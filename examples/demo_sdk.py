@@ -1,12 +1,24 @@
+# Reminder:
+# def method(self, ...)
+#     I need one existing package.
+
+# @classmethod
+# def method(cls, ...)
+#     I need the USAPPackage class, usually to create a package.
+
+# @staticmethod
+# def method(...)
+#     I do not need either; I am just a helper.
+
+
 from __future__ import annotations
 
-from usap_core import ELEMENT_KIND_FACE, USAPPackage
-
+from usap import ELEMENT_KIND_FACE, USAPPackage
 
 def main() -> None:
     with USAPPackage.create(
         "demo_sdk.usap.gpkg",
-        schema_path="schema.sql",
+        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         # ------------------------------------------------------------

@@ -8,27 +8,9 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
-
-ELEMENT_KIND_FACE = 1
-ELEMENT_KIND_POINT = 2
-ELEMENT_KIND_VERTEX = 3
-ELEMENT_KIND_FEATURE = 4
-
-DEFAULT_BLOCK_SIZE = 4096
-DEFAULT_ENCODING = "u32-zlib"
-
-
-class USAPError(Exception):
-    """Base exception for USAP SDK errors."""
-
-def require_lastrowid(cur: sqlite3.Cursor) -> int:
-    """
-    Return cursor.lastrowid as int, or fail loudly if SQLite did not produce one.
-    """
-    if cur.lastrowid is None:
-        raise USAPError("Expected SQLite lastrowid, but got None.")
-
-    return int(cur.lastrowid)
+from .errors import USAPError
+from .constants import DEFAULT_BLOCK_SIZE, DEFAULT_ENCODING
+from .sqlite_utils import require_lastrowid
 
 class USAPPackage:
     """
@@ -36,9 +18,9 @@ class USAPPackage:
     """
 
     def __init__(self, db_path: str | Path): # Constructor of the package
-        self.db_path = Path(db_path)
+        self.db_path = Path(db_path) #make sure it is path
         self.conn = sqlite3.connect(self.db_path)
-        self.conn.row_factory = sqlite3.Row
+        self.conn.row_factory = sqlite3.Row # Better access to rows (by column name)
         self.conn.execute("PRAGMA foreign_keys = ON;")
 
     # ---------------------------------------------------------------------

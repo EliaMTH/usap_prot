@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: usap
+Version: 0.1.0
+Summary: Urban Semantic Annotation Package phase-1 prototype
+Requires-Python: >=3.11

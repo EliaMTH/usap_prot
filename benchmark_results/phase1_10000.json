@@ -1,0 +1,84 @@
+{
+  "created_at_utc": "2026-06-09T16:21:05.975229+00:00",
+  "python": {
+    "version": "3.12.3 (main, Mar 23 2026, 19:04:32) [GCC 13.3.0]",
+    "implementation": "CPython",
+    "platform": "Linux-6.6.114.1-microsoft-standard-WSL2-x86_64-with-glibc2.39"
+  },
+  "database": {
+    "path": "benchmark_phase1.usap.gpkg",
+    "size_bytes": 37896192,
+    "size_human": "36.14 MiB"
+  },
+  "synthetic_config": {
+    "building_count": 10000,
+    "roof_faces_per_building": 120,
+    "wall_faces_per_building": 300,
+    "ground_faces_per_building": 80,
+    "faces_per_building": 500
+  },
+  "package_counts": {
+    "total_faces": 5000000,
+    "annotations": 30000,
+    "city_objects": 40000,
+    "relationships": 30000,
+    "closure_rows": 70000,
+    "membership_blocks": 31191,
+    "default_block_size": 4096
+  },
+  "build": {
+    "seconds": 9.112511489000099
+  },
+  "queries": {
+    "q1_selected_face_count": 100,
+    "q1_touched_blocks": 1,
+    "q2_selected_face_count": 1000,
+    "q2_touched_blocks": 20,
+    "timings": [
+      {
+        "name": "Q1 selected faces in one block -> annotations",
+        "repeat": 3,
+        "mean_ms": 2.395835333421322,
+        "min_ms": 1.9846249997499399,
+        "max_ms": 2.9383510009211022,
+        "summary": "1 rows/items"
+      },
+      {
+        "name": "Q2 selected faces across many blocks -> annotations",
+        "repeat": 3,
+        "mean_ms": 9.614161333350543,
+        "min_ms": 6.718491000356153,
+        "max_ms": 14.316270999188419,
+        "summary": "25 rows/items"
+      },
+      {
+        "name": "Q3 all RoofSurface blocks",
+        "repeat": 3,
+        "mean_ms": 389.74572500046634,
+        "min_ms": 374.2405829998461,
+        "max_ms": 404.2681460014137,
+        "summary": "10283 rows/items"
+      },
+      {
+        "name": "Q4 building_000000 descendants -> membership blocks",
+        "repeat": 3,
+        "mean_ms": 14.081910000337908,
+        "min_ms": 6.161519999295706,
+        "max_ms": 29.870992000724073,
+        "summary": "3 rows/items"
+      },
+      {
+        "name": "Q5 replace one annotation with up to 5000 faces",
+        "repeat": 3,
+        "mean_ms": 15.762372666965044,
+        "min_ms": 15.038755000205128,
+        "max_ms": 16.875968000022112,
+        "summary": "None"
+      }
+    ]
+  },
+  "validation": {
+    "ok": true,
+    "problems": []
+  }
+}

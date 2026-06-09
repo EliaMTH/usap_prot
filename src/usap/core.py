@@ -5,12 +5,17 @@ import sqlite3
 import struct
 import zlib
 from collections import defaultdict, deque
+from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+
 
 from .errors import USAPError
 from .constants import DEFAULT_BLOCK_SIZE, DEFAULT_ENCODING
 from .sqlite_utils import require_lastrowid
+from .validation import validate_connection
+from .geopackage import initialize_geopackage_metadata
 
 class USAPPackage:
     """
@@ -18,10 +23,48 @@ class USAPPackage:
     """
 
     def __init__(self, db_path: str | Path): # Constructor of the package
-        self.db_path = Path(db_path) #make sure it is path
+        self.db_path = Path(db_path)
         self.conn = sqlite3.connect(self.db_path)
-        self.conn.row_factory = sqlite3.Row # Better access to rows (by column name)
+        self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON;")
+        self._transaction_depth = 0
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """
+        Open a write transaction.
+
+        If already inside a USAP transaction, this becomes a no-op nested
+        transaction. This lets SDK methods be safe when called individually,
+        but also fast when many edits are grouped together.
+
+        Example:
+
+            with pkg.transaction():
+                pkg.create_city_object(...)
+                pkg.create_annotation(...)
+                pkg.replace_annotation_membership(...)
+        """
+        if self._transaction_depth > 0 or self.conn.in_transaction:
+            self._transaction_depth += 1
+            try:
+                yield
+            finally:
+                self._transaction_depth -= 1
+            return
+
+        self._transaction_depth = 1
+
+        try:
+            self.conn.execute("BEGIN")
+            yield
+        except Exception:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
+        finally:
+            self._transaction_depth = 0
 
     # ---------------------------------------------------------------------
     # Opening / creating
@@ -54,7 +97,12 @@ class USAPPackage:
 
         pkg.conn.executescript(schema_sql)
 
-        with pkg.conn:
+        with pkg.transaction():
+            initialize_geopackage_metadata(
+                pkg.conn,
+                profile_version=profile_version,
+            )
+
             pkg.conn.execute(
                 """
                 INSERT INTO usap_profile (
@@ -76,7 +124,7 @@ class USAPPackage:
             )
 
         return pkg
-
+    
     @classmethod
     def open(cls, db_path: str | Path) -> "USAPPackage":
         db_path = Path(db_path)
@@ -216,7 +264,7 @@ class USAPPackage:
         if existing is not None:
             return int(existing["asset_id"])
 
-        with self.conn:
+        with self.transaction():
             cur = self.conn.execute(
                 """
                 INSERT INTO usap_asset (
@@ -274,7 +322,7 @@ class USAPPackage:
         if existing is not None:
             return int(existing["asset_part_id"])
 
-        with self.conn:
+        with self.transaction():
             cur = self.conn.execute(
                 """
                 INSERT INTO usap_asset_part (
@@ -336,7 +384,7 @@ class USAPPackage:
         if existing is not None:
             return int(existing["semantic_class_id"])
 
-        with self.conn:
+        with self.transaction():
             cur = self.conn.execute(
                 """
                 INSERT INTO usap_semantic_class (
@@ -437,7 +485,7 @@ class USAPPackage:
         if existing is not None:
             return int(existing["city_object_id"])
 
-        with self.conn:
+        with self.transaction():
             cur = self.conn.execute(
                 """
                 INSERT INTO usap_city_object (
@@ -485,7 +533,7 @@ class USAPPackage:
         """
         Add one typed edge between two city objects.
         """
-        with self.conn:
+        with self.transaction():
             cur = self.conn.execute(
                 """
                 INSERT INTO usap_city_object_relationship (
@@ -579,7 +627,7 @@ class USAPPackage:
                     closure_rows.append((graph_name, start_id, child_id, depth))
                     queue.append((child_id, depth))
 
-        with self.conn:
+        with self.transaction():
             self.conn.execute(
                 """
                 DELETE FROM usap_city_object_closure
@@ -635,7 +683,7 @@ class USAPPackage:
         if existing is not None:
             return int(existing["annotation_id"])
 
-        with self.conn:
+        with self.transaction():
             cur = self.conn.execute(
                 """
                 INSERT INTO usap_annotation (
@@ -693,7 +741,7 @@ class USAPPackage:
         city_object_id: int,
         relation_type: str = "represents",
     ) -> None:
-        with self.conn:
+        with self.transaction():
             self.conn.execute(
                 """
                 INSERT OR IGNORE INTO usap_annotation_object (
@@ -770,7 +818,7 @@ class USAPPackage:
 
         blocks = self.split_indices_into_blocks(unique_indices, block_size)
 
-        with self.conn:
+        with self.transaction():
             self.conn.execute(
                 """
                 DELETE FROM usap_membership_block
@@ -828,6 +876,33 @@ class USAPPackage:
     # ---------------------------------------------------------------------
     # Queries
     # ---------------------------------------------------------------------
+    def _membership_block_row_to_dict(
+        self,
+        row: sqlite3.Row,
+        expand: bool,
+    ) -> dict[str, Any]:
+        item = {
+            "membership_block_id": int(row["membership_block_id"]),
+            "annotation_id": int(row["annotation_id"]),
+            "asset_part_id": int(row["asset_part_id"]),
+            "element_kind": int(row["element_kind"]),
+            "block_start": int(row["block_start"]),
+            "block_size": int(row["block_size"]),
+            "encoding": row["encoding"],
+            "element_count": int(row["element_count"]),
+            "min_element_index": int(row["min_element_index"]),
+            "max_element_index": int(row["max_element_index"]),
+        }
+
+        if expand:
+            offsets = self.decode_u32_zlib(row["payload"])
+            item["elements"] = [
+                int(row["block_start"]) + offset
+                for offset in offsets
+            ]
+
+        return item
+
 
     def annotations_for_elements(
         self,
@@ -840,8 +915,14 @@ class USAPPackage:
 
             selected faces/points -> annotations
 
-        This only touches membership blocks for the selected block_start values.
+        Optimized version:
+        - groups selected indices by block_start
+        - queries all relevant block_start values in one SQL query
+        - decodes only candidate membership blocks
         """
+        if not selected_indices:
+            return []
+
         block_size = self.get_default_block_size()
 
         selected_by_block: dict[int, set[int]] = defaultdict(set)
@@ -854,67 +935,80 @@ class USAPPackage:
             offset = index - block_start
             selected_by_block[block_start].add(offset)
 
+        block_starts = sorted(selected_by_block)
+
+        placeholders = ",".join("?" for _ in block_starts)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                mb.annotation_id,
+                mb.block_start,
+                mb.payload,
+
+                a.annotation_uid,
+                a.label,
+                a.status,
+
+                sc.local_name AS semantic_class,
+                sc.class_uri AS semantic_class_uri,
+
+                co.object_uid AS primary_city_object_uid
+            FROM usap_membership_block AS mb
+            JOIN usap_annotation AS a
+                ON a.annotation_id = mb.annotation_id
+            JOIN usap_semantic_class AS sc
+                ON sc.semantic_class_id = a.semantic_class_id
+            LEFT JOIN usap_city_object AS co
+                ON co.city_object_id = a.primary_city_object_id
+            WHERE mb.asset_part_id = ?
+            AND mb.element_kind = ?
+            AND mb.block_start IN ({placeholders})
+            ORDER BY
+                mb.block_start,
+                mb.annotation_id
+            """,
+            (
+                asset_part_id,
+                element_kind,
+                *block_starts,
+            ),
+        ).fetchall()
+
         matches_by_annotation: dict[int, dict[str, Any]] = {}
 
-        for block_start, selected_offsets in selected_by_block.items():
-            rows = self.conn.execute(
-                """
-                SELECT
-                    mb.annotation_id,
-                    mb.block_start,
-                    mb.payload,
+        for row in rows:
+            block_start = int(row["block_start"])
+            selected_offsets = selected_by_block[block_start]
 
-                    a.annotation_uid,
-                    a.label,
-                    a.status,
+            encoded_offsets = set(self.decode_u32_zlib(row["payload"]))
+            hit_offsets = selected_offsets.intersection(encoded_offsets)
 
-                    sc.local_name AS semantic_class,
-                    sc.class_uri AS semantic_class_uri,
+            if not hit_offsets:
+                continue
 
-                    co.object_uid AS primary_city_object_uid
-                FROM usap_membership_block AS mb
-                JOIN usap_annotation AS a
-                    ON a.annotation_id = mb.annotation_id
-                JOIN usap_semantic_class AS sc
-                    ON sc.semantic_class_id = a.semantic_class_id
-                LEFT JOIN usap_city_object AS co
-                    ON co.city_object_id = a.primary_city_object_id
-                WHERE mb.asset_part_id = ?
-                  AND mb.element_kind = ?
-                  AND mb.block_start = ?
-                """,
-                (asset_part_id, element_kind, block_start),
-            ).fetchall()
+            annotation_id = int(row["annotation_id"])
 
-            for row in rows:
-                encoded_offsets = set(self.decode_u32_zlib(row["payload"]))
-                hit_offsets = selected_offsets.intersection(encoded_offsets)
+            if annotation_id not in matches_by_annotation:
+                matches_by_annotation[annotation_id] = {
+                    "annotation_id": annotation_id,
+                    "annotation_uid": row["annotation_uid"],
+                    "label": row["label"],
+                    "status": row["status"],
+                    "semantic_class": row["semantic_class"],
+                    "semantic_class_uri": row["semantic_class_uri"],
+                    "primary_city_object_uid": row["primary_city_object_uid"],
+                    "matched_elements": [],
+                }
 
-                if not hit_offsets:
-                    continue
+            absolute_hits = [
+                block_start + offset
+                for offset in sorted(hit_offsets)
+            ]
 
-                annotation_id = int(row["annotation_id"])
-
-                if annotation_id not in matches_by_annotation:
-                    matches_by_annotation[annotation_id] = {
-                        "annotation_id": annotation_id,
-                        "annotation_uid": row["annotation_uid"],
-                        "label": row["label"],
-                        "status": row["status"],
-                        "semantic_class": row["semantic_class"],
-                        "semantic_class_uri": row["semantic_class_uri"],
-                        "primary_city_object_uid": row["primary_city_object_uid"],
-                        "matched_elements": [],
-                    }
-
-                absolute_hits = [
-                    int(row["block_start"]) + offset
-                    for offset in sorted(hit_offsets)
-                ]
-
-                matches_by_annotation[annotation_id]["matched_elements"].extend(
-                    absolute_hits
-                )
+            matches_by_annotation[annotation_id]["matched_elements"].extend(
+                absolute_hits
+            )
 
         results = list(matches_by_annotation.values())
 
@@ -957,32 +1051,10 @@ class USAPPackage:
             (annotation_id,),
         ).fetchall()
 
-        results: list[dict[str, Any]] = []
-
-        for row in rows:
-            item = {
-                "membership_block_id": int(row["membership_block_id"]),
-                "annotation_id": int(row["annotation_id"]),
-                "asset_part_id": int(row["asset_part_id"]),
-                "element_kind": int(row["element_kind"]),
-                "block_start": int(row["block_start"]),
-                "block_size": int(row["block_size"]),
-                "encoding": row["encoding"],
-                "element_count": int(row["element_count"]),
-                "min_element_index": int(row["min_element_index"]),
-                "max_element_index": int(row["max_element_index"]),
-            }
-
-            if expand:
-                offsets = self.decode_u32_zlib(row["payload"])
-                item["elements"] = [
-                    int(row["block_start"]) + offset
-                    for offset in offsets
-                ]
-
-            results.append(item)
-
-        return results
+        return [
+            self._membership_block_row_to_dict(row, expand=expand)
+            for row in rows
+        ]
 
     def elements_for_semantic_class(
         self,
@@ -991,50 +1063,74 @@ class USAPPackage:
         expand: bool = False,
     ) -> list[dict[str, Any]]:
         """
-        Query annotations by semantic class, then return their membership blocks.
+        Query membership blocks for annotations of a semantic class.
+
+        This optimized version uses one SQL join instead of one query per
+        annotation.
 
         Default expand=False because big results should stay compact.
         """
         if include_subclasses:
-            class_rows = self.conn.execute(
+            rows = self.conn.execute(
                 """
-                SELECT descendant_class_id
-                FROM usap_semantic_class_closure
-                WHERE ancestor_class_id = ?
+                SELECT
+                    mb.membership_block_id,
+                    mb.annotation_id,
+                    mb.asset_part_id,
+                    mb.element_kind,
+                    mb.block_start,
+                    mb.block_size,
+                    mb.encoding,
+                    mb.element_count,
+                    mb.min_element_index,
+                    mb.max_element_index,
+                    mb.payload
+                FROM usap_membership_block AS mb
+                JOIN usap_annotation AS a
+                    ON a.annotation_id = mb.annotation_id
+                JOIN usap_semantic_class_closure AS c
+                    ON c.descendant_class_id = a.semantic_class_id
+                WHERE c.ancestor_class_id = ?
+                ORDER BY
+                    mb.asset_part_id,
+                    mb.element_kind,
+                    mb.block_start,
+                    mb.annotation_id
+                """,
+                (semantic_class_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT
+                    mb.membership_block_id,
+                    mb.annotation_id,
+                    mb.asset_part_id,
+                    mb.element_kind,
+                    mb.block_start,
+                    mb.block_size,
+                    mb.encoding,
+                    mb.element_count,
+                    mb.min_element_index,
+                    mb.max_element_index,
+                    mb.payload
+                FROM usap_membership_block AS mb
+                JOIN usap_annotation AS a
+                    ON a.annotation_id = mb.annotation_id
+                WHERE a.semantic_class_id = ?
+                ORDER BY
+                    mb.asset_part_id,
+                    mb.element_kind,
+                    mb.block_start,
+                    mb.annotation_id
                 """,
                 (semantic_class_id,),
             ).fetchall()
 
-            class_ids = [int(row["descendant_class_id"]) for row in class_rows]
-        else:
-            class_ids = [semantic_class_id]
-
-        if not class_ids:
-            return []
-
-        placeholders = ",".join("?" for _ in class_ids)
-
-        annotation_rows = self.conn.execute(
-            f"""
-            SELECT annotation_id
-            FROM usap_annotation
-            WHERE semantic_class_id IN ({placeholders})
-            ORDER BY annotation_id
-            """,
-            class_ids,
-        ).fetchall()
-
-        results: list[dict[str, Any]] = []
-
-        for row in annotation_rows:
-            annotation_id = int(row["annotation_id"])
-            blocks = self.elements_for_annotation(
-                annotation_id,
-                expand=expand,
-            )
-            results.extend(blocks)
-
-        return results
+        return [
+            self._membership_block_row_to_dict(row, expand=expand)
+            for row in rows
+        ]
 
     def elements_for_city_object(
         self,
@@ -1110,59 +1206,21 @@ class USAPPackage:
     # Basic validation
     # ---------------------------------------------------------------------
 
+    def validate_report(self):
+        """
+        Return a structured validation report.
+
+        This is the preferred validation API.
+        """
+
+        return validate_connection(self.conn)
+
+
     def validate_basic(self) -> list[str]:
         """
-        Minimal phase-1 validation.
+        Backward-compatible simple validation API.
 
-        Later this will become a richer validation report.
+        Returns formatted validation issues as strings.
         """
-        problems: list[str] = []
-
-        orphan_membership = self.conn.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM usap_membership_block AS mb
-            LEFT JOIN usap_annotation AS a
-                ON a.annotation_id = mb.annotation_id
-            WHERE a.annotation_id IS NULL
-            """
-        ).fetchone()["n"]
-
-        if orphan_membership:
-            problems.append(
-                f"Found {orphan_membership} membership blocks "
-                "without annotation."
-            )
-
-        out_of_range = self.conn.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM usap_membership_block AS mb
-            JOIN usap_asset_part AS ap
-                ON ap.asset_part_id = mb.asset_part_id
-            WHERE mb.max_element_index >= ap.element_count
-               OR mb.min_element_index < 0
-            """
-        ).fetchone()["n"]
-
-        if out_of_range:
-            problems.append(
-                f"Found {out_of_range} membership blocks "
-                "with out-of-range element indices."
-            )
-
-        bad_encoding = self.conn.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM usap_membership_block
-            WHERE encoding != 'u32-zlib'
-            """
-        ).fetchone()["n"]
-
-        if bad_encoding:
-            problems.append(
-                f"Found {bad_encoding} membership blocks "
-                "with unsupported encoding."
-            )
-
-        return problems
+        report = self.validate_report()
+        return [issue.format() for issue in report.issues]

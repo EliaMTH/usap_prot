@@ -38,6 +38,47 @@
 
 PRAGMA foreign_keys = ON; -- ensure key consistency between tables (i.e.: prevent operations that would break relationship between tables); need to be declare as it is off by default for backwards compatibility
 
+-- -------------------------------------------------------------------------
+-- Minimal GeoPackage core metadata
+-- -------------------------------------------------------------------------
+
+CREATE TABLE gpkg_spatial_ref_sys (
+    srs_name TEXT NOT NULL,
+    srs_id INTEGER NOT NULL PRIMARY KEY,
+    organization TEXT NOT NULL,
+    organization_coordsys_id INTEGER NOT NULL,
+    definition TEXT NOT NULL,
+    description TEXT
+);
+
+CREATE TABLE gpkg_contents (
+    table_name TEXT NOT NULL PRIMARY KEY,
+    data_type TEXT NOT NULL,
+    identifier TEXT UNIQUE,
+    description TEXT DEFAULT '',
+    last_change DATETIME NOT NULL DEFAULT (
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    ),
+    min_x DOUBLE,
+    min_y DOUBLE,
+    max_x DOUBLE,
+    max_y DOUBLE,
+    srs_id INTEGER,
+    CONSTRAINT fk_gc_r_srs_id
+        FOREIGN KEY (srs_id)
+        REFERENCES gpkg_spatial_ref_sys(srs_id)
+);
+
+CREATE TABLE gpkg_extensions (
+    table_name TEXT,
+    column_name TEXT,
+    extension_name TEXT NOT NULL,
+    definition TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    CONSTRAINT ge_tce
+        UNIQUE (table_name, column_name, extension_name)
+);
+
 CREATE TABLE usap_profile (
     profile_id          INTEGER PRIMARY KEY CHECK (profile_id = 1),
     profile_name        TEXT NOT NULL DEFAULT 'USAP',

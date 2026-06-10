@@ -139,7 +139,7 @@ class USAPPackage:
     def __enter__(self) -> "USAPPackage":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
         self.close()
 
     # ---------------------------------------------------------------------
@@ -662,21 +662,7 @@ class USAPPackage:
             annotation_id = require_lastrowid(cur)
 
             if primary_city_object_id is not None and link_primary_object:
-                self.conn.execute(
-                    """
-                    INSERT OR IGNORE INTO usap_annotation_object (
-                        annotation_id,
-                        city_object_id,
-                        relation_type
-                    )
-                    VALUES (?, ?, ?)
-                    """,
-                    (
-                        annotation_id,
-                        primary_city_object_id,
-                        "represents",
-                    ),
-                )
+                self._link_annotation_object(annotation_id, primary_city_object_id, "represents")
 
             self.log_edit(
                 "create_annotation",
@@ -693,18 +679,7 @@ class USAPPackage:
         relation_type: str = "represents",
     ) -> None:
         with self.transaction():
-            self.conn.execute(
-                """
-                INSERT OR IGNORE INTO usap_annotation_object (
-                    annotation_id,
-                    city_object_id,
-                    relation_type
-                )
-                VALUES (?, ?, ?)
-                """,
-                (annotation_id, city_object_id, relation_type),
-            )
-
+            self._link_annotation_object(annotation_id, city_object_id, relation_type)
             self.log_edit(
                 "link_annotation_to_object",
                 "usap_annotation_object",
@@ -714,6 +689,46 @@ class USAPPackage:
     # ---------------------------------------------------------------------
     # Membership editing
     # ---------------------------------------------------------------------
+
+    def _validate_membership_indices(
+        self,
+        asset_part_id: int,
+        element_kind: int,
+        element_indices: list[int],
+    ) -> list[int]:
+        asset_part = self.conn.execute(
+            """
+            SELECT element_kind, element_count
+            FROM usap_asset_part
+            WHERE asset_part_id = ?
+            """,
+            (asset_part_id,),
+        ).fetchone()
+
+        if asset_part is None:
+            raise USAPError(f"Unknown asset_part_id: {asset_part_id}")
+
+        expected_kind = int(asset_part["element_kind"])
+        element_count = int(asset_part["element_count"])
+
+        if element_kind != expected_kind:
+            raise USAPError(
+                f"Element kind mismatch: asset part expects "
+                f"{expected_kind}, got {element_kind}"
+            )
+
+        unique_indices = sorted(set(element_indices))
+
+        for index in unique_indices:
+            if index < 0:
+                raise USAPError(f"Negative element index: {index}")
+            if index >= element_count:
+                raise USAPError(
+                    f"Element index {index} is out of range. "
+                    f"Asset part has {element_count} elements."
+                )
+
+        return unique_indices
 
     def replace_annotation_membership(
         self,
@@ -735,37 +750,9 @@ class USAPPackage:
         if block_size is None:
             block_size = self.get_default_block_size()
 
-        asset_part = self.conn.execute(
-            """
-            SELECT asset_part_id, element_kind, element_count
-            FROM usap_asset_part
-            WHERE asset_part_id = ?
-            """,
-            (asset_part_id,),
-        ).fetchone()
-
-        if asset_part is None:
-            raise USAPError(f"Unknown asset_part_id: {asset_part_id}")
-
-        expected_element_kind = int(asset_part["element_kind"])
-        element_count = int(asset_part["element_count"])
-
-        if element_kind != expected_element_kind:
-            raise USAPError(
-                f"Element kind mismatch: asset part expects "
-                f"{expected_element_kind}, got {element_kind}"
-            )
-
-        unique_indices = sorted(set(element_indices))
-
-        for index in unique_indices:
-            if index < 0:
-                raise USAPError(f"Negative element index: {index}")
-            if index >= element_count:
-                raise USAPError(
-                    f"Element index {index} is out of range. "
-                    f"Asset part has {element_count} elements."
-                )
+        unique_indices = self._validate_membership_indices(
+            asset_part_id, element_kind, element_indices
+        )
 
         blocks = split_indices_into_blocks(unique_indices, block_size)
 
@@ -823,6 +810,24 @@ class USAPPackage:
                 f'"element_kind": {element_kind}, '
                 f'"element_count": {len(unique_indices)}}}',
             )
+
+    def _link_annotation_object(
+        self,
+        annotation_id: int,
+        city_object_id: int,
+        relation_type: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO usap_annotation_object (
+                annotation_id,
+                city_object_id,
+                relation_type
+            )
+            VALUES (?, ?, ?)
+            """,
+            (annotation_id, city_object_id, relation_type),
+        )
 
     # ---------------------------------------------------------------------
     # Queries
@@ -1022,66 +1027,44 @@ class USAPPackage:
         Default expand=False because big results should stay compact.
         """
         if include_subclasses:
-            rows = self.conn.execute(
-                """
-                SELECT
-                    mb.membership_block_id,
-                    mb.annotation_id,
-                    mb.asset_part_id,
-                    mb.element_kind,
-                    mb.block_start,
-                    mb.block_size,
-                    mb.encoding,
-                    mb.element_count,
-                    mb.min_element_index,
-                    mb.max_element_index,
-                    mb.payload
-                FROM usap_membership_block AS mb
-                JOIN usap_annotation AS a
-                    ON a.annotation_id = mb.annotation_id
-                JOIN usap_semantic_class_closure AS c
-                    ON c.descendant_class_id = a.semantic_class_id
-                WHERE c.ancestor_class_id = ?
-                ORDER BY
-                    mb.asset_part_id,
-                    mb.element_kind,
-                    mb.block_start,
-                    mb.annotation_id
-                """,
-                (semantic_class_id,),
-            ).fetchall()
+            extra_join = """
+            JOIN usap_semantic_class_closure AS c
+                ON c.descendant_class_id = a.semantic_class_id
+            """
+            where = "WHERE c.ancestor_class_id = ?"
         else:
-            rows = self.conn.execute(
-                """
-                SELECT
-                    mb.membership_block_id,
-                    mb.annotation_id,
-                    mb.asset_part_id,
-                    mb.element_kind,
-                    mb.block_start,
-                    mb.block_size,
-                    mb.encoding,
-                    mb.element_count,
-                    mb.min_element_index,
-                    mb.max_element_index,
-                    mb.payload
-                FROM usap_membership_block AS mb
-                JOIN usap_annotation AS a
-                    ON a.annotation_id = mb.annotation_id
-                WHERE a.semantic_class_id = ?
-                ORDER BY
-                    mb.asset_part_id,
-                    mb.element_kind,
-                    mb.block_start,
-                    mb.annotation_id
-                """,
-                (semantic_class_id,),
-            ).fetchall()
+            extra_join = ""
+            where = "WHERE a.semantic_class_id = ?"
 
-        return [
-            self._membership_block_row_to_dict(row, expand=expand)
-            for row in rows
-        ]
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                mb.membership_block_id,
+                mb.annotation_id,
+                mb.asset_part_id,
+                mb.element_kind,
+                mb.block_start,
+                mb.block_size,
+                mb.encoding,
+                mb.element_count,
+                mb.min_element_index,
+                mb.max_element_index,
+                mb.payload
+            FROM usap_membership_block AS mb
+            JOIN usap_annotation AS a
+                ON a.annotation_id = mb.annotation_id
+            {extra_join}
+            {where}
+            ORDER BY
+                mb.asset_part_id,
+                mb.element_kind,
+                mb.block_start,
+                mb.annotation_id
+            """,
+            (semantic_class_id,),
+        ).fetchall()
+
+        return [self._membership_block_row_to_dict(row, expand=expand) for row in rows]
 
     def elements_for_city_object(
         self,
@@ -1131,27 +1114,36 @@ class USAPPackage:
 
         placeholders = ",".join("?" for _ in object_ids)
 
-        annotation_rows = self.conn.execute(
+        rows = self.conn.execute(
             f"""
-            SELECT DISTINCT annotation_id
-            FROM usap_annotation_object
-            WHERE city_object_id IN ({placeholders})
-            ORDER BY annotation_id
+            SELECT
+                mb.membership_block_id,
+                mb.annotation_id,
+                mb.asset_part_id,
+                mb.element_kind,
+                mb.block_start,
+                mb.block_size,
+                mb.encoding,
+                mb.element_count,
+                mb.min_element_index,
+                mb.max_element_index,
+                mb.payload
+            FROM usap_membership_block AS mb
+            WHERE mb.annotation_id IN (
+                SELECT DISTINCT ao.annotation_id
+                FROM usap_annotation_object AS ao
+                WHERE ao.city_object_id IN ({placeholders})
+            )
+            ORDER BY
+                mb.asset_part_id,
+                mb.element_kind,
+                mb.block_start,
+                mb.annotation_id
             """,
             object_ids,
         ).fetchall()
 
-        results: list[dict[str, Any]] = []
-
-        for row in annotation_rows:
-            annotation_id = int(row["annotation_id"])
-            blocks = self.elements_for_annotation(
-                annotation_id,
-                expand=expand,
-            )
-            results.extend(blocks)
-
-        return results
+        return [self._membership_block_row_to_dict(row, expand=expand) for row in rows]
 
     # ---------------------------------------------------------------------
     # Basic validation

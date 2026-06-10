@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import struct
-import zlib
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from collections.abc import Iterator
@@ -13,6 +11,7 @@ from typing import Any
 
 from .errors import USAPError
 from .constants import DEFAULT_BLOCK_SIZE, DEFAULT_ENCODING
+from .encoding import encode_u32_zlib, decode_u32_zlib, block_start_for_index, split_indices_into_blocks
 from .sqlite_utils import require_lastrowid
 from .validation import validate_connection
 from .geopackage import initialize_geopackage_metadata
@@ -146,54 +145,6 @@ class USAPPackage:
     # ---------------------------------------------------------------------
     # Encoding / decoding membership payloads
     # ---------------------------------------------------------------------
-
-    @staticmethod
-    def encode_u32_zlib(offsets: list[int]) -> bytes:
-        offsets = sorted(set(offsets))
-
-        for value in offsets:
-            if value < 0:
-                raise USAPError(f"Negative offset: {value}")
-            if value > 2**32 - 1:
-                raise USAPError(f"Offset too large for uint32: {value}")
-
-        raw = struct.pack("<" + "I" * len(offsets), *offsets)
-        return zlib.compress(raw)
-
-    @staticmethod
-    def decode_u32_zlib(payload: bytes) -> list[int]:
-        raw = zlib.decompress(payload)
-
-        if len(raw) % 4 != 0:
-            raise USAPError("Invalid u32-zlib payload length")
-
-        count = len(raw) // 4
-
-        if count == 0:
-            return []
-
-        return list(struct.unpack("<" + "I" * count, raw))
-
-    @staticmethod
-    def block_start_for_index(index: int, block_size: int) -> int:
-        return (index // block_size) * block_size
-
-    @staticmethod
-    def split_indices_into_blocks(
-        indices: list[int],
-        block_size: int,
-    ) -> dict[int, list[int]]:
-        blocks: dict[int, list[int]] = defaultdict(list)
-
-        for index in sorted(set(indices)):
-            if index < 0:
-                raise USAPError(f"Negative element index: {index}")
-
-            block_start = (index // block_size) * block_size
-            offset = index - block_start
-            blocks[block_start].append(offset)
-
-        return dict(blocks)
 
     # ---------------------------------------------------------------------
     # Small internal helpers
@@ -816,7 +767,7 @@ class USAPPackage:
                     f"Asset part has {element_count} elements."
                 )
 
-        blocks = self.split_indices_into_blocks(unique_indices, block_size)
+        blocks = split_indices_into_blocks(unique_indices, block_size)
 
         with self.transaction():
             self.conn.execute(
@@ -830,7 +781,7 @@ class USAPPackage:
             )
 
             for block_start, offsets in blocks.items():
-                payload = self.encode_u32_zlib(offsets)
+                payload = encode_u32_zlib(offsets)
                 min_element_index = block_start + min(offsets)
                 max_element_index = block_start + max(offsets)
 
@@ -895,7 +846,7 @@ class USAPPackage:
         }
 
         if expand:
-            offsets = self.decode_u32_zlib(row["payload"])
+            offsets = decode_u32_zlib(row["payload"])
             item["elements"] = [
                 int(row["block_start"]) + offset
                 for offset in offsets
@@ -931,7 +882,7 @@ class USAPPackage:
             if index < 0:
                 raise USAPError(f"Negative selected index: {index}")
 
-            block_start = self.block_start_for_index(index, block_size)
+            block_start = block_start_for_index(index, block_size)
             offset = index - block_start
             selected_by_block[block_start].add(offset)
 
@@ -981,7 +932,7 @@ class USAPPackage:
             block_start = int(row["block_start"])
             selected_offsets = selected_by_block[block_start]
 
-            encoded_offsets = set(self.decode_u32_zlib(row["payload"]))
+            encoded_offsets = set(decode_u32_zlib(row["payload"]))
             hit_offsets = selected_offsets.intersection(encoded_offsets)
 
             if not hit_offsets:

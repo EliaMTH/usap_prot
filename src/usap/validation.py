@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
-import struct
-import zlib
 from dataclasses import dataclass, field
 from typing import Any
 
 from .constants import DEFAULT_ENCODING
+from .encoding import decode_u32_zlib
 from .geopackage import (
     GPKG_APPLICATION_ID,
     GPKG_USER_VERSION,
@@ -80,20 +79,6 @@ class ValidationReport:
 
         for issue in self.issues:
             print(issue.format())
-
-
-def _decode_u32_zlib(payload: bytes) -> list[int]:
-    raw = zlib.decompress(payload)
-
-    if len(raw) % 4 != 0:
-        raise ValueError("Decoded byte length is not divisible by 4.")
-
-    count = len(raw) // 4
-
-    if count == 0:
-        return []
-
-    return list(struct.unpack("<" + "I" * count, raw))
 
 
 def _count(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> int:
@@ -343,7 +328,7 @@ def _validate_membership_blocks(
             )
 
         try:
-            offsets = _decode_u32_zlib(row["payload"])
+            offsets = decode_u32_zlib(row["payload"])
         except Exception as exc:
             report.add(
                 severity="error",

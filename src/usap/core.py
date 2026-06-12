@@ -249,6 +249,12 @@ class USAPPackage:
         element_kind: int,
         element_count: int,
         index_origin: str = "zero_based",
+        minx: float | None = None,
+        miny: float | None = None,
+        minz: float | None = None,
+        maxx: float | None = None,
+        maxy: float | None = None,
+        maxz: float | None = None,
         metadata_json: str | None = None,
     ) -> int:
         """
@@ -282,9 +288,15 @@ class USAPPackage:
                     element_kind,
                     element_count,
                     index_origin,
+                    minx,
+                    miny,
+                    minz,
+                    maxx,
+                    maxy,
+                    maxz,
                     metadata_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     asset_id,
@@ -292,6 +304,12 @@ class USAPPackage:
                     element_kind,
                     element_count,
                     index_origin,
+                    minx,
+                    miny,
+                    minz,
+                    maxx,
+                    maxy,
+                    maxz,
                     metadata_json,
                 ),
             )

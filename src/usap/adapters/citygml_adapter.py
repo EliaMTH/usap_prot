@@ -137,7 +137,15 @@ def _relationship_type_from_context(context_name: str | None) -> str:
 
 
 def _role_for_child(local_name: str) -> str | None:
-    return ROLE_BY_CLASS.get(local_name)
+    known = ROLE_BY_CLASS.get(local_name)
+
+    if known is not None:
+        return known
+
+    if not local_name:
+        return None
+
+    return local_name[:1].lower() + local_name[1:]
 
 
 def _citygml_version_hint(root: etree._Element) -> str | None:
@@ -221,6 +229,7 @@ def import_citygml_semantics(
         )
 
         classes = seed_citygml_basic_classes(pkg)
+        citygml_object_classes = set(classes.by_name.keys())
 
         imported_objects: list[ImportedCityObject] = []
         imported_relationships: list[ImportedRelationship] = []
@@ -257,7 +266,7 @@ def import_citygml_semantics(
 
             local_name = _local_name(element.tag)
 
-            is_city_object = local_name in CITYGML_OBJECT_CLASSES
+            is_city_object = local_name in citygml_object_classes
 
             if is_city_object:
                 sequence_number += 1

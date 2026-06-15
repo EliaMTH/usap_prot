@@ -56,6 +56,11 @@ from .batch import (
     apply_annotation_batch,
     apply_annotation_batch_file,
 )
+from .project_builder import (
+    ProjectBuildResult,
+    build_project_package,
+    build_project_package_from_file,
+)
 
 __all__ = [
     "USAPPackage",
@@ -96,4 +101,7 @@ __all__ = [
     "BatchImportResult",
     "apply_annotation_batch",
     "apply_annotation_batch_file",
+    "ProjectBuildResult",
+    "build_project_package",
+    "build_project_package_from_file",
 ]

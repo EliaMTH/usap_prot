@@ -1,0 +1,49 @@
+{
+  "db_path": "../outputs/example_project.usap.gpkg",
+  "manifest_path": "../outputs/example_project_manifest.json",
+  "schema_path": "../sql/schema.sql",
+
+  "vocabularies": [
+    "../vocabularies/citygml_3_0_mvp.json",
+    "../vocabularies/usap_ade_prototype.json"
+  ],
+
+  "citygml": {
+    "path": "../data/area.gml",
+    "graph_name": "citygml_import",
+    "also_usap_default": true,
+    "compute_hash": true
+  },
+
+  "las": [
+    {
+      "path": "../data/area.las",
+      "part_path": "points/all",
+      "compute_hash": true
+    }
+  ],
+
+  "meshes": [
+    {
+      "path": "../data/area_lod1.obj",
+      "representation_name": "buildings_lod1",
+      "representation_kind": "building_mesh",
+      "lod": "LoD1",
+      "compute_hash": true
+    },
+    {
+      "path": "../data/area_lod2.obj",
+      "representation_name": "buildings_lod2",
+      "representation_kind": "building_mesh",
+      "lod": "LoD2",
+      "compute_hash": true
+    },
+    {
+      "path": "../data/city_triangulation.obj",
+      "representation_name": "city_triangulation",
+      "representation_kind": "triangulated_city_surface",
+      "lod": null,
+      "compute_hash": true
+    }
+  ]
+}

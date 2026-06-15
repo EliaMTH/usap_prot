@@ -29,14 +29,14 @@ def build_tiny_package(db_path: Path) -> tuple[USAPPackage, int, int, int]:
     building_class_id = pkg.create_semantic_class(
         scheme="citygml",
         scheme_version="3.0",
-        class_uri="citygml-3.0:bldg:Building",
+        class_uri="citygml-3.0:building:Building",
         local_name="Building",
     )
 
     roof_class_id = pkg.create_semantic_class(
         scheme="citygml",
         scheme_version="3.0",
-        class_uri="citygml-3.0:bldg:RoofSurface",
+        class_uri="citygml-3.0:building:RoofSurface",
         local_name="RoofSurface",
     )
 

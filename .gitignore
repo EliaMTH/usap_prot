@@ -5,3 +5,9 @@ __pycache__/
 *.usap.gpkg
 *.usap.gpkg
 *.prof
+city_JSON.gml
+city_mesh.obj
+decimated_classified_output.las
+outputs/
+*.usap.gpkg
+data/

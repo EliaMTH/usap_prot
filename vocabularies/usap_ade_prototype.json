@@ -1,0 +1,87 @@
+{
+  "registry_uid": "usap_ade_prototype",
+  "title": "USAP prototype ADE/custom domain concepts",
+  "scheme": "usap-ade-prototype",
+  "scheme_version": "0.1",
+  "is_ade": true,
+  "source": {
+    "name": "USAP prototype domain requirements",
+    "note": "ADE-ready custom classes. No formal ADE schema validation yet."
+  },
+  "concepts": [
+    {
+      "module": "common",
+      "local_name": "Facade",
+      "class_uri": "usap-ade-prototype:common:Facade"
+    },
+    {
+      "module": "common",
+      "local_name": "ExternalSurface",
+      "class_uri": "usap-ade-prototype:common:ExternalSurface"
+    },
+    {
+      "module": "common",
+      "local_name": "UrbanZone",
+      "class_uri": "usap-ade-prototype:common:UrbanZone"
+    },
+    {
+      "module": "common",
+      "local_name": "BuildingElement",
+      "class_uri": "usap-ade-prototype:common:BuildingElement"
+    },
+
+    {
+      "module": "energy_emissions",
+      "local_name": "EnergyBuilding",
+      "class_uri": "usap-ade-prototype:energy:EnergyBuilding"
+    },
+    {
+      "module": "energy_emissions",
+      "local_name": "EnergyFacade",
+      "class_uri": "usap-ade-prototype:energy:EnergyFacade"
+    },
+    {
+      "module": "energy_emissions",
+      "local_name": "EnergyRoof",
+      "class_uri": "usap-ade-prototype:energy:EnergyRoof"
+    },
+
+    {
+      "module": "soil_permeability",
+      "local_name": "PermeabilityExternalSurface",
+      "class_uri": "usap-ade-prototype:soil:PermeabilityExternalSurface"
+    },
+    {
+      "module": "soil_permeability",
+      "local_name": "PermeabilityUrbanZone",
+      "class_uri": "usap-ade-prototype:soil:PermeabilityUrbanZone"
+    },
+
+    {
+      "module": "acoustic_comfort",
+      "local_name": "AcousticBuilding",
+      "class_uri": "usap-ade-prototype:acoustic:AcousticBuilding"
+    },
+    {
+      "module": "acoustic_comfort",
+      "local_name": "AcousticUrbanArea",
+      "class_uri": "usap-ade-prototype:acoustic:AcousticUrbanArea"
+    },
+    {
+      "module": "acoustic_comfort",
+      "local_name": "ScreeningElement",
+      "class_uri": "usap-ade-prototype:acoustic:ScreeningElement"
+    },
+
+    {
+      "module": "visual_wellbeing",
+      "local_name": "VisualBuilding",
+      "class_uri": "usap-ade-prototype:visual:VisualBuilding"
+    },
+    {
+      "module": "visual_wellbeing",
+      "local_name": "VisualFacade",
+      "class_uri": "usap-ade-prototype:visual:VisualFacade"
+    }
+  ]
+}

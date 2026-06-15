@@ -1,0 +1,44 @@
+{
+  "vocabularies": [
+    "../../vocabularies/citygml_3_0_mvp.json",
+    "../../vocabularies/usap_ade_prototype.json"
+  ],
+  "annotations": [
+    {
+      "annotation_uid": "ann_batch_energy_roof_001",
+      "concept": "EnergyRoof",
+      "city_object_uid": "building_1_roof_1",
+      "label": "Batch EnergyRoof annotation",
+      "status": "draft",
+      "confidence": 0.8,
+      "attributes": {
+        "domain": "energy_emissions",
+        "geometric_attributes": {
+          "roof_slope": 31.5,
+          "orientation": "SE",
+          "shading": "partial"
+        },
+        "non_geometric_attributes": {
+          "construction_era": "1946-1970",
+          "use": "residential"
+        },
+        "derived_indicators": {
+          "specific_energy_kwh_m2": null,
+          "co2_emissions": null
+        }
+      },
+      "memberships": [
+        {
+          "asset_part_id": 1,
+          "element_kind": "point",
+          "element_indices": [1, 2, 3]
+        },
+        {
+          "asset_part_id": 2,
+          "element_kind": "face",
+          "element_indices": [0, 1]
+        }
+      ]
+    }
+  ]
+}

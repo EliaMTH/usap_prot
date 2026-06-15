@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from .core import USAPPackage
 
@@ -11,103 +14,135 @@ class VocabularyResult:
     by_uri: dict[str, int]
 
 
-def seed_citygml_basic_classes(pkg: USAPPackage) -> VocabularyResult:
-    """
-    Seed basic CityGML-inspired semantic classes.
+DEFAULT_CITYGML_VOCABULARY_PATH = Path("vocabularies/citygml_3_0_mvp.json")
+DEFAULT_ADE_VOCABULARY_PATH = Path("vocabularies/usap_ade_prototype.json")
 
-    This is not a full CityGML schema import.
-    It creates the class references needed for prototype annotation.
+
+def seed_vocabulary_file(
+    pkg: USAPPackage,
+    path: str | Path,
+) -> VocabularyResult:
     """
+    Seed semantic classes from an external vocabulary JSON file.
+
+    The JSON file is the accepted concept registry for one scheme/version.
+    Concepts are idempotently inserted using scheme + class_uri.
+    """
+    vocab_path = Path(path)
+
+    if not vocab_path.exists():
+        raise FileNotFoundError(f"Vocabulary file not found: {vocab_path}")
+
+    data = json.loads(vocab_path.read_text(encoding="utf-8"))
+
+    scheme = _required_str(data, "scheme", source=str(vocab_path))
+    scheme_version = data.get("scheme_version")
+    is_ade = bool(data.get("is_ade", False))
+
+    concepts = data.get("concepts")
+
+    if not isinstance(concepts, list):
+        raise ValueError(
+            f"Vocabulary {vocab_path} must contain a 'concepts' list."
+        )
+
     by_name: dict[str, int] = {}
     by_uri: dict[str, int] = {}
 
-    def add(
-        local_name: str,
-        class_uri: str,
-        parent_name: str | None = None,
-    ) -> int:
-        parent_id = by_name[parent_name] if parent_name else None
+    # First pass: create in the order given by the file.
+    # Parent concepts should appear before children.
+    for item in concepts:
+        if not isinstance(item, dict):
+            raise ValueError(f"Invalid concept entry in {vocab_path}: {item!r}")
 
-        class_id = pkg.create_semantic_class(
-            scheme="citygml",
-            scheme_version="3.0",
+        local_name = _required_str(item, "local_name", source=str(vocab_path))
+        class_uri = _required_str(item, "class_uri", source=str(vocab_path))
+
+        parent_class_id = None
+        parent_uri = item.get("parent_uri")
+        parent_name = item.get("parent_name")
+
+        if parent_uri is not None:
+            parent_class_id = _resolve_optional_parent(
+                pkg,
+                parent_uri,
+                scheme=scheme,
+                vocab_path=vocab_path,
+                child_uri=class_uri,
+            )
+
+        elif parent_name is not None:
+            parent_class_id = _resolve_optional_parent(
+                pkg,
+                parent_name,
+                scheme=scheme,
+                vocab_path=vocab_path,
+                child_uri=class_uri,
+            )
+
+        class_id = pkg.get_or_create_semantic_class(
+            scheme=scheme,
+            scheme_version=scheme_version,
             class_uri=class_uri,
             local_name=local_name,
-            parent_class_id=parent_id,
-            is_ade=False,
+            parent_class_id=parent_class_id,
+            is_ade=is_ade,
         )
 
         by_name[local_name] = class_id
         by_uri[class_uri] = class_id
 
-        return class_id
-
-    add("Building", "citygml-3.0:bldg:Building")
-    add("BuildingPart", "citygml-3.0:bldg:BuildingPart")
-
-    add("BoundarySurface", "citygml-3.0:bldg:BoundarySurface")
-    add("RoofSurface", "citygml-3.0:bldg:RoofSurface", "BoundarySurface")
-    add("WallSurface", "citygml-3.0:bldg:WallSurface", "BoundarySurface")
-    add("GroundSurface", "citygml-3.0:bldg:GroundSurface", "BoundarySurface")
-    add("ClosureSurface", "citygml-3.0:bldg:ClosureSurface", "BoundarySurface")
-    add("OuterCeilingSurface", "citygml-3.0:bldg:OuterCeilingSurface", "BoundarySurface")
-    add("OuterFloorSurface", "citygml-3.0:bldg:OuterFloorSurface", "BoundarySurface")
-
-    add("Opening", "citygml-3.0:bldg:Opening")
-    add("Window", "citygml-3.0:bldg:Window", "Opening")
-    add("Door", "citygml-3.0:bldg:Door", "Opening")
-
     return VocabularyResult(by_name=by_name, by_uri=by_uri)
+
+
+def seed_default_citygml_vocabulary(pkg: USAPPackage) -> VocabularyResult:
+    return seed_vocabulary_file(pkg, DEFAULT_CITYGML_VOCABULARY_PATH)
+
+
+def seed_default_ade_vocabulary(pkg: USAPPackage) -> VocabularyResult:
+    return seed_vocabulary_file(pkg, DEFAULT_ADE_VOCABULARY_PATH)
+
+
+# Backward-compatible names used by earlier tests/examples.
+
+def seed_citygml_basic_classes(pkg: USAPPackage) -> VocabularyResult:
+    return seed_default_citygml_vocabulary(pkg)
 
 
 def seed_prototype_ade_classes(pkg: USAPPackage) -> VocabularyResult:
-    """
-    Seed prototype ADE/domain classes.
+    return seed_default_ade_vocabulary(pkg)
 
-    These are intentionally stored as ADE/custom semantic classes.
-    Later, when your ADE is formalized, the URIs can be replaced by the
-    official ADE namespace/class URIs without changing the membership model.
-    """
-    by_name: dict[str, int] = {}
-    by_uri: dict[str, int] = {}
 
-    def add(local_name: str, class_uri: str) -> int:
-        class_id = pkg.create_semantic_class(
-            scheme="usap-ade-prototype",
-            scheme_version="0.1",
-            class_uri=class_uri,
-            local_name=local_name,
-            parent_class_id=None,
-            is_ade=True,
+def _required_str(
+    data: dict[str, Any],
+    key: str,
+    *,
+    source: str,
+) -> str:
+    value = data.get(key)
+
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{source}: missing required string field {key!r}")
+
+    return value
+
+
+def _resolve_optional_parent(
+    pkg: USAPPackage,
+    parent_ref: str,
+    *,
+    scheme: str,
+    vocab_path: Path,
+    child_uri: str,
+) -> int:
+    try:
+        return pkg.resolve_semantic_class(
+            parent_ref,
+            scheme=scheme,
         )
-
-        by_name[local_name] = class_id
-        by_uri[class_uri] = class_id
-
-        return class_id
-
-    # Shared / reusable domain concepts
-    add("Facade", "usap-ade-prototype:common:Facade")
-    add("ExternalSurface", "usap-ade-prototype:common:ExternalSurface")
-    add("UrbanZone", "usap-ade-prototype:common:UrbanZone")
-    add("BuildingElement", "usap-ade-prototype:common:BuildingElement")
-
-    # Energy / emissions
-    add("EnergyBuilding", "usap-ade-prototype:energy:EnergyBuilding")
-    add("EnergyFacade", "usap-ade-prototype:energy:EnergyFacade")
-    add("EnergyRoof", "usap-ade-prototype:energy:EnergyRoof")
-
-    # Soil permeability
-    add("PermeabilityExternalSurface", "usap-ade-prototype:soil:PermeabilityExternalSurface")
-    add("PermeabilityUrbanZone", "usap-ade-prototype:soil:PermeabilityUrbanZone")
-
-    # Acoustic comfort
-    add("AcousticBuilding", "usap-ade-prototype:acoustic:AcousticBuilding")
-    add("AcousticUrbanArea", "usap-ade-prototype:acoustic:AcousticUrbanArea")
-    add("ScreeningElement", "usap-ade-prototype:acoustic:ScreeningElement")
-
-    # Visual well-being
-    add("VisualBuilding", "usap-ade-prototype:visual:VisualBuilding")
-    add("VisualFacade", "usap-ade-prototype:visual:VisualFacade")
-
-    return VocabularyResult(by_name=by_name, by_uri=by_uri)
+    except Exception as exc:
+        raise ValueError(
+            f"{vocab_path}: parent concept {parent_ref!r} for "
+            f"{child_uri!r} is not registered yet. Put parent concepts "
+            "before children in the vocabulary file."
+        ) from exc

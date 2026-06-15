@@ -7,16 +7,38 @@ from contextlib import contextmanager
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-
+import json
+import uuid
 
 from .errors import USAPError
-from .constants import DEFAULT_BLOCK_SIZE, DEFAULT_ENCODING
+from .constants import (
+    DEFAULT_BLOCK_SIZE,
+    DEFAULT_ENCODING,
+    normalize_element_kind,
+)
 from .encoding import encode_u32_zlib, decode_u32_zlib, block_start_for_index, split_indices_into_blocks
 from .sqlite_utils import require_lastrowid
 from .validation import validate_connection
 from .geopackage import initialize_geopackage_metadata
 
+_UNSET = object()
+
 class USAPPackage:
+
+    def _commit_if_needed(self) -> None:
+        """
+        Commit immediately unless we are inside an explicit package transaction.
+
+        Prototype note:
+        Older methods call this after write operations so single operations are
+        persisted, while bulk operations inside `with pkg.transaction():` only
+        commit once at the end.
+        """
+        if getattr(self, "_transaction_depth", 0) == 0:
+            self.conn.commit()
+
+
+
     """
     Tiny phase-1 USAP SDK. It controls common database edits and queries.
     """
@@ -262,6 +284,7 @@ class USAPPackage:
 
         Returns asset_part_id.
         """
+        element_kind = normalize_element_kind(element_kind)
         if element_count < 0:
             raise USAPError("element_count cannot be negative")
 
@@ -629,6 +652,337 @@ class USAPPackage:
     # Annotations
     # ---------------------------------------------------------------------
 
+    def get_annotation(
+        self,
+        annotation_id: int | None = None,
+        *,
+        annotation_uid: str | None = None,
+        include_membership_summary: bool = True,
+    ) -> dict[str, Any] | None:
+        """
+        Read one annotation by id or uid.
+
+        Returns None if no annotation is found.
+        """
+        if annotation_id is None and annotation_uid is None:
+            raise USAPError("Provide annotation_id or annotation_uid.")
+
+        if annotation_id is not None and annotation_uid is not None:
+            raise USAPError("Provide only one of annotation_id or annotation_uid.")
+
+        where_sql = "a.annotation_id = ?"
+        params: list[Any] = [annotation_id]
+
+        if annotation_uid is not None:
+            where_sql = "a.annotation_uid = ?"
+            params = [annotation_uid]
+
+        row = self.conn.execute(
+            f"""
+            SELECT
+                a.annotation_id,
+                a.annotation_uid,
+                a.semantic_class_id,
+                sc.scheme AS semantic_scheme,
+                sc.scheme_version AS semantic_scheme_version,
+                sc.class_uri AS semantic_class_uri,
+                sc.local_name AS semantic_class,
+                sc.is_ade AS semantic_is_ade,
+                a.primary_city_object_id,
+                co.object_uid AS primary_city_object_uid,
+                co.gml_id AS primary_city_object_gml_id,
+                a.label,
+                a.status,
+                a.confidence,
+                a.attributes_json
+            FROM usap_annotation AS a
+            JOIN usap_semantic_class AS sc
+                ON sc.semantic_class_id = a.semantic_class_id
+            LEFT JOIN usap_city_object AS co
+                ON co.city_object_id = a.primary_city_object_id
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        result = dict(row)
+
+        if include_membership_summary:
+            result["membership_summary"] = self._annotation_membership_summary(
+                int(result["annotation_id"])
+            )
+
+        return result
+
+
+    def list_annotations(
+        self,
+        *,
+        status: str | None = None,
+        semantic_class_id: int | None = None,
+        semantic_class_local_name: str | None = None,
+        city_object_id: int | None = None,
+        city_object_uid: str | None = None,
+        include_membership_summary: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        List annotations using simple prototype filters.
+
+        Filters are AND-combined.
+
+        city_object_id / city_object_uid matches either:
+        - annotation.primary_city_object_id
+        - usap_annotation_object links
+        """
+        where: list[str] = []
+        params: list[Any] = []
+
+        if status is not None:
+            where.append("a.status = ?")
+            params.append(status)
+
+        if semantic_class_id is not None:
+            where.append("a.semantic_class_id = ?")
+            params.append(semantic_class_id)
+
+        if semantic_class_local_name is not None:
+            where.append("sc.local_name = ?")
+            params.append(semantic_class_local_name)
+
+        if city_object_id is not None:
+            where.append(
+                """
+                (
+                    a.primary_city_object_id = ?
+                    OR EXISTS (
+                        SELECT 1
+                        FROM usap_annotation_object AS ao
+                        WHERE ao.annotation_id = a.annotation_id
+                        AND ao.city_object_id = ?
+                    )
+                )
+                """
+            )
+            params.extend([city_object_id, city_object_id])
+
+        if city_object_uid is not None:
+            where.append(
+                """
+                (
+                    primary_co.object_uid = ?
+                    OR EXISTS (
+                        SELECT 1
+                        FROM usap_annotation_object AS ao
+                        JOIN usap_city_object AS linked_co
+                            ON linked_co.city_object_id = ao.city_object_id
+                        WHERE ao.annotation_id = a.annotation_id
+                        AND linked_co.object_uid = ?
+                    )
+                )
+                """
+            )
+            params.extend([city_object_uid, city_object_uid])
+
+        where_sql = ""
+
+        if where:
+            where_sql = "WHERE " + " AND ".join(where)
+
+        limit_sql = ""
+
+        if limit is not None:
+            if limit <= 0:
+                raise USAPError("limit must be positive when provided.")
+
+            limit_sql = "LIMIT ?"
+            params.append(limit)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT
+                a.annotation_id,
+                a.annotation_uid,
+                a.semantic_class_id,
+                sc.scheme AS semantic_scheme,
+                sc.scheme_version AS semantic_scheme_version,
+                sc.class_uri AS semantic_class_uri,
+                sc.local_name AS semantic_class,
+                sc.is_ade AS semantic_is_ade,
+                a.primary_city_object_id,
+                primary_co.object_uid AS primary_city_object_uid,
+                primary_co.gml_id AS primary_city_object_gml_id,
+                a.label,
+                a.status,
+                a.confidence,
+                a.attributes_json
+            FROM usap_annotation AS a
+            JOIN usap_semantic_class AS sc
+                ON sc.semantic_class_id = a.semantic_class_id
+            LEFT JOIN usap_city_object AS primary_co
+                ON primary_co.city_object_id = a.primary_city_object_id
+            {where_sql}
+            ORDER BY a.annotation_id
+            {limit_sql}
+            """,
+            params,
+        ).fetchall()
+
+        result = [dict(row) for row in rows]
+
+        if include_membership_summary:
+            for item in result:
+                item["membership_summary"] = self._annotation_membership_summary(
+                    int(item["annotation_id"])
+                )
+
+        return result
+
+
+    def update_annotation(
+        self,
+        annotation_id: int,
+        *,
+        annotation_uid: object = _UNSET,
+        semantic_class_id: object = _UNSET,
+        primary_city_object_id: object = _UNSET,
+        label: object = _UNSET,
+        status: object = _UNSET,
+        confidence: object = _UNSET,
+        attributes_json: object = _UNSET,
+    ) -> dict[str, Any]:
+        """
+        Update annotation metadata.
+
+        Omitted fields are preserved.
+        Passing None explicitly stores NULL.
+        """
+        updates: list[str] = []
+        params: list[Any] = []
+
+        def add_update(column: str, value: object) -> None:
+            if value is _UNSET:
+                return
+
+            updates.append(f"{column} = ?")
+            params.append(value)
+
+        add_update("annotation_uid", annotation_uid)
+        add_update("semantic_class_id", semantic_class_id)
+        add_update("primary_city_object_id", primary_city_object_id)
+        add_update("label", label)
+        add_update("status", status)
+        add_update("confidence", confidence)
+        add_update("attributes_json", attributes_json)
+
+        if not updates:
+            existing = self.get_annotation(annotation_id)
+
+            if existing is None:
+                raise USAPError(f"Annotation not found: {annotation_id}")
+
+            return existing
+
+        params.append(annotation_id)
+
+        cur = self.conn.execute(
+            f"""
+            UPDATE usap_annotation
+            SET {", ".join(updates)}
+            WHERE annotation_id = ?
+            """,
+            params,
+        )
+
+        if cur.rowcount != 1:
+            raise USAPError(f"Annotation not found: {annotation_id}")
+
+        self._commit_if_needed()
+
+        updated = self.get_annotation(annotation_id)
+
+        if updated is None:
+            raise USAPError(f"Annotation disappeared after update: {annotation_id}")
+
+        return updated
+
+
+    def delete_annotation(
+        self,
+        annotation_id: int,
+        *,
+        missing_ok: bool = False,
+    ) -> bool:
+        """
+        Delete an annotation.
+
+        Membership blocks and annotation-object links should be removed by
+        ON DELETE CASCADE.
+
+        Returns True if an annotation was deleted.
+        Returns False only when missing_ok=True and the annotation did not exist.
+        """
+        cur = self.conn.execute(
+            """
+            DELETE FROM usap_annotation
+            WHERE annotation_id = ?
+            """,
+            (annotation_id,),
+        )
+
+        if cur.rowcount == 0:
+            if missing_ok:
+                return False
+
+            raise USAPError(f"Annotation not found: {annotation_id}")
+
+        self._commit_if_needed()
+
+        return True
+
+
+    def _annotation_membership_summary(
+        self,
+        annotation_id: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Summarize which asset parts an annotation touches.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT
+                mb.asset_part_id,
+                ap.asset_id,
+                asset.uri AS asset_uri,
+                asset.asset_kind,
+                ap.part_path,
+                ap.element_kind,
+                SUM(mb.element_count) AS selected_count,
+                COUNT(*) AS block_count
+            FROM usap_membership_block AS mb
+            JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = mb.asset_part_id
+            JOIN usap_asset AS asset
+                ON asset.asset_id = ap.asset_id
+            WHERE mb.annotation_id = ?
+            GROUP BY
+                mb.asset_part_id,
+                ap.asset_id,
+                asset.uri,
+                asset.asset_kind,
+                ap.part_path,
+                ap.element_kind
+            ORDER BY mb.asset_part_id
+            """,
+            (annotation_id,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+
     def create_annotation(
         self,
         annotation_uid: str,
@@ -762,6 +1116,7 @@ class USAPPackage:
 
         This is an edit operation, so we validate first and write in a transaction.
         """
+        element_kind = normalize_element_kind(element_kind)
         if encoding != "u32-zlib":
             raise USAPError(f"Unsupported encoding in phase 1: {encoding}")
 
@@ -779,10 +1134,14 @@ class USAPPackage:
                 """
                 DELETE FROM usap_membership_block
                 WHERE annotation_id = ?
-                  AND asset_part_id = ?
-                  AND element_kind = ?
+                AND asset_part_id = ?
+                AND element_kind = ?
                 """,
-                (annotation_id, asset_part_id, element_kind),
+                (
+                    annotation_id,
+                    asset_part_id,
+                    element_kind,
+                ),
             )
 
             for block_start, offsets in blocks.items():
@@ -894,6 +1253,7 @@ class USAPPackage:
         - queries all relevant block_start values in one SQL query
         - decodes only candidate membership blocks
         """
+        element_kind = normalize_element_kind(element_kind)
         if not selected_indices:
             return []
 
@@ -1185,3 +1545,501 @@ class USAPPackage:
         """
         report = self.validate_report()
         return [issue.format() for issue in report.issues]
+
+    # ---------------------------------------------------------------------
+    # CRUD operations for integrated prototype test
+    # --------------------------------------------------------------------- 
+
+    def resolve_semantic_class(
+        self,
+        concept: int | str,
+        *,
+        scheme: str | None = None,
+        require_unique: bool = True,
+    ) -> int:
+        """
+        Resolve a concept reference to a semantic_class_id.
+
+        Accepted concept forms:
+        - semantic_class_id as int
+        - class_uri as str
+        - local_name as str
+
+        Examples:
+        resolve_semantic_class(12)
+        resolve_semantic_class("RoofSurface")
+        resolve_semantic_class("citygml-3.0:building:RoofSurface")
+        resolve_semantic_class("EnergyRoof")
+        resolve_semantic_class("usap-ade-prototype:energy:EnergyRoof")
+        """
+        if isinstance(concept, int):
+            row = self.conn.execute(
+                """
+                SELECT semantic_class_id
+                FROM usap_semantic_class
+                WHERE semantic_class_id = ?
+                """,
+                (concept,),
+            ).fetchone()
+
+            if row is None:
+                raise USAPError(f"Semantic class not found: {concept}")
+
+            return int(row["semantic_class_id"])
+
+        where = """
+            (
+                local_name = ?
+                OR class_uri = ?
+            )
+        """
+        params: list[Any] = [concept, concept]
+
+        if scheme is not None:
+            where += " AND scheme = ?"
+            params.append(scheme)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                semantic_class_id,
+                scheme,
+                scheme_version,
+                class_uri,
+                local_name,
+                is_ade
+            FROM usap_semantic_class
+            WHERE {where}
+            ORDER BY semantic_class_id
+            """,
+            params,
+        ).fetchall()
+
+        if not rows:
+            raise USAPError(f"Semantic class concept not found: {concept}")
+
+        if require_unique and len(rows) > 1:
+            options = [
+                {
+                    "semantic_class_id": int(row["semantic_class_id"]),
+                    "scheme": row["scheme"],
+                    "scheme_version": row["scheme_version"],
+                    "class_uri": row["class_uri"],
+                    "local_name": row["local_name"],
+                    "is_ade": bool(row["is_ade"]),
+                }
+                for row in rows
+            ]
+
+            raise USAPError(
+                "Semantic class concept is ambiguous. "
+                f"Use a class_uri, semantic_class_id, or scheme. "
+                f"Concept: {concept}. Options: {options}"
+            )
+
+        return int(rows[0]["semantic_class_id"])
+    
+
+    def get_semantic_class(
+        self,
+        concept: int | str,
+        *,
+        scheme: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Resolve and return one semantic class record.
+        """
+        semantic_class_id = self.resolve_semantic_class(
+            concept,
+            scheme=scheme,
+        )
+
+        row = self.conn.execute(
+            """
+            SELECT
+                semantic_class_id,
+                scheme,
+                scheme_version,
+                class_uri,
+                local_name,
+                parent_class_id,
+                is_ade
+            FROM usap_semantic_class
+            WHERE semantic_class_id = ?
+            """,
+            (semantic_class_id,),
+        ).fetchone()
+
+        if row is None:
+            raise USAPError(f"Semantic class not found: {semantic_class_id}")
+
+        result = dict(row)
+        result["is_ade"] = bool(result["is_ade"])
+
+        return result
+
+
+    def list_accepted_concepts(
+        self,
+        *,
+        scheme: str | None = None,
+        is_ade: bool | None = None,
+        search: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        List concepts currently registered in the package.
+
+        These are the concepts accepted by annotate_elements(...).
+        """
+        where: list[str] = []
+        params: list[Any] = []
+
+        if scheme is not None:
+            where.append("scheme = ?")
+            params.append(scheme)
+
+        if is_ade is not None:
+            where.append("is_ade = ?")
+            params.append(1 if is_ade else 0)
+
+        if search is not None:
+            pattern = f"%{search}%"
+            where.append(
+                """
+                (
+                    local_name LIKE ?
+                    OR class_uri LIKE ?
+                    OR scheme LIKE ?
+                )
+                """
+            )
+            params.extend([pattern, pattern, pattern])
+
+        where_sql = ""
+
+        if where:
+            where_sql = "WHERE " + " AND ".join(where)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                semantic_class_id,
+                scheme,
+                scheme_version,
+                class_uri,
+                local_name,
+                parent_class_id,
+                is_ade
+            FROM usap_semantic_class
+            {where_sql}
+            ORDER BY is_ade, scheme, local_name, semantic_class_id
+            """,
+            params,
+        ).fetchall()
+
+        result = []
+
+        for row in rows:
+            item = dict(row)
+            item["is_ade"] = bool(item["is_ade"])
+            result.append(item)
+
+        return result
+
+
+    def concept_exists(
+        self,
+        concept: int | str,
+        *,
+        scheme: str | None = None,
+    ) -> bool:
+        """
+        Return True if a concept resolves to exactly one semantic class.
+        """
+        try:
+            self.resolve_semantic_class(
+                concept,
+                scheme=scheme,
+            )
+        except USAPError:
+            return False
+
+        return True
+    
+    def resolve_city_object(
+        self,
+        city_object: int | str,
+    ) -> int:
+        """
+        Resolve a city object reference to city_object_id.
+
+        Accepted forms:
+        - city_object_id as int
+        - object_uid as str
+        - gml_id as str
+        """
+        if isinstance(city_object, int):
+            row = self.conn.execute(
+                """
+                SELECT city_object_id
+                FROM usap_city_object
+                WHERE city_object_id = ?
+                """,
+                (city_object,),
+            ).fetchone()
+
+            if row is None:
+                raise USAPError(f"City object not found: {city_object}")
+
+            return int(row["city_object_id"])
+
+        rows = self.conn.execute(
+            """
+            SELECT city_object_id, object_uid, gml_id
+            FROM usap_city_object
+            WHERE object_uid = ?
+            OR gml_id = ?
+            ORDER BY city_object_id
+            """,
+            (city_object, city_object),
+        ).fetchall()
+
+        if not rows:
+            raise USAPError(f"City object not found: {city_object}")
+
+        if len(rows) > 1:
+            options = [
+                {
+                    "city_object_id": int(row["city_object_id"]),
+                    "object_uid": row["object_uid"],
+                    "gml_id": row["gml_id"],
+                }
+                for row in rows
+            ]
+
+            raise USAPError(
+                "City object reference is ambiguous. "
+                f"Use city_object_id. Reference: {city_object}. Options: {options}"
+            )
+
+        return int(rows[0]["city_object_id"])
+    
+    def create_concept_annotation(
+        self,
+        *,
+        concept: int | str,
+        annotation_uid: str | None = None,
+        city_object_id: int | None = None,
+        city_object_uid: str | None = None,
+        label: str | None = None,
+        status: str = "draft",
+        confidence: float | None = None,
+        attributes: dict[str, Any] | None = None,
+        attributes_json: str | None = None,
+        scheme: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Create an annotation using a concept reference instead of a raw
+        semantic_class_id.
+
+        The concept can come from CityGML, ADE, or any registered semantic scheme.
+        """
+        semantic_class_id = self.resolve_semantic_class(
+            concept,
+            scheme=scheme,
+        )
+
+        resolved_city_object_id: int | None = None
+
+        if city_object_id is not None and city_object_uid is not None:
+            raise USAPError("Provide city_object_id or city_object_uid, not both.")
+
+        if city_object_id is not None:
+            resolved_city_object_id = self.resolve_city_object(city_object_id)
+
+        if city_object_uid is not None:
+            resolved_city_object_id = self.resolve_city_object(city_object_uid)
+
+        if attributes is not None and attributes_json is not None:
+            raise USAPError("Provide attributes or attributes_json, not both.")
+
+        stored_attributes_json = attributes_json
+
+        if attributes is not None:
+            stored_attributes_json = json.dumps(attributes)
+
+        if annotation_uid is None:
+            annotation_uid = f"ann_{uuid.uuid4().hex}"
+
+        annotation_id = self.create_annotation(
+            annotation_uid=annotation_uid,
+            semantic_class_id=semantic_class_id,
+            primary_city_object_id=resolved_city_object_id,
+            label=label,
+            status=status,
+            confidence=confidence,
+            attributes_json=stored_attributes_json,
+        )
+
+        if resolved_city_object_id is not None:
+            self.link_annotation_to_object(
+                annotation_id=annotation_id,
+                city_object_id=resolved_city_object_id,
+            )
+
+        annotation = self.get_annotation(
+            annotation_id,
+            include_membership_summary=True,
+        )
+
+        if annotation is None:
+            raise USAPError(
+                f"Annotation disappeared after creation: {annotation_id}"
+            )
+
+        return annotation
+    
+    def annotate_elements(
+        self,
+        *,
+        concept: int | str,
+        asset_part_id: int,
+        element_kind: str,
+        element_indices: list[int],
+        annotation_uid: str | None = None,
+        city_object_id: int | None = None,
+        city_object_uid: str | None = None,
+        label: str | None = None,
+        status: str = "draft",
+        confidence: float | None = None,
+        attributes: dict[str, Any] | None = None,
+        attributes_json: str | None = None,
+        scheme: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Create an annotation for a concept and immediately attach selected elements.
+
+        This is the main prototype API:
+
+            annotate this asset part, these element indices, as this concept.
+
+        The concept can be CityGML, ADE, or any registered semantic class.
+        """
+        element_kind = normalize_element_kind(element_kind)
+        with self.transaction():
+            annotation = self.create_concept_annotation(
+                concept=concept,
+                annotation_uid=annotation_uid,
+                city_object_id=city_object_id,
+                city_object_uid=city_object_uid,
+                label=label,
+                status=status,
+                confidence=confidence,
+                attributes=attributes,
+                attributes_json=attributes_json,
+                scheme=scheme,
+            )
+
+            annotation_id = int(annotation["annotation_id"])
+
+            self.replace_annotation_membership(
+                annotation_id=annotation_id,
+                asset_part_id=asset_part_id,
+                element_kind=element_kind,
+                element_indices=element_indices,
+            )
+
+        result = self.get_annotation(
+            annotation_id,
+            include_membership_summary=True,
+        )
+
+        if result is None:
+            raise USAPError(
+                f"Annotation disappeared after element annotation: {annotation_id}"
+            )
+
+        return result
+    
+
+    def attach_annotation_elements(
+        self,
+        *,
+        annotation_id: int,
+        asset_part_id: int,
+        element_kind: str,
+        element_indices: list[int],
+    ) -> dict[str, Any]:
+        """
+        Attach or replace selected elements for one annotation on one asset part.
+
+        This is a clearer prototype name for replace_annotation_membership.
+        It preserves memberships on other asset parts.
+        """
+        element_kind = normalize_element_kind(element_kind)
+        self.replace_annotation_membership(
+            annotation_id=annotation_id,
+            asset_part_id=asset_part_id,
+            element_kind=element_kind,
+            element_indices=element_indices,
+        )
+
+        annotation = self.get_annotation(
+            annotation_id,
+            include_membership_summary=True,
+        )
+
+        if annotation is None:
+            raise USAPError(
+                f"Annotation not found after attaching elements: {annotation_id}"
+            )
+
+        return annotation
+    
+    # ---------------------------------------------------------------------
+    # CRUD operations for integrated prototype test
+    # --------------------------------------------------------------------- 
+    def get_or_create_semantic_class(
+        self,
+        *,
+        scheme: str,
+        scheme_version: str | None,
+        class_uri: str,
+        local_name: str,
+        parent_class_id: int | None = None,
+        is_ade: bool = False,
+    ) -> int:
+        """
+        Return an existing semantic class with the same scheme + class_uri,
+        or create it if it does not exist.
+
+        This makes vocabulary seeding idempotent.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT semantic_class_id
+            FROM usap_semantic_class
+            WHERE scheme = ?
+            AND class_uri = ?
+            ORDER BY semantic_class_id
+            """,
+            (scheme, class_uri),
+        ).fetchall()
+
+        if len(rows) > 1:
+            raise USAPError(
+                "Duplicate semantic class registration for "
+                f"scheme={scheme!r}, class_uri={class_uri!r}."
+            )
+
+        if len(rows) == 1:
+            return int(rows[0]["semantic_class_id"])
+
+        return self.create_semantic_class(
+            scheme=scheme,
+            scheme_version=scheme_version,
+            class_uri=class_uri,
+            local_name=local_name,
+            parent_class_id=parent_class_id,
+            is_ade=is_ade,
+        )

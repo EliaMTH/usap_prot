@@ -119,28 +119,28 @@ def create_synthetic_package(
             building_class_id = pkg.create_semantic_class(
                 scheme="citygml",
                 scheme_version="3.0",
-                class_uri="citygml-3.0:bldg:Building",
+                class_uri="citygml-3.0:building:Building",
                 local_name="Building",
             )
 
             roof_class_id = pkg.create_semantic_class(
                 scheme="citygml",
                 scheme_version="3.0",
-                class_uri="citygml-3.0:bldg:RoofSurface",
+                class_uri="citygml-3.0:building:RoofSurface",
                 local_name="RoofSurface",
             )
 
             wall_class_id = pkg.create_semantic_class(
                 scheme="citygml",
                 scheme_version="3.0",
-                class_uri="citygml-3.0:bldg:WallSurface",
+                class_uri="citygml-3.0:building:WallSurface",
                 local_name="WallSurface",
             )
 
             ground_class_id = pkg.create_semantic_class(
                 scheme="citygml",
                 scheme_version="3.0",
-                class_uri="citygml-3.0:bldg:GroundSurface",
+                class_uri="citygml-3.0:building:GroundSurface",
                 local_name="GroundSurface",
             )
 

@@ -100,6 +100,7 @@ def validate_connection(conn: sqlite3.Connection) -> ValidationReport:
 
     _validate_geopackage_metadata(conn, report)
     _validate_profile(conn, report)
+    _validate_semantic_class_registry(conn, report)
     _validate_orphans(conn, report)
     _validate_membership_blocks(conn, report)
     _validate_semantic_class_closure(conn, report)
@@ -127,6 +128,43 @@ def _validate_profile(conn: sqlite3.Connection, report: ValidationReport) -> Non
             table="usap_profile",
         )
 
+def _validate_semantic_class_registry(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    """
+    Validate the accepted concept registry.
+
+    Duplicate local names across different schemes are allowed.
+    Duplicate scheme + class_uri registrations are not allowed.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            scheme,
+            class_uri,
+            COUNT(*) AS n
+        FROM usap_semantic_class
+        GROUP BY scheme, class_uri
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+
+    for row in rows:
+        report.add(
+            severity="error",
+            code="DUPLICATE_SEMANTIC_CLASS_REGISTRATION",
+            message=(
+                "Duplicate semantic class registration for the same "
+                "scheme and class_uri."
+            ),
+            table="usap_semantic_class",
+            details={
+                "scheme": row["scheme"],
+                "class_uri": row["class_uri"],
+                "count": int(row["n"]),
+            },
+        )
 
 def _validate_orphans(conn: sqlite3.Connection, report: ValidationReport) -> None:
     checks = [

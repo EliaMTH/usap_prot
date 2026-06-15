@@ -1,0 +1,78 @@
+{
+  "registry_uid": "demo_citygml_concepts",
+  "title": "Demo CityGML concept registry",
+  "scheme": "citygml",
+  "scheme_version": "3.0",
+  "is_ade": false,
+  "source": {
+    "name": "CityGML-derived demo registry",
+    "note": "Curated subset for USAP demonstration."
+  },
+  "concepts": [
+    {
+      "module": "core",
+      "local_name": "AbstractCityObject",
+      "class_uri": "citygml-3.0:core:AbstractCityObject"
+    },
+    {
+      "module": "construction",
+      "local_name": "AbstractThematicSurface",
+      "class_uri": "citygml-3.0:construction:AbstractThematicSurface",
+      "parent_uri": "citygml-3.0:core:AbstractCityObject"
+    },
+    {
+      "module": "construction",
+      "local_name": "AbstractFillingSurface",
+      "class_uri": "citygml-3.0:construction:AbstractFillingSurface",
+      "parent_uri": "citygml-3.0:construction:AbstractThematicSurface"
+    },
+    {
+      "module": "building",
+      "local_name": "Building",
+      "class_uri": "citygml-3.0:building:Building",
+      "parent_uri": "citygml-3.0:core:AbstractCityObject"
+    },
+    {
+      "module": "building",
+      "local_name": "RoofSurface",
+      "class_uri": "citygml-3.0:building:RoofSurface",
+      "parent_uri": "citygml-3.0:construction:AbstractThematicSurface"
+    },
+    {
+      "module": "building",
+      "local_name": "WallSurface",
+      "class_uri": "citygml-3.0:building:WallSurface",
+      "parent_uri": "citygml-3.0:construction:AbstractThematicSurface"
+    },
+    {
+      "module": "building",
+      "local_name": "GroundSurface",
+      "class_uri": "citygml-3.0:building:GroundSurface",
+      "parent_uri": "citygml-3.0:construction:AbstractThematicSurface"
+    },
+    {
+      "module": "building",
+      "local_name": "Window",
+      "class_uri": "citygml-3.0:building:Window",
+      "parent_uri": "citygml-3.0:construction:AbstractFillingSurface"
+    },
+    {
+      "module": "building",
+      "local_name": "Door",
+      "class_uri": "citygml-3.0:building:Door",
+      "parent_uri": "citygml-3.0:construction:AbstractFillingSurface"
+    },
+    {
+      "module": "transportation",
+      "local_name": "Road",
+      "class_uri": "citygml-3.0:transportation:Road",
+      "parent_uri": "citygml-3.0:core:AbstractCityObject"
+    },
+    {
+      "module": "transportation",
+      "local_name": "TrafficArea",
+      "class_uri": "citygml-3.0:transportation:TrafficArea",
+      "parent_uri": "citygml-3.0:core:AbstractCityObject"
+    }
+  ]
+}

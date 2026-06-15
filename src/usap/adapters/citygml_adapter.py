@@ -12,18 +12,18 @@ from ..core import USAPPackage
 from ..domain_vocab import seed_citygml_basic_classes
 
 
-CITYGML_OBJECT_CLASSES = {
-    "Building",
-    "BuildingPart",
-    "RoofSurface",
-    "WallSurface",
-    "GroundSurface",
-    "ClosureSurface",
-    "OuterCeilingSurface",
-    "OuterFloorSurface",
-    "Window",
-    "Door",
-}
+# CITYGML_OBJECT_CLASSES = {
+#     "Building",
+#     "BuildingPart",
+#     "RoofSurface",
+#     "WallSurface",
+#     "GroundSurface",
+#     "ClosureSurface",
+#     "OuterCeilingSurface",
+#     "OuterFloorSurface",
+#     "Window",
+#     "Door",
+# }
 
 
 ROLE_BY_CLASS = {

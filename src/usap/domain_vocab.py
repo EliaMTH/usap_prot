@@ -136,13 +136,22 @@ def _resolve_optional_parent(
     child_uri: str,
 ) -> int:
     try:
+        # First try same-scheme resolution. This is useful for local names.
         return pkg.resolve_semantic_class(
             parent_ref,
             scheme=scheme,
         )
+    except Exception:
+        pass
+
+    try:
+        # Then try global resolution. This allows ADE/custom concepts
+        # to inherit from CityGML class URIs.
+        return pkg.resolve_semantic_class(parent_ref)
     except Exception as exc:
         raise ValueError(
             f"{vocab_path}: parent concept {parent_ref!r} for "
             f"{child_uri!r} is not registered yet. Put parent concepts "
-            "before children in the vocabulary file."
+            "before children, and load parent vocabularies before child "
+            "vocabularies."
         ) from exc

@@ -1,0 +1,42 @@
+{
+  "registry_uid": "demo_ade_concepts",
+  "title": "Demo ADE/custom USAP concepts",
+  "scheme": "usap-demo-ade",
+  "scheme_version": "0.1",
+  "is_ade": true,
+  "source": {
+    "name": "Demo domain concepts",
+    "note": "ADE-ready custom concepts for the USAP demo."
+  },
+  "concepts": [
+    {
+      "module": "energy_emissions",
+      "local_name": "EnergyRoof",
+      "class_uri": "usap-demo-ade:energy:EnergyRoof",
+      "parent_uri": "citygml-3.0:building:RoofSurface"
+    },
+    {
+      "module": "energy_emissions",
+      "local_name": "EnergyFacade",
+      "class_uri": "usap-demo-ade:energy:EnergyFacade",
+      "parent_uri": "citygml-3.0:building:WallSurface"
+    },
+    {
+      "module": "soil_permeability",
+      "local_name": "PermeabilitySurface",
+      "class_uri": "usap-demo-ade:soil:PermeabilitySurface"
+    },
+    {
+      "module": "acoustic_comfort",
+      "local_name": "AcousticBuilding",
+      "class_uri": "usap-demo-ade:acoustic:AcousticBuilding",
+      "parent_uri": "citygml-3.0:building:Building"
+    },
+    {
+      "module": "visual_wellbeing",
+      "local_name": "VisualFacade",
+      "class_uri": "usap-demo-ade:visual:VisualFacade",
+      "parent_uri": "citygml-3.0:building:WallSurface"
+    }
+  ]
+}

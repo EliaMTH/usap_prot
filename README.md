@@ -126,11 +126,11 @@ See [REFERENCE.md](REFERENCE.md) for the full feature list.
   *rebind* annotations — if a source file legitimately changes, its annotations
   must be treated as stale. There is no spatial/geometric re-binding yet.
 - **Membership encoding is deliberately simple** (sorted `uint32` offsets + zlib,
-  in blocks). A production system would likely use roaring bitmaps; this is a
-  simple-first, dependency-light choice.
+  in blocks). A production system would likely use *roaring bitmaps*; this is a
+  simple-first, dependency-light choice. Roaring bitmaps will be adopted in the first actual release.
 - **"GeoPackage" is minimal.** The file carries the GeoPackage container magic and
   a few `gpkg_*` tables, but USAP is **not** a registered OGC extension. Generic
-  GIS tools may open the container but will not understand USAP semantics. This will be for sure dealt with prior "serious" release.
+  GIS tools may open the container but will not understand USAP semantics. This will be for sure dealt in the first actual release.
 - **CityGML import is semantic-only**: identity (`gml:id`), class names, basic
   nesting, and provenance. No geometry import, no full schema validation, no
   xlink resolution, no complete ADE XML interpretation.
@@ -151,7 +151,87 @@ python -m pip install -e .
 python -m pytest                 # run the test suite
 ```
 
-A minimal annotation, in Python:
+### Build a package from a config file (recommended)
+
+The easiest way to create a USAP package is to describe your study area in **one
+JSON config** and run the builder — no Python required.
+
+**1. Point a config at your data.** Copy
+[`project_configs/example_project.json`](project_configs/example_project.json)
+and edit the paths to your own CityGML, point cloud, and meshes. Paths are
+resolved relative to the config file:
+
+```jsonc
+{
+  "db_path": "../outputs/my_area.usap.gpkg",
+  "manifest_path": "../outputs/my_area_manifest.json",
+  "schema_path": "../sql/schema.sql",
+  "vocabularies": [
+    "../vocabularies/citygml_3_0_mvp.json",
+    "../vocabularies/usap_ade_prototype.json"
+  ],
+  "citygml": { "path": "../data/area.gml", "also_usap_default": true },
+  "las":     [ { "path": "../data/area.las", "part_path": "points/all" } ],
+  "meshes":  [ { "path": "../data/area_lod2.obj", "representation_name": "buildings_lod2", "lod": "LoD2" } ]
+}
+```
+
+**2. Build the package** (run from the repo root):
+
+```bash
+python examples/build_project_package.py project_configs/my_area.json
+```
+
+This registers every asset, imports the CityGML semantic objects, loads the
+concept registries, and writes two files:
+
+```text
+outputs/my_area.usap.gpkg      ← the USAP package
+outputs/my_area_manifest.json  ← lists the asset_part_id of each point cloud / mesh
+```
+
+You need the `asset_part_id` values from the manifest to write annotations.
+
+**3. Annotate** by applying a JSON batch that references those `asset_part_id`s:
+
+```json
+{
+  "annotations": [
+    {
+      "annotation_uid": "ann_energy_roof_001",
+      "concept": "EnergyRoof",
+      "city_object_uid": "building_1_roof_1",
+      "memberships": [
+        { "asset_part_id": 2, "element_kind": "point", "element_indices": [100, 101, 102] }
+      ]
+    }
+  ]
+}
+```
+
+```bash
+python examples/apply_annotation_batch.py outputs/my_area.usap.gpkg my_batch.json
+python examples/validate_package.py     outputs/my_area.usap.gpkg
+```
+
+**4. See which concepts the package accepts.** USAP only accepts annotations
+whose `concept` is in the loaded vocabularies. List them — optionally filtered —
+straight from the built package:
+
+```bash
+python examples/list_concepts_demo.py --db outputs/my_area.usap.gpkg
+python examples/list_concepts_demo.py --db outputs/my_area.usap.gpkg --search Roof
+```
+
+Each line shows the concept's local name, whether it is a standard CityGML or an
+ADE/custom concept, its scheme, and its full `class_uri`.
+
+A ready-to-run Catania config
+([`project_configs/example_project_catania.json`](project_configs/example_project_catania.json))
+is included; supply your own `data/catania.*` files to use it. The full batch
+format and every command-line flag are documented in [REFERENCE.md](REFERENCE.md).
+
+### Or drive it from Python
 
 ```python
 from usap import (
@@ -181,7 +261,4 @@ with USAPPackage.create("demo.usap.gpkg", schema_path="sql/schema.sql", overwrit
     ):
         print(match["annotation_uid"], match["semantic_class"])
 ```
-
-To build a package from real study-area data, see
-[`examples/build_project_package.py`](examples/build_project_package.py) and the configs in [`project_configs/`](project_configs/). Full command-line workflows (project builds, batch annotation, smoke tests, validation) are documented in [REFERENCE.md](REFERENCE.md).
 

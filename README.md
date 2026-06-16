@@ -6,29 +6,28 @@ semantic annotations over external 3D urban data assets** — without copying an
 geometry.
 
 This is an MVP whose purpose is to test whether the idea is *usable*, not to be
-a finished product. Read the [Limitations](#limitations--read-this-before-relying-on-it)
-section before drawing conclusions from it.
+a finished product. 
 
 ---
 
 ## The problem it addresses
 
-Urban analysis — energy and emissions, soil permeability, acoustic comfort,
-visual wellbeing — increasingly works from the **same area captured in several
-forms at once**:
+Urban analysis (energy and emissions, soil permeability, acoustic comfort,
+visual wellbeing) increasingly works from the same area captured in several
+forms at once:
 
 - a semantic city model (CityGML / CityJSON),
 - one or more meshes (LoD1/LoD2, photogrammetry, triangulated terrain),
 - a LAS/LAZ point cloud.
 
 There is no lightweight, editable place to record a claim like *"this roof — in
-the CityGML model, in the LoD2 mesh, and in the point cloud — is an `EnergyRoof`
+the CityGML model, in the LoD2 mesh, and in the point cloud — is an `BuildingRoof`
 with these attributes"* down to the exact points and faces, and then query it
 back from a selection. Each format keeps semantics in its own silo (CityGML
 objects, 3D Tiles feature IDs, the LAS classification byte) and none of them
 references the others.
 
-USAP is an attempt to fill exactly that gap.
+USAP is an attempt to fill that gap.
 
 ---
 
@@ -54,9 +53,9 @@ So USAP is really **two things at once**:
 2. a **lightweight semantic-object store** — stable object identities and typed
    relationship graphs (optionally mirrored from CityGML).
 
-It is explicitly **not** a 3D city model, a geometry store, or a replacement for
+It is not a 3D city model, a geometry store, or a replacement for
 CityGML, CityJSON, 3DCityDB, 3D Tiles, or GeoPackage. When a CityGML source
-exists, it stays the semantic authority; USAP is the editable query/annotation
+exists, it stays the semantic authority and USAP is the editable query/annotation
 layer on top of it.
 
 ---
@@ -88,7 +87,7 @@ annotation: ann_energy_roof_001
 
 ## How it relates to existing work
 
-USAP is not a new city-model standard. It overlaps with, and deliberately
+To be clear, USAP is not a new city-model standard. It overlaps with, and deliberately
 defers to, several existing technologies:
 
 | Existing technology | What it does | What USAP adds / why not just use it |
@@ -106,27 +105,18 @@ cross-representation** semantic annotation in a single lightweight file.
 
 ## Status
 
-This is a working **MVP**. It can, end to end:
-
-create a package · register LAS/LAZ, mesh, and CityGML assets · import CityGML
-semantic objects and relationships · load CityGML/ADE concept registries · apply
-JSON annotation batches · attach one annotation to a CityGML object, LAS points,
-and mesh faces · query annotations back from selected elements · validate package
-integrity.
+This is a working **MVP**. It can, end to end:  create a package · register LAS/LAZ, mesh, and CityGML assets · import CityGML semantic objects and relationships · load CityGML/ADE concept registries · apply JSON annotation batches · attach one annotation to a CityGML object, LAS points, and mesh faces · query annotations back from selected elements · validate package integrity.
 
 A synthetic benchmark (1,000 buildings ≈ 500k faces) builds in ~1 s into a
 ~3.7 MiB file, and the core queries return in single- to low-double-digit
-milliseconds without scanning the whole model. This supports a **narrow** claim —
-the data model and query design are efficient enough to justify continuing — and
-does **not** yet demonstrate real-world interoperability.
+milliseconds without scanning the whole model. This supports a **narrow** claim. The data model and query design are efficient enough to justify continuing, although they
+do **not** yet demonstrate real-world interoperability.
 
-See [REFERENCE.md](REFERENCE.md) for the full feature list and the
-[design roadmap](.chats/USAP_FINAL_DESIGN_ROADMAP.md) for what is intentionally
-out of scope for now.
+See [REFERENCE.md](REFERENCE.md) for the full feature list.
 
 ---
 
-## Limitations — read this before relying on it
+## Limitations
 
 - **Stable element identity is the load-bearing assumption.** An annotation is
   bound to *one immutable version* of an external file. LAS point order and mesh
@@ -140,7 +130,7 @@ out of scope for now.
   simple-first, dependency-light choice.
 - **"GeoPackage" is minimal.** The file carries the GeoPackage container magic and
   a few `gpkg_*` tables, but USAP is **not** a registered OGC extension. Generic
-  GIS tools may open the container but will not understand USAP semantics.
+  GIS tools may open the container but will not understand USAP semantics. This will be for sure dealt with prior "serious" release.
 - **CityGML import is semantic-only**: identity (`gml:id`), class names, basic
   nesting, and provenance. No geometry import, no full schema validation, no
   xlink resolution, no complete ADE XML interpretation.
@@ -193,19 +183,5 @@ with USAPPackage.create("demo.usap.gpkg", schema_path="sql/schema.sql", overwrit
 ```
 
 To build a package from real study-area data, see
-[`examples/build_project_package.py`](examples/build_project_package.py) and the
-configs in [`project_configs/`](project_configs/). Full command-line workflows
-(project builds, batch annotation, smoke tests, validation) are documented in
-[REFERENCE.md](REFERENCE.md).
+[`examples/build_project_package.py`](examples/build_project_package.py) and the configs in [`project_configs/`](project_configs/). Full command-line workflows (project builds, batch annotation, smoke tests, validation) are documented in [REFERENCE.md](REFERENCE.md).
 
----
-
-## Where to go next
-
-- **[REFERENCE.md](REFERENCE.md)** — the complete manual: every concept, the full
-  API, batch format, CLI workflows, and validation. (This is the previous long
-  README, kept as a second reading.)
-- **[.chats/USAP_FINAL_DESIGN_ROADMAP.md](.chats/USAP_FINAL_DESIGN_ROADMAP.md)** —
-  design rationale, the full schema, and the phased roadmap.
-- **[usap_devdiary.md](usap_devdiary.md)** — how the prototype was built and why,
-  step by step.

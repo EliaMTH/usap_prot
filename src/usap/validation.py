@@ -136,16 +136,15 @@ def _validate_semantic_class_registry(
     Validate the accepted concept registry.
 
     Duplicate local names across different schemes are allowed.
-    Duplicate scheme + class_uri registrations are not allowed.
+    class_uri is globally unique, so a class_uri must not appear more than once.
     """
     rows = conn.execute(
         """
         SELECT
-            scheme,
             class_uri,
             COUNT(*) AS n
         FROM usap_semantic_class
-        GROUP BY scheme, class_uri
+        GROUP BY class_uri
         HAVING COUNT(*) > 1
         """
     ).fetchall()
@@ -154,13 +153,9 @@ def _validate_semantic_class_registry(
         report.add(
             severity="error",
             code="DUPLICATE_SEMANTIC_CLASS_REGISTRATION",
-            message=(
-                "Duplicate semantic class registration for the same "
-                "scheme and class_uri."
-            ),
+            message="Duplicate semantic class registration for the same class_uri.",
             table="usap_semantic_class",
             details={
-                "scheme": row["scheme"],
                 "class_uri": row["class_uri"],
                 "count": int(row["n"]),
             },

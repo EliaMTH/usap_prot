@@ -3,12 +3,16 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 *.usap.gpkg
-*.usap.gpkg
 *.prof
 city_JSON.gml
 city_mesh.obj
 decimated_classified_output.las
 outputs/
-*.usap.gpkg
 data/
 CLAUDE.md
+
+# Local dev notes / scratch (kept on disk, not tracked)
+.chats/
+benchmark_results/
+usap_devdiary.md
+PHASE1_BASELINE.md

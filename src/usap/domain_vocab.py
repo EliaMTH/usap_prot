@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
+from ._util import require_str
 from .core import USAPPackage
 
 
@@ -26,7 +26,7 @@ def seed_vocabulary_file(
     Seed semantic classes from an external vocabulary JSON file.
 
     The JSON file is the accepted concept registry for one scheme/version.
-    Concepts are idempotently inserted using scheme + class_uri.
+    Concepts are idempotently inserted using class_uri (globally unique).
     """
     vocab_path = Path(path)
 
@@ -35,7 +35,7 @@ def seed_vocabulary_file(
 
     data = json.loads(vocab_path.read_text(encoding="utf-8"))
 
-    scheme = _required_str(data, "scheme", source=str(vocab_path))
+    scheme = require_str(data, "scheme", source=str(vocab_path))
     scheme_version = data.get("scheme_version")
     is_ade = bool(data.get("is_ade", False))
 
@@ -55,8 +55,8 @@ def seed_vocabulary_file(
         if not isinstance(item, dict):
             raise ValueError(f"Invalid concept entry in {vocab_path}: {item!r}")
 
-        local_name = _required_str(item, "local_name", source=str(vocab_path))
-        class_uri = _required_str(item, "class_uri", source=str(vocab_path))
+        local_name = require_str(item, "local_name", source=str(vocab_path))
+        class_uri = require_str(item, "class_uri", source=str(vocab_path))
 
         parent_class_id = None
         parent_uri = item.get("parent_uri")
@@ -111,20 +111,6 @@ def seed_citygml_basic_classes(pkg: USAPPackage) -> VocabularyResult:
 
 def seed_prototype_ade_classes(pkg: USAPPackage) -> VocabularyResult:
     return seed_default_ade_vocabulary(pkg)
-
-
-def _required_str(
-    data: dict[str, Any],
-    key: str,
-    *,
-    source: str,
-) -> str:
-    value = data.get(key)
-
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{source}: missing required string field {key!r}")
-
-    return value
 
 
 def _resolve_optional_parent(

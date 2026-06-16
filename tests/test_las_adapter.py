@@ -2,26 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import laspy
-import numpy as np
-
+from conftest import write_tiny_las as _write_tiny_las
 from usap import (
     ELEMENT_KIND_POINT,
     USAPPackage,
     register_las_asset,
     seed_citygml_basic_classes,
 )
-
-
-def _write_tiny_las(path: Path, point_count: int = 10) -> None:
-    header = laspy.LasHeader(point_format=3, version="1.2")
-    las = laspy.LasData(header)
-
-    las.x = np.arange(point_count, dtype=float)
-    las.y = np.arange(point_count, dtype=float) + 100.0
-    las.z = np.arange(point_count, dtype=float) + 200.0
-
-    las.write(path)
 
 
 def test_register_las_asset_and_annotate_points(tmp_path: Path) -> None:

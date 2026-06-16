@@ -1,26 +1,21 @@
 -- NOTE:
--- Missing or postponed tables:
+-- Postponed / not-yet-implemented tables:
 --
--- 1. Minimal official GeoPackage metadata tables:
---    gpkg_spatial_ref_sys
---    gpkg_contents
---    gpkg_extensions
---
--- 2. Optional spatial acceleration:
+-- 1. Optional spatial acceleration:
 --    usap_annotation_extent_rtree
 --
--- 3. Optional external feature-ID bridge:
+-- 2. Optional external feature-ID bridge:
 --    usap_feature_id_binding
 --
--- 4. Future extension/schema tables:
+-- 3. Future extension/schema tables:
 --    usap_extension_registry
 --    usap_attribute_schema
 --    project-specific ADE tables
 --
--- 5. Migration/versioning tables:
+-- 4. Migration/versioning tables:
 --    usap_schema_migration or similar
 
--- ODER MATTER!
+-- ORDER MATTERS!
 -- Raw layout:
 -- 1. profile / metadata tables
 -- 2. usap_asset

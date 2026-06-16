@@ -1,29 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
-from lxml import etree
-
+from .._util import sha256_file
 from ..core import USAPPackage
 from ..domain_vocab import seed_citygml_basic_classes
 
-
-# CITYGML_OBJECT_CLASSES = {
-#     "Building",
-#     "BuildingPart",
-#     "RoofSurface",
-#     "WallSurface",
-#     "GroundSurface",
-#     "ClosureSurface",
-#     "OuterCeilingSurface",
-#     "OuterFloorSurface",
-#     "Window",
-#     "Door",
-# }
+if TYPE_CHECKING:
+    from lxml import etree
 
 
 ROLE_BY_CLASS = {
@@ -78,21 +65,6 @@ class CityGMLImportResult:
     relationship_count: int
     imported_objects: list[ImportedCityObject] = field(default_factory=list)
     imported_relationships: list[ImportedRelationship] = field(default_factory=list)
-
-
-def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-
-            if not chunk:
-                break
-
-            digest.update(chunk)
-
-    return digest.hexdigest()
 
 
 def _local_name(tag: str) -> str:
@@ -193,6 +165,8 @@ def import_citygml_semantics(
         - ADE XML parsing
         - LoD geometry mapping
     """
+    from lxml import etree
+
     path = Path(citygml_path)
 
     if not path.exists():
@@ -208,7 +182,7 @@ def import_citygml_semantics(
     root = tree.getroot()
 
     version_hint = _citygml_version_hint(root)
-    content_hash = _sha256_file(path) if compute_hash else None
+    content_hash = sha256_file(path) if compute_hash else None
 
     asset_metadata = {
         "adapter": "citygml_adapter",
@@ -255,6 +229,51 @@ def import_citygml_semantics(
             classes.by_uri[class_uri] = class_id
 
             return class_id
+
+        def add_relationship(
+            *,
+            parent: ImportedCityObject,
+            child_city_object_id: int,
+            child_uid: str,
+            relationship_type: str,
+            role: str | None,
+            relationship_context: str | None,
+            target_graph: str,
+            extra_metadata: dict | None = None,
+        ) -> None:
+            metadata = {
+                "source": "citygml_adapter",
+                "relationship_context": relationship_context,
+            }
+
+            if extra_metadata:
+                metadata.update(extra_metadata)
+
+            relationship_id = pkg.link_city_objects(
+                parent_city_object_id=parent.city_object_id,
+                child_city_object_id=child_city_object_id,
+                relationship_type=relationship_type,
+                role=role,
+                graph_name=target_graph,
+                source_asset_id=source_asset_id,
+                source_relation_id=(
+                    f"{parent.object_uid}/{relationship_context or 'contains'}/"
+                    f"{child_uid}"
+                ),
+                metadata_json=json.dumps(metadata),
+                rebuild_closure=False,
+            )
+
+            imported_relationships.append(
+                ImportedRelationship(
+                    relationship_id=relationship_id,
+                    parent_uid=parent.object_uid,
+                    child_uid=child_uid,
+                    relationship_type=relationship_type,
+                    role=role,
+                    graph_name=target_graph,
+                )
+            )
 
         def walk(
             element: etree._Element,
@@ -314,68 +333,26 @@ def import_citygml_semantics(
                     )
                     role = _role_for_child(local_name)
 
-                    relationship_id = pkg.link_city_objects(
-                        parent_city_object_id=parent.city_object_id,
+                    add_relationship(
+                        parent=parent,
                         child_city_object_id=city_object_id,
+                        child_uid=object_uid,
                         relationship_type=relationship_type,
                         role=role,
-                        graph_name=graph_name,
-                        source_asset_id=source_asset_id,
-                        source_relation_id=(
-                            f"{parent.object_uid}/{relationship_context or 'contains'}/"
-                            f"{object_uid}"
-                        ),
-                        metadata_json=json.dumps(
-                            {
-                                "source": "citygml_adapter",
-                                "relationship_context": relationship_context,
-                            }
-                        ),
-                        rebuild_closure=False,
-                    )
-
-                    imported_relationships.append(
-                        ImportedRelationship(
-                            relationship_id=relationship_id,
-                            parent_uid=parent.object_uid,
-                            child_uid=object_uid,
-                            relationship_type=relationship_type,
-                            role=role,
-                            graph_name=graph_name,
-                        )
+                        relationship_context=relationship_context,
+                        target_graph=graph_name,
                     )
 
                     if also_usap_default:
-                        default_relationship_id = pkg.link_city_objects(
-                            parent_city_object_id=parent.city_object_id,
+                        add_relationship(
+                            parent=parent,
                             child_city_object_id=city_object_id,
+                            child_uid=object_uid,
                             relationship_type=relationship_type,
                             role=role,
-                            graph_name="usap_default",
-                            source_asset_id=source_asset_id,
-                            source_relation_id=(
-                                f"{parent.object_uid}/{relationship_context or 'contains'}/"
-                                f"{object_uid}"
-                            ),
-                            metadata_json=json.dumps(
-                                {
-                                    "source": "citygml_adapter",
-                                    "mirrored_from_graph": graph_name,
-                                    "relationship_context": relationship_context,
-                                }
-                            ),
-                            rebuild_closure=False,
-                        )
-
-                        imported_relationships.append(
-                            ImportedRelationship(
-                                relationship_id=default_relationship_id,
-                                parent_uid=parent.object_uid,
-                                child_uid=object_uid,
-                                relationship_type=relationship_type,
-                                role=role,
-                                graph_name="usap_default",
-                            )
+                            relationship_context=relationship_context,
+                            target_graph="usap_default",
+                            extra_metadata={"mirrored_from_graph": graph_name},
                         )
 
                 next_stack = object_stack + [imported]

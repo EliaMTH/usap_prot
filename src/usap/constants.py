@@ -1,3 +1,5 @@
+from typing import Any
+
 ELEMENT_KIND_FACE = 1
 ELEMENT_KIND_POINT = 2
 ELEMENT_KIND_VERTEX = 3
@@ -7,8 +9,6 @@ DEFAULT_BLOCK_SIZE = 4096
 DEFAULT_ENCODING = "u32-zlib"
 
 DEFAULT_GRAPH_NAME = "usap_default"
-
-from typing import Any
 
 
 def normalize_element_kind(value: Any) -> Any:

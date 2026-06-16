@@ -3,10 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import laspy
-import numpy as np
-import trimesh
-
+from conftest import write_tiny_las as _write_tiny_las, write_tiny_mesh as _write_tiny_mesh
 from usap import (
     ELEMENT_KIND_FACE,
     ELEMENT_KIND_POINT,
@@ -39,43 +36,6 @@ TINY_CITYGML = """<?xml version="1.0" encoding="UTF-8"?>
   </core:cityObjectMember>
 </core:CityModel>
 """
-
-
-def _write_tiny_las(path: Path, point_count: int = 20) -> None:
-    header = laspy.LasHeader(point_format=3, version="1.2")
-    las = laspy.LasData(header)
-
-    las.x = np.arange(point_count, dtype=float)
-    las.y = np.arange(point_count, dtype=float) + 100.0
-    las.z = np.arange(point_count, dtype=float) + 200.0
-
-    las.write(path)
-
-
-def _write_tiny_mesh(path: Path) -> None:
-    vertices = np.array(
-        [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ]
-    )
-
-    faces = np.array(
-        [
-            [0, 1, 2],
-            [0, 2, 3],
-        ]
-    )
-
-    mesh = trimesh.Trimesh(
-        vertices=vertices,
-        faces=faces,
-        process=False,
-    )
-
-    mesh.export(path)
 
 
 def test_integrated_citygml_las_mesh_ade_annotation(tmp_path: Path) -> None:

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
 
-import laspy
-
-from usap import ELEMENT_KIND_POINT, USAPPackage
+from .._util import sha256_file
+from ..constants import ELEMENT_KIND_POINT
+from ..core import USAPPackage
 
 
 @dataclass(frozen=True)
@@ -23,21 +22,6 @@ class LASRegistrationResult:
     maxy: float
     maxz: float
     crs_wkt: str | None
-
-
-def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-
-            if not chunk:
-                break
-
-            digest.update(chunk)
-
-    return digest.hexdigest()
 
 
 def _guess_las_media_type(path: Path) -> str:
@@ -86,6 +70,8 @@ def register_las_asset(
     This does not copy points into USAP.
     It only records the external file and the point-index coordinate system.
     """
+    import laspy
+
     path = Path(las_path)
 
     if not path.exists():
@@ -106,7 +92,7 @@ def register_las_asset(
 
         crs_wkt = _try_read_crs_wkt(header)
 
-    content_hash = _sha256_file(path) if compute_hash else None
+    content_hash = sha256_file(path) if compute_hash else None
 
     asset_metadata = {
         "adapter": "las_adapter",
@@ -114,14 +100,6 @@ def register_las_asset(
         "point_count": point_count,
         "crs_wkt": crs_wkt,
     }
-
-    asset_id = pkg.register_asset(
-        uri=uri if uri is not None else str(path),
-        asset_kind="pointcloud",
-        media_type=_guess_las_media_type(path),
-        content_hash=content_hash,
-        metadata_json=json.dumps(asset_metadata),
-    )
 
     part_metadata = {
         "adapter": "las_adapter",
@@ -133,20 +111,29 @@ def register_las_asset(
         ),
     }
 
-    asset_part_id = pkg.register_asset_part(
-        asset_id=asset_id,
-        part_path=part_path,
-        element_kind=ELEMENT_KIND_POINT,
-        element_count=point_count,
-        index_origin="zero_based",
-        minx=minx,
-        miny=miny,
-        minz=minz,
-        maxx=maxx,
-        maxy=maxy,
-        maxz=maxz,
-        metadata_json=json.dumps(part_metadata),
-    )
+    with pkg.transaction():
+        asset_id = pkg.register_asset(
+            uri=uri if uri is not None else str(path),
+            asset_kind="pointcloud",
+            media_type=_guess_las_media_type(path),
+            content_hash=content_hash,
+            metadata_json=json.dumps(asset_metadata),
+        )
+
+        asset_part_id = pkg.register_asset_part(
+            asset_id=asset_id,
+            part_path=part_path,
+            element_kind=ELEMENT_KIND_POINT,
+            element_count=point_count,
+            index_origin="zero_based",
+            minx=minx,
+            miny=miny,
+            minz=minz,
+            maxx=maxx,
+            maxy=maxy,
+            maxz=maxz,
+            metadata_json=json.dumps(part_metadata),
+        )
 
     return LASRegistrationResult(
         asset_id=asset_id,

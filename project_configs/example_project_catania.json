@@ -1,11 +1,11 @@
 {
-  "db_path": "../outputs/example_project.usap.gpkg",
-  "manifest_path": "../outputs/example_project_manifest.json",
+  "db_path": "../outputs/example_project_catania.usap.gpkg",
+  "manifest_path": "../outputs/example_project_catania_manifest.json",
   "schema_path": "../sql/schema.sql",
 
   "vocabularies": [
-  "../vocabularies/demo_citygml_concepts.json",
-  "../vocabularies/demo_ade_concepts.json"
+    "../vocabularies/citygml_3_0_mvp.json",
+    "../vocabularies/usap_ade_prototype.json"
   ],
 
   "citygml": {

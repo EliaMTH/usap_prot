@@ -1,9 +1,0 @@
-Metadata-Version: 2.4
-Name: usap
-Version: 0.1.0
-Summary: Urban Semantic Annotation Package phase-1 prototype
-Requires-Python: >=3.11
-Requires-Dist: laspy>=2.5
-Requires-Dist: lxml>=5
-Requires-Dist: trimesh>=4
-Requires-Dist: numpy>=1.26

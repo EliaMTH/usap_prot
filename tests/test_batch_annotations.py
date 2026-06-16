@@ -3,11 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import laspy
-import numpy as np
 import pytest
-import trimesh
 
+from conftest import write_tiny_las as _write_tiny_las, write_tiny_mesh as _write_tiny_mesh
 from usap import (
     USAPError,
     USAPPackage,
@@ -17,38 +15,6 @@ from usap import (
     seed_default_ade_vocabulary,
     seed_default_citygml_vocabulary,
 )
-
-
-def _write_tiny_las(path: Path, point_count: int = 10) -> None:
-    header = laspy.LasHeader(point_format=3, version="1.2")
-    las = laspy.LasData(header)
-
-    las.x = np.arange(point_count, dtype=float)
-    las.y = np.arange(point_count, dtype=float)
-    las.z = np.arange(point_count, dtype=float)
-
-    las.write(path)
-
-
-def _write_tiny_mesh(path: Path) -> None:
-    vertices = np.array(
-        [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ]
-    )
-
-    faces = np.array(
-        [
-            [0, 1, 2],
-            [0, 2, 3],
-        ]
-    )
-
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    mesh.export(path)
 
 
 def test_apply_annotation_batch_with_las_and_mesh(tmp_path: Path) -> None:
@@ -291,3 +257,97 @@ def test_batch_replace_existing(tmp_path: Path) -> None:
 
         assert matches_old == []
         assert matches_new[0]["annotation_uid"] == "ann_replace"
+
+
+def test_batch_replace_preserves_omitted_fields(tmp_path: Path) -> None:
+    # Re-applying a batch with replace_existing is a *partial* update: fields
+    # omitted from the entry must keep their existing values rather than being
+    # wiped to NULL. This guards against silent data loss when a follow-up
+    # batch only carries new memberships.
+    db_path = tmp_path / "replace_preserve.usap.gpkg"
+    las_path = tmp_path / "tiny.las"
+
+    _write_tiny_las(las_path, point_count=10)
+
+    with USAPPackage.create(
+        db_path,
+        schema_path="sql/schema.sql",
+        overwrite=True,
+    ) as pkg:
+        citygml_vocab = seed_default_citygml_vocabulary(pkg)
+        seed_default_ade_vocabulary(pkg)
+
+        roof_object_id = pkg.create_city_object(
+            object_uid="building_1_roof_1",
+            semantic_class_id=citygml_vocab.by_name["RoofSurface"],
+            gml_id="building_1_roof_1",
+        )
+
+        las = register_las_asset(pkg, las_path)
+
+        full = {
+            "annotations": [
+                {
+                    "annotation_uid": "ann_preserve",
+                    "concept": "EnergyRoof",
+                    "city_object_uid": "building_1_roof_1",
+                    "label": "Keep me",
+                    "confidence": 0.75,
+                    "attributes": {"domain": "energy_emissions"},
+                    "memberships": [
+                        {
+                            "asset_part_id": las.asset_part_id,
+                            "element_kind": "point",
+                            "element_indices": [1, 2],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        # Minimal replacement: only the required fields + new memberships.
+        minimal = {
+            "annotations": [
+                {
+                    "annotation_uid": "ann_preserve",
+                    "concept": "EnergyRoof",
+                    "memberships": [
+                        {
+                            "asset_part_id": las.asset_part_id,
+                            "element_kind": "point",
+                            "element_indices": [3, 4],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        apply_annotation_batch(pkg, full)
+        apply_annotation_batch(pkg, minimal, replace_existing=True)
+
+        annotation = pkg.get_annotation(annotation_uid="ann_preserve")
+
+        assert annotation is not None
+        # Omitted fields are preserved, not cleared to NULL:
+        assert annotation["label"] == "Keep me"
+        assert annotation["confidence"] == 0.75
+        assert annotation["attributes_json"] is not None
+        assert json.loads(annotation["attributes_json"]) == {
+            "domain": "energy_emissions"
+        }
+        assert annotation["primary_city_object_id"] == roof_object_id
+
+        # The membership was still replaced by the new indices.
+        matches_new = pkg.annotations_for_elements(
+            asset_part_id=las.asset_part_id,
+            element_kind="point",
+            selected_indices=[3],
+        )
+        matches_old = pkg.annotations_for_elements(
+            asset_part_id=las.asset_part_id,
+            element_kind="point",
+            selected_indices=[1],
+        )
+
+        assert matches_new[0]["annotation_uid"] == "ann_preserve"
+        assert matches_old == []

@@ -14,6 +14,7 @@ from .errors import USAPError
 from .constants import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_ENCODING,
+    DEFAULT_GRAPH_NAME,
     normalize_element_kind,
 )
 from .encoding import encode_u32_zlib, decode_u32_zlib, block_start_for_index, split_indices_into_blocks
@@ -24,21 +25,6 @@ from .geopackage import initialize_geopackage_metadata
 _UNSET = object()
 
 class USAPPackage:
-
-    def _commit_if_needed(self) -> None:
-        """
-        Commit immediately unless we are inside an explicit package transaction.
-
-        Prototype note:
-        Older methods call this after write operations so single operations are
-        persisted, while bulk operations inside `with pkg.transaction():` only
-        commit once at the end.
-        """
-        if getattr(self, "_transaction_depth", 0) == 0:
-            self.conn.commit()
-
-
-
     """
     Tiny phase-1 USAP SDK. It controls common database edits and queries.
     """
@@ -163,10 +149,6 @@ class USAPPackage:
 
     def __exit__(self, _exc_type, _exc, _tb) -> None:
         self.close()
-
-    # ---------------------------------------------------------------------
-    # Encoding / decoding membership payloads
-    # ---------------------------------------------------------------------
 
     # ---------------------------------------------------------------------
     # Small internal helpers
@@ -516,7 +498,7 @@ class USAPPackage:
         child_city_object_id: int,
         relationship_type: str,
         role: str | None = None,
-        graph_name: str = "usap_default",
+        graph_name: str = DEFAULT_GRAPH_NAME,
         source_asset_id: int | None = None,
         source_relation_id: str | None = None,
         metadata_json: str | None = None,
@@ -566,7 +548,7 @@ class USAPPackage:
 
     def rebuild_city_object_closure(
         self,
-        graph_name: str = "usap_default",
+        graph_name: str = DEFAULT_GRAPH_NAME,
     ) -> None:
         """
         Rebuild graph-aware ancestor/descendant closure.
@@ -888,19 +870,20 @@ class USAPPackage:
 
         params.append(annotation_id)
 
-        cur = self.conn.execute(
-            f"""
-            UPDATE usap_annotation
-            SET {", ".join(updates)}
-            WHERE annotation_id = ?
-            """,
-            params,
-        )
+        with self.transaction():
+            cur = self.conn.execute(
+                f"""
+                UPDATE usap_annotation
+                SET {", ".join(updates)}
+                WHERE annotation_id = ?
+                """,
+                params,
+            )
 
-        if cur.rowcount != 1:
-            raise USAPError(f"Annotation not found: {annotation_id}")
+            if cur.rowcount != 1:
+                raise USAPError(f"Annotation not found: {annotation_id}")
 
-        self._commit_if_needed()
+            self.log_edit("update_annotation", "usap_annotation", annotation_id)
 
         updated = self.get_annotation(annotation_id)
 
@@ -925,21 +908,22 @@ class USAPPackage:
         Returns True if an annotation was deleted.
         Returns False only when missing_ok=True and the annotation did not exist.
         """
-        cur = self.conn.execute(
-            """
-            DELETE FROM usap_annotation
-            WHERE annotation_id = ?
-            """,
-            (annotation_id,),
-        )
+        with self.transaction():
+            cur = self.conn.execute(
+                """
+                DELETE FROM usap_annotation
+                WHERE annotation_id = ?
+                """,
+                (annotation_id,),
+            )
 
-        if cur.rowcount == 0:
-            if missing_ok:
-                return False
+            if cur.rowcount == 0:
+                if missing_ok:
+                    return False
 
-            raise USAPError(f"Annotation not found: {annotation_id}")
+                raise USAPError(f"Annotation not found: {annotation_id}")
 
-        self._commit_if_needed()
+            self.log_edit("delete_annotation", "usap_annotation", annotation_id)
 
         return True
 
@@ -1448,7 +1432,7 @@ class USAPPackage:
         self,
         object_uid: str,
         include_descendants: bool = True,
-        graph_name: str = "usap_default",
+        graph_name: str = DEFAULT_GRAPH_NAME,
         expand: bool = False,
     ) -> list[dict[str, Any]]:
         """
@@ -1871,6 +1855,8 @@ class USAPPackage:
         if annotation_uid is None:
             annotation_uid = f"ann_{uuid.uuid4().hex}"
 
+        # create_annotation links the primary city object itself
+        # (link_primary_object=True), so no extra annotation-object link here.
         annotation_id = self.create_annotation(
             annotation_uid=annotation_uid,
             semantic_class_id=semantic_class_id,
@@ -1880,12 +1866,6 @@ class USAPPackage:
             confidence=confidence,
             attributes_json=stored_attributes_json,
         )
-
-        if resolved_city_object_id is not None:
-            self.link_annotation_to_object(
-                annotation_id=annotation_id,
-                city_object_id=resolved_city_object_id,
-            )
 
         annotation = self.get_annotation(
             annotation_id,
@@ -1997,8 +1977,8 @@ class USAPPackage:
         return annotation
     
     # ---------------------------------------------------------------------
-    # CRUD operations for integrated prototype test
-    # --------------------------------------------------------------------- 
+    # Semantic class helpers
+    # ---------------------------------------------------------------------
     def get_or_create_semantic_class(
         self,
         *,
@@ -2010,30 +1990,23 @@ class USAPPackage:
         is_ade: bool = False,
     ) -> int:
         """
-        Return an existing semantic class with the same scheme + class_uri,
+        Return an existing semantic class with the same class_uri,
         or create it if it does not exist.
 
+        class_uri is globally unique, so it is the idempotency key here.
         This makes vocabulary seeding idempotent.
         """
-        rows = self.conn.execute(
+        existing = self.conn.execute(
             """
             SELECT semantic_class_id
             FROM usap_semantic_class
-            WHERE scheme = ?
-            AND class_uri = ?
-            ORDER BY semantic_class_id
+            WHERE class_uri = ?
             """,
-            (scheme, class_uri),
-        ).fetchall()
+            (class_uri,),
+        ).fetchone()
 
-        if len(rows) > 1:
-            raise USAPError(
-                "Duplicate semantic class registration for "
-                f"scheme={scheme!r}, class_uri={class_uri!r}."
-            )
-
-        if len(rows) == 1:
-            return int(rows[0]["semantic_class_id"])
+        if existing is not None:
+            return int(existing["semantic_class_id"])
 
         return self.create_semantic_class(
             scheme=scheme,

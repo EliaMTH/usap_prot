@@ -106,8 +106,10 @@ usap_prot/
   src/
     usap/
       __init__.py
+      _util.py
       constants.py
       core.py
+      encoding.py
       errors.py
       sqlite_utils.py
       validation.py
@@ -131,13 +133,23 @@ usap_prot/
     smoke_test_project_package.py
     apply_annotation_batch.py
     build_integrated_prototype.py
+    build_synthetic.py
+    demo_sdk.py
     import_citygml_demo.py
     register_las_demo.py
     register_mesh_demo.py
     list_concepts_demo.py
+    validate_package.py
+    batches/
+      example_annotation_batch.json
 
   project_configs/
     example_project.json
+    example_project_catania.json
+
+  scripts/
+    benchmark_phase1.py
+    profile_synthetic_build.py
 
   tests/
     test_core.py
@@ -340,18 +352,20 @@ with USAPPackage.create("concepts.usap.gpkg", schema_path="sql/schema.sql", over
 
 ## Build a real project package
 
-Create or edit a project config:
+Two project configs are provided:
 
-```text
-project_configs/example_project.json
-```
+- `project_configs/example_project_catania.json` — ready to run against the bundled
+  Catania study-area data under `data/`. Those data files are large and are **not**
+  committed to git, so you must supply your own `data/catania.*` to run it.
+- `project_configs/example_project.json` — a generic template; edit its `area.*` paths
+  to point at your own data files.
 
-Example:
+The Catania config looks like this:
 
 ```json
 {
-  "db_path": "../outputs/example_project.usap.gpkg",
-  "manifest_path": "../outputs/example_project_manifest.json",
+  "db_path": "../outputs/example_project_catania.usap.gpkg",
+  "manifest_path": "../outputs/example_project_catania_manifest.json",
   "schema_path": "../sql/schema.sql",
 
   "vocabularies": [
@@ -360,7 +374,7 @@ Example:
   ],
 
   "citygml": {
-    "path": "../data/area.gml",
+    "path": "../data/catania.gml",
     "graph_name": "citygml_import",
     "also_usap_default": true,
     "compute_hash": true
@@ -368,7 +382,7 @@ Example:
 
   "las": [
     {
-      "path": "../data/area.las",
+      "path": "../data/catania.las",
       "part_path": "points/all",
       "compute_hash": true
     }
@@ -376,24 +390,10 @@ Example:
 
   "meshes": [
     {
-      "path": "../data/area_lod1.obj",
+      "path": "../data/catania.obj",
       "representation_name": "buildings_lod1",
       "representation_kind": "building_mesh",
       "lod": "LoD1",
-      "compute_hash": true
-    },
-    {
-      "path": "../data/area_lod2.obj",
-      "representation_name": "buildings_lod2",
-      "representation_kind": "building_mesh",
-      "lod": "LoD2",
-      "compute_hash": true
-    },
-    {
-      "path": "../data/city_triangulation.obj",
-      "representation_name": "city_triangulation",
-      "representation_kind": "triangulated_city_surface",
-      "lod": null,
       "compute_hash": true
     }
   ]
@@ -403,14 +403,14 @@ Example:
 Run:
 
 ```bash
-python examples/build_project_package.py project_configs/example_project.json
+python examples/build_project_package.py project_configs/example_project_catania.json
 ```
 
 Expected outputs:
 
 ```text
-outputs/example_project.usap.gpkg
-outputs/example_project_manifest.json
+outputs/example_project_catania.usap.gpkg
+outputs/example_project_catania_manifest.json
 ```
 
 The manifest tells you which `asset_part_id` values to use in annotation batches.
@@ -423,8 +423,8 @@ After building a project package:
 
 ```bash
 python examples/smoke_test_project_package.py \
-  outputs/example_project.usap.gpkg \
-  outputs/example_project_manifest.json \
+  outputs/example_project_catania.usap.gpkg \
+  outputs/example_project_catania_manifest.json \
   --batch-out outputs/smoke_batch.json
 ```
 
@@ -442,8 +442,8 @@ To rerun and replace the same smoke annotation:
 
 ```bash
 python examples/smoke_test_project_package.py \
-  outputs/example_project.usap.gpkg \
-  outputs/example_project_manifest.json \
+  outputs/example_project_catania.usap.gpkg \
+  outputs/example_project_catania_manifest.json \
   --batch-out outputs/smoke_batch.json \
   --replace-existing
 ```
@@ -452,8 +452,8 @@ Use a specific CityGML object:
 
 ```bash
 python examples/smoke_test_project_package.py \
-  outputs/example_project.usap.gpkg \
-  outputs/example_project_manifest.json \
+  outputs/example_project_catania.usap.gpkg \
+  outputs/example_project_catania_manifest.json \
   --city-object-uid YOUR_GML_ID \
   --replace-existing
 ```
@@ -462,8 +462,8 @@ Use a specific mesh representation:
 
 ```bash
 python examples/smoke_test_project_package.py \
-  outputs/example_project.usap.gpkg \
-  outputs/example_project_manifest.json \
+  outputs/example_project_catania.usap.gpkg \
+  outputs/example_project_catania_manifest.json \
   --mesh-representation-name buildings_lod2 \
   --replace-existing
 ```
@@ -523,7 +523,7 @@ Apply a batch:
 
 ```bash
 python examples/apply_annotation_batch.py \
-  outputs/example_project.usap.gpkg \
+  outputs/example_project_catania.usap.gpkg \
   path/to/batch.json
 ```
 
@@ -531,7 +531,7 @@ Replace an existing annotation with the same `annotation_uid`:
 
 ```bash
 python examples/apply_annotation_batch.py \
-  outputs/example_project.usap.gpkg \
+  outputs/example_project_catania.usap.gpkg \
   path/to/batch.json \
   --replace-existing
 ```
@@ -766,7 +766,7 @@ report.print()
 Or run an example validator:
 
 ```bash
-python examples/validate_package.py outputs/example_project.usap.gpkg
+python examples/validate_package.py outputs/example_project_catania.usap.gpkg
 ```
 
 The validator checks, among other things:
@@ -815,15 +815,15 @@ python -m pytest
 Build a project package:
 
 ```bash
-python examples/build_project_package.py project_configs/example_project.json
+python examples/build_project_package.py project_configs/example_project_catania.json
 ```
 
 Run smoke test:
 
 ```bash
 python examples/smoke_test_project_package.py \
-  outputs/example_project.usap.gpkg \
-  outputs/example_project_manifest.json \
+  outputs/example_project_catania.usap.gpkg \
+  outputs/example_project_catania_manifest.json \
   --batch-out outputs/smoke_batch.json \
   --replace-existing
 ```
@@ -832,7 +832,7 @@ Apply annotation batch:
 
 ```bash
 python examples/apply_annotation_batch.py \
-  outputs/example_project.usap.gpkg \
+  outputs/example_project_catania.usap.gpkg \
   path/to/batch.json \
   --replace-existing
 ```

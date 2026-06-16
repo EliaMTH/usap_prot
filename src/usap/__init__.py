@@ -17,20 +17,6 @@ from .geopackage import (
     USAP_EXTENSION_NAME,
     read_geopackage_header,
 )
-# from .adapters import (
-#     CityGMLImportResult,
-#     ImportedCityObject,
-#     ImportedRelationship,
-#     LASRegistrationResult,
-#     import_citygml_semantics,
-#     register_las_asset,
-# )
-from .domain_vocab import (
-    VocabularyResult,
-    seed_citygml_basic_classes,
-    seed_prototype_ade_classes,
-)
-
 from .adapters import (
     CityGMLImportResult,
     ImportedCityObject,
@@ -81,14 +67,14 @@ __all__ = [
     "GPKG_APPLICATION_ID",
     "GPKG_USER_VERSION",
     "USAP_EXTENSION_NAME",
-    "read_geopackage_header",   
+    "read_geopackage_header",
     "LASRegistrationResult",
     "register_las_asset",
     "VocabularyResult",
     "seed_citygml_basic_classes",
     "seed_prototype_ade_classes",
     "CityGMLImportResult",
-    "ImportedCityObject",   
+    "ImportedCityObject",
     "ImportedRelationship",
     "import_citygml_semantics",
     "MeshPartRegistration",
@@ -96,7 +82,7 @@ __all__ = [
     "register_mesh_asset",
     "seed_default_ade_vocabulary",
     "seed_default_citygml_vocabulary",
-    "seed_vocabulary_file", 
+    "seed_vocabulary_file",
     "BatchAnnotationResult",
     "BatchImportResult",
     "apply_annotation_batch",

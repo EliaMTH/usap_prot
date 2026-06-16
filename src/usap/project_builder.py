@@ -13,6 +13,7 @@ from .adapters import (
     register_las_asset,
     register_mesh_asset,
 )
+from ._util import require_str
 from .core import USAPPackage
 from .domain_vocab import seed_vocabulary_file
 from .errors import USAPError
@@ -66,7 +67,7 @@ def build_project_package(
     base_path = Path(base_dir)
 
     db_path = _resolve_path(
-        _required_str(config, "db_path"),
+        require_str(config, "db_path"),
         base_path=base_path,
     )
 
@@ -80,7 +81,7 @@ def build_project_package(
 
     if config.get("manifest_path") is not None:
         manifest_path = _resolve_path(
-            _required_str(config, "manifest_path"),
+            require_str(config, "manifest_path"),
             base_path=base_path,
         )
 
@@ -196,7 +197,7 @@ def _import_config_citygml(
         raise ValueError("'citygml' must be an object when provided.")
 
     path = _resolve_path(
-        _required_str(citygml, "path"),
+        require_str(citygml, "path"),
         base_path=base_path,
         must_exist=True,
     )
@@ -229,7 +230,7 @@ def _register_config_las(
             raise ValueError(f"Invalid LAS entry: {item!r}")
 
         path = _resolve_path(
-            _required_str(item, "path"),
+            require_str(item, "path"),
             base_path=base_path,
             must_exist=True,
         )
@@ -265,7 +266,7 @@ def _register_config_meshes(
             raise ValueError(f"Invalid mesh entry: {item!r}")
 
         path = _resolve_path(
-            _required_str(item, "path"),
+            require_str(item, "path"),
             base_path=base_path,
             must_exist=True,
         )
@@ -273,7 +274,7 @@ def _register_config_meshes(
         result = register_mesh_asset(
             pkg,
             path,
-            representation_name=_required_str(item, "representation_name"),
+            representation_name=require_str(item, "representation_name"),
             representation_kind=item.get("representation_kind", "mesh"),
             lod=item.get("lod"),
             uri=item.get("uri"),
@@ -418,15 +419,3 @@ def _resolve_path(
     # The output file usually does not exist yet, so existence-based fallback
     # is wrong here.
     return candidate_from_config
-
-
-def _required_str(
-    data: dict[str, Any],
-    key: str,
-) -> str:
-    value = data.get(key)
-
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"Missing required string field: {key}")
-
-    return value

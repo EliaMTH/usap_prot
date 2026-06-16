@@ -2,41 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
-import trimesh
-
+from conftest import write_tiny_mesh as _write_tiny_mesh
 from usap import (
     ELEMENT_KIND_FACE,
     USAPPackage,
     register_mesh_asset,
     seed_citygml_basic_classes,
 )
-
-
-def _write_tiny_mesh(path: Path) -> None:
-    vertices = np.array(
-        [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ]
-    )
-
-    faces = np.array(
-        [
-            [0, 1, 2],
-            [0, 2, 3],
-        ]
-    )
-
-    mesh = trimesh.Trimesh(
-        vertices=vertices,
-        faces=faces,
-        process=False,
-    )
-
-    mesh.export(path)
 
 
 def test_register_generic_mesh_and_annotate_faces(tmp_path: Path) -> None:

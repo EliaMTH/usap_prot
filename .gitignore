@@ -1,5 +1,5 @@
 .venv
-.chat
+.chats
 __pycache__/
 .pytest_cache/
 *.egg-info/
@@ -12,8 +12,6 @@ outputs/
 data/
 CLAUDE.md
 
-# Local dev notes / scratch (kept on disk, not tracked)
-.chats/
 benchmark_results/
 usap_devdiary.md
 PHASE1_BASELINE.md

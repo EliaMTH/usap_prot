@@ -277,9 +277,9 @@ def create_synthetic_package(
             # One closure rebuild at the end is much faster than one per edge.
             pkg.rebuild_city_object_closure(graph_name="usap_default")
 
-            problems = pkg.validate_basic()
-            if problems:
-                joined = "\n".join(problems)
+            report = pkg.validate_report()
+            if report.issues:
+                joined = "\n".join(issue.format() for issue in report.issues)
                 raise RuntimeError(f"Synthetic package failed validation:\n{joined}")
 
     return SyntheticResult(

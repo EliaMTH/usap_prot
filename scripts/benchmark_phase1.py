@@ -537,12 +537,12 @@ def main() -> None:
 
         print_result_table(timings)
 
-        problems = pkg.validate_basic()
+        report = pkg.validate_report()
 
-        if problems:
+        if report.issues:
             print("Validation problems:")
-            for problem in problems:
-                print("-", problem)
+            for issue in report.issues:
+                print("-", issue.format())
         else:
             print("Validation: OK")
 

@@ -80,7 +80,9 @@ def seed_vocabulary_file(
                 child_uri=class_uri,
             )
 
-        class_id = pkg.get_or_create_semantic_class(
+        # create_semantic_class is itself idempotent on class_uri (the globally
+        # unique key), which is what makes vocabulary seeding idempotent.
+        class_id = pkg.create_semantic_class(
             scheme=scheme,
             scheme_version=scheme_version,
             class_uri=class_uri,

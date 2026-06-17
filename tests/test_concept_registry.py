@@ -147,7 +147,7 @@ def test_ambiguous_local_name_requires_scheme_or_uri(tmp_path: Path) -> None:
         schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        citygml_roof = pkg.get_or_create_semantic_class(
+        citygml_roof = pkg.create_semantic_class(
             scheme="citygml",
             scheme_version="3.0",
             class_uri="citygml-3.0:building:Roof",
@@ -155,7 +155,7 @@ def test_ambiguous_local_name_requires_scheme_or_uri(tmp_path: Path) -> None:
             is_ade=False,
         )
 
-        ade_roof = pkg.get_or_create_semantic_class(
+        ade_roof = pkg.create_semantic_class(
             scheme="my-ade",
             scheme_version="0.1",
             class_uri="my-ade:energy:Roof",

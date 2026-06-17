@@ -178,14 +178,14 @@ def main() -> None:
         # ------------------------------------------------------------
         # 12. Basic validation
         # ------------------------------------------------------------
-        problems = pkg.validate_basic()
+        report = pkg.validate_report()
 
-        if not problems:
+        if not report.issues:
             print("Validation: OK")
         else:
             print("Validation problems:")
-            for problem in problems:
-                print("-", problem)
+            for issue in report.issues:
+                print("-", issue.format())
 
 
 if __name__ == "__main__":

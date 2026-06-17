@@ -1,3 +1,69 @@
+"""
+USAP core SDK — the ``USAPPackage`` class.
+
+``USAPPackage`` is a thin, explicit wrapper over a single SQLite/GeoPackage
+file (``*.usap.gpkg``). It owns all common edits and queries. Heavier or
+self-contained concerns live in sibling modules and are only orchestrated from
+here: membership ``encoding``, GeoPackage header/metadata (``geopackage``),
+integrity checks (``validation``), and the file readers (``adapters``).
+
+Data model (each level references — never copies — the one above it)::
+
+    asset            an external file: a .las, a mesh, a .gml      → usap_asset
+      asset_part     a stable region whose element indices are valid
+                     (all LAS points; one mesh geometry)           → usap_asset_part
+        elements     individual point / face indices inside a part
+          membership the exact indices an annotation covers, stored
+                     as zlib-compressed uint32 offset blocks        → usap_membership_block
+            annotation  an editable claim: concept + status + attrs → usap_annotation
+              semantic_class  what kind of thing it is (RoofSurface) → usap_semantic_class
+              city_object     which object it is (building_1_roof_1) → usap_city_object
+
+Two independent hierarchies are kept as transitive-closure tables so
+"this class and its subclasses" / "this object and its descendants" are single
+indexed lookups instead of recursive walks:
+
+    usap_semantic_class_closure   class → subclass (parentage from vocabularies)
+    usap_city_object_closure      object → descendant, per named graph
+
+One annotation can carry membership in several asset parts at once (LAS points
+*and* mesh faces *and* a triangulation), which is what makes a claim
+"cross-representation".
+
+Conventions used throughout this file:
+
+  * Idempotent creates. ``register_asset``, ``create_semantic_class``,
+    ``create_city_object``, ``create_annotation`` etc. look up the natural key
+    first (``uri+hash``, ``class_uri``, ``object_uid``, ``annotation_uid``) and
+    return the existing id instead of inserting a duplicate.
+  * Nested transactions. ``transaction()`` is re-entrant: the outermost ``with``
+    block commits/rolls back, inner ones are no-ops. This lets each public
+    method be safe when called alone yet cheap when batched.
+  * Every write appends a row to ``usap_edit_log`` via ``log_edit``.
+  * Element kinds arrive as friendly strings ("point"/"face") and are coerced to
+    integer constants by ``normalize_element_kind``.
+
+Method map (matches the ``# ---`` section banners below):
+
+    Opening / creating ......... create, open, close, context manager
+    Small internal helpers ..... get_default_block_size, log_edit
+    Assets ..................... register_asset, register_asset_part
+    Semantic classes ........... create_semantic_class (+ closure maintenance)
+    City objects and graph ..... create_city_object, link_city_objects,
+                                  rebuild_city_object_closure
+    Annotations ................ get/list/update/delete_annotation,
+                                  create_annotation, link_annotation_to_object
+    Membership editing ......... replace_annotation_membership (+ validation)
+    Queries .................... annotations_for_elements (reverse: elements →
+                                  annotations), elements_for_annotation /
+                                  _semantic_class / _city_object (forward)
+    Validation ................. validate_report
+    Concept-level API .......... resolve_semantic_class / resolve_city_object,
+                                  create_concept_annotation, annotate_elements,
+                                  attach_annotation_elements (the high-level
+                                  entry points most callers use)
+"""
+
 from __future__ import annotations
 
 import os
@@ -551,9 +617,14 @@ class USAPPackage:
         graph_name: str = DEFAULT_GRAPH_NAME,
     ) -> None:
         """
-        Rebuild graph-aware ancestor/descendant closure.
+        Rebuild the ancestor/descendant closure for one named graph.
 
-        For phase 1 we assume usap_default is a practical navigation graph.
+        The closure exists to accelerate annotation retrieval: it lets
+        elements_for_city_object answer "annotations for this object and its
+        parts" with a single indexed lookup instead of walking the relationship
+        edges. usap_default is the graph those queries traverse; the several
+        named graphs are mainly plumbing for mirroring CityGML structure, not a
+        general-purpose graph database.
         """
         objects = self.conn.execute(
             """
@@ -868,6 +939,11 @@ class USAPPackage:
 
             return existing
 
+        # Keep updated_at meaningful: it is set to CURRENT_TIMESTAMP on creation
+        # and must advance on every real edit, otherwise it just mirrors
+        # created_at. CURRENT_TIMESTAMP is inline SQL, so it needs no parameter.
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+
         params.append(annotation_id)
 
         with self.transaction():
@@ -1092,20 +1168,24 @@ class USAPPackage:
         asset_part_id: int,
         element_kind: int,
         element_indices: list[int],
-        block_size: int | None = None,
         encoding: str = DEFAULT_ENCODING,
     ) -> None:
         """
         Replace all membership blocks for one annotation in one asset part.
 
         This is an edit operation, so we validate first and write in a transaction.
+
+        Blocks are always sized at the package default
+        (usap_profile.default_block_size). The reverse query
+        annotations_for_elements derives block boundaries from that single
+        global size, so membership must not be written at any other size or the
+        reverse lookup would silently miss it.
         """
         element_kind = normalize_element_kind(element_kind)
         if encoding != "u32-zlib":
             raise USAPError(f"Unsupported encoding in phase 1: {encoding}")
 
-        if block_size is None:
-            block_size = self.get_default_block_size()
+        block_size = self.get_default_block_size()
 
         unique_indices = self._validate_membership_indices(
             asset_part_id, element_kind, element_indices
@@ -1438,6 +1518,12 @@ class USAPPackage:
         """
         Query a city object and optionally its descendants, then return
         annotation membership blocks.
+
+        An annotation counts as belonging to a city object if it is linked via
+        usap_annotation_object OR names it as its primary_city_object_id. Those
+        two should always agree (create_annotation links the primary object),
+        but matching both means an annotation can never silently drop out of
+        this query if they ever diverge.
         """
         city_object = self.conn.execute(
             """
@@ -1492,9 +1578,13 @@ class USAPPackage:
                 mb.payload
             FROM usap_membership_block AS mb
             WHERE mb.annotation_id IN (
-                SELECT DISTINCT ao.annotation_id
+                SELECT ao.annotation_id
                 FROM usap_annotation_object AS ao
                 WHERE ao.city_object_id IN ({placeholders})
+                UNION
+                SELECT a.annotation_id
+                FROM usap_annotation AS a
+                WHERE a.primary_city_object_id IN ({placeholders})
             )
             ORDER BY
                 mb.asset_part_id,
@@ -1502,33 +1592,20 @@ class USAPPackage:
                 mb.block_start,
                 mb.annotation_id
             """,
-            object_ids,
+            [*object_ids, *object_ids],
         ).fetchall()
 
         return [self._membership_block_row_to_dict(row, expand=expand) for row in rows]
 
     # ---------------------------------------------------------------------
-    # Basic validation
+    # Validation
     # ---------------------------------------------------------------------
 
     def validate_report(self):
         """
         Return a structured validation report.
-
-        This is the preferred validation API.
         """
-
         return validate_connection(self.conn)
-
-
-    def validate_basic(self) -> list[str]:
-        """
-        Backward-compatible simple validation API.
-
-        Returns formatted validation issues as strings.
-        """
-        report = self.validate_report()
-        return [issue.format() for issue in report.issues]
 
     # ---------------------------------------------------------------------
     # CRUD operations for integrated prototype test
@@ -1975,44 +2052,3 @@ class USAPPackage:
             )
 
         return annotation
-    
-    # ---------------------------------------------------------------------
-    # Semantic class helpers
-    # ---------------------------------------------------------------------
-    def get_or_create_semantic_class(
-        self,
-        *,
-        scheme: str,
-        scheme_version: str | None,
-        class_uri: str,
-        local_name: str,
-        parent_class_id: int | None = None,
-        is_ade: bool = False,
-    ) -> int:
-        """
-        Return an existing semantic class with the same class_uri,
-        or create it if it does not exist.
-
-        class_uri is globally unique, so it is the idempotency key here.
-        This makes vocabulary seeding idempotent.
-        """
-        existing = self.conn.execute(
-            """
-            SELECT semantic_class_id
-            FROM usap_semantic_class
-            WHERE class_uri = ?
-            """,
-            (class_uri,),
-        ).fetchone()
-
-        if existing is not None:
-            return int(existing["semantic_class_id"])
-
-        return self.create_semantic_class(
-            scheme=scheme,
-            scheme_version=scheme_version,
-            class_uri=class_uri,
-            local_name=local_name,
-            parent_class_id=parent_class_id,
-            is_ade=is_ade,
-        )

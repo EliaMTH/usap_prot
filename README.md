@@ -41,8 +41,10 @@ A `*.usap.gpkg` file stores, for one study area:
 - the **semantic concept** of each annotation (e.g. `RoofSurface`, `EnergyRoof`),
   drawn from external vocabulary registries;
 - editable **annotation records** with label, status, confidence, attributes;
-- a lightweight mirror of **city-object identity** and typed **relationship
-  graphs**, optionally imported from CityGML.
+- a lightweight mirror of **city-object identity** and a typed **relationship
+  graph** — used to retrieve annotations across an object and its parts (e.g. a
+  building together with its roof and walls), not as a general-purpose graph
+  store — optionally imported from CityGML.
 
 A single annotation can therefore span a CityGML object, LAS points, and mesh
 faces of the same physical thing.
@@ -50,8 +52,10 @@ faces of the same physical thing.
 So USAP is really **two things at once**:
 
 1. an **annotation index** — which elements mean what, and
-2. a **lightweight semantic-object store** — stable object identities and typed
-   relationship graphs (optionally mirrored from CityGML).
+2. a **lightweight semantic-object store** — stable object identities and the
+   typed relationship graph that annotation queries traverse (optionally
+   mirrored from CityGML). The graph is a query accelerator for the annotation
+   index above, not an independent city-model database.
 
 It is not a 3D city model, a geometry store, or a replacement for
 CityGML, CityJSON, 3DCityDB, 3D Tiles, or GeoPackage. When a CityGML source

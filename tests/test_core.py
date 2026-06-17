@@ -150,14 +150,55 @@ def test_city_object_query_uses_usap_default_descendants(tmp_path: Path) -> None
         pkg.close()
 
 
+def test_city_object_query_finds_annotation_without_object_link(tmp_path: Path) -> None:
+    # Hardening regression: an annotation that names a primary city object but
+    # has no usap_annotation_object link row must still be returned. The query
+    # used to match only via the link table, so such an annotation silently
+    # vanished from elements_for_city_object.
+    db_path = tmp_path / "test.usap.gpkg"
+
+    pkg, asset_part_id, roof_class_id, _annotation_id = build_tiny_package(db_path)
+
+    try:
+        roof_id = pkg.resolve_city_object("building_1_roof_1")
+
+        unlinked_id = pkg.create_annotation(
+            annotation_uid="ann_unlinked_roof",
+            semantic_class_id=roof_class_id,
+            primary_city_object_id=roof_id,
+            status="accepted",
+            link_primary_object=False,
+        )
+
+        pkg.replace_annotation_membership(
+            annotation_id=unlinked_id,
+            asset_part_id=asset_part_id,
+            element_kind=ELEMENT_KIND_FACE,
+            element_indices=[7000, 7001],
+        )
+
+        blocks = pkg.elements_for_city_object(
+            object_uid="building_1",
+            include_descendants=True,
+            graph_name="usap_default",
+            expand=True,
+        )
+
+        annotation_ids = {block["annotation_id"] for block in blocks}
+        assert unlinked_id in annotation_ids
+
+    finally:
+        pkg.close()
+
+
 def test_validation_is_ok_for_tiny_package(tmp_path: Path) -> None:
     db_path = tmp_path / "test.usap.gpkg"
 
     pkg, _asset_part_id, _roof_class_id, _annotation_id = build_tiny_package(db_path)
 
     try:
-        problems = pkg.validate_basic()
-        assert problems == []
+        report = pkg.validate_report()
+        assert report.issues == []
 
     finally:
         pkg.close()

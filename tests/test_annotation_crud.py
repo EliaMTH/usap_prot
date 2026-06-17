@@ -76,6 +76,34 @@ def test_get_and_update_annotation(tmp_path: Path) -> None:
         assert updated["confidence"] is None
         assert json.loads(updated["attributes_json"]) == {"version": 2}
 
+        # updated_at must track the last edit, not stay frozen at created_at.
+        # Backdate the row so the assertion is deterministic despite the
+        # one-second resolution of CURRENT_TIMESTAMP, then confirm an update
+        # advances updated_at while leaving created_at untouched.
+        with pkg.transaction():
+            pkg.conn.execute(
+                """
+                UPDATE usap_annotation
+                SET created_at = ?, updated_at = ?
+                WHERE annotation_id = ?
+                """,
+                ("2000-01-01 00:00:00", "2000-01-01 00:00:00", annotation_id),
+            )
+
+        pkg.update_annotation(annotation_id, label="Touched roof annotation")
+
+        timestamps = pkg.conn.execute(
+            """
+            SELECT created_at, updated_at
+            FROM usap_annotation
+            WHERE annotation_id = ?
+            """,
+            (annotation_id,),
+        ).fetchone()
+
+        assert timestamps["created_at"] == "2000-01-01 00:00:00"
+        assert timestamps["updated_at"] > "2000-01-01 00:00:00"
+
 
 def test_list_annotations_with_filters(tmp_path: Path) -> None:
     db_path = tmp_path / "list.usap.gpkg"

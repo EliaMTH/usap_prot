@@ -1904,6 +1904,9 @@ class USAPPackage:
         semantic_class_id.
 
         The concept can come from CityGML, ADE, or any registered semantic scheme.
+        Precondition: the concept must already be registered in the package's
+        vocabulary (see seed_vocabulary_file) — it is referenced here, not created.
+        Resolution raises USAPError if the concept is unknown.
         """
         semantic_class_id = self.resolve_semantic_class(
             concept,

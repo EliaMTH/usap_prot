@@ -89,6 +89,58 @@ annotation: ann_energy_roof_001
 
 ---
 
+## Concepts & vocabularies
+
+USAP ships **no** built-in taxonomy and does not enforce one. A new package starts with
+**zero** concepts; it holds only whatever vocabulary you seed into it.
+
+**Register a concept before you annotate with it.** Every annotation references exactly one
+concept — `usap_annotation.semantic_class_id` is `NOT NULL` with a foreign key into
+`usap_semantic_class` — so the concept must already exist in the package, carrying at least
+its minimal identity:
+
+- `scheme` — the vocabulary/namespace it belongs to
+- `local_name` — its label
+- `class_uri` — its globally-unique identifier
+- *(optional)* `parent_uri` (parent concept, for hierarchy), `scheme_version`, `is_ade`
+
+Annotations then **reference** the registered concept; they do not re-describe it.
+
+**The vocabulary format is the contract — not the example files.** Concepts are loaded with
+`seed_vocabulary_file()`, which expects a JSON registry of this minimal shape (one file per
+scheme; list parents before children):
+
+```json
+{
+  "scheme": "citygml",
+  "scheme_version": "3.0",
+  "is_ade": false,
+  "concepts": [
+    { "local_name": "AbstractThematicSurface",
+      "class_uri": "citygml-3.0:construction:AbstractThematicSurface" },
+    { "local_name": "RoofSurface",
+      "class_uri": "citygml-3.0:building:RoofSurface",
+      "parent_uri": "citygml-3.0:construction:AbstractThematicSurface" }
+  ]
+}
+```
+
+Required: top-level `scheme`; `concepts[]` each with `local_name` + `class_uri`. Optional:
+`parent_uri`, `scheme_version`, `is_ade`. **Any other keys are ignored.** This minimal shape is
+intentionally a thin JSON form of a **SKOS** concept scheme (`class_uri` → concept IRI,
+`local_name` → `skos:prefLabel`, `parent_uri` → `skos:broader`, `scheme` →
+`skos:ConceptScheme`). Richer per-concept metadata (definitions, units, properties) is
+deliberately out of scope — that is the *application schema* (e.g. a CityGML ADE XSD / SHACL),
+not the concept scheme.
+
+**Bring your own adapter for other formats.** If your authoritative taxonomy lives in another
+format (a CityGML ADE registry, an XSD, OWL/SKOS, ...), write a small adapter that emits the
+registry shape above, then load it. USAP intentionally does **not** bundle adapters for foreign
+formats — they are source-specific and belong in your project. The files under `vocabularies/`
+are **examples only**, not a built-in taxonomy.
+
+---
+
 ## How it relates to existing work
 
 To be clear, USAP is not a new city-model standard. It overlaps with, and deliberately

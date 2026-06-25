@@ -27,6 +27,18 @@ def seed_vocabulary_file(
 
     The JSON file is the accepted concept registry for one scheme/version.
     Concepts are idempotently inserted using class_uri (globally unique).
+
+    This minimal format is intentionally a thin JSON form of a SKOS concept
+    scheme; the fields map 1:1 to SKOS, so a vocabulary here can be generated
+    from / exported to standard SKOS:
+        class_uri   -> the concept IRI (a skos:Concept)
+        local_name  -> skos:prefLabel
+        parent_uri  -> skos:broader            (omit for top concepts)
+        scheme / scheme_version -> the skos:ConceptScheme
+        is_ade      -> marks an ADE/extension scheme vs a base one
+    Richer per-concept metadata (definitions, units, applicable features, ...)
+    is deliberately out of scope here: that is the application schema
+    (e.g. the CityGML ADE XSD / SHACL), not the concept scheme.
     """
     vocab_path = Path(path)
 

@@ -429,7 +429,7 @@ class USAPPackage:
         """
         existing = self.conn.execute(
             """
-            SELECT semantic_class_id
+            SELECT semantic_class_id, parent_class_id
             FROM usap_semantic_class
             WHERE class_uri = ?
             """,
@@ -437,6 +437,21 @@ class USAPPackage:
         ).fetchone()
 
         if existing is not None:
+            existing_parent_id = existing["parent_class_id"]
+
+            # A requested None parent makes no claim, so plain re-creates and
+            # re-seeding stay idempotent; only a contradicting parent raises.
+            if (
+                parent_class_id is not None
+                and existing_parent_id != parent_class_id
+            ):
+                raise USAPError(
+                    f"Semantic class already exists with a different parent: "
+                    f"{class_uri!r} has parent_class_id {existing_parent_id}, "
+                    f"requested {parent_class_id}. "
+                    "Changing a concept's parent is not supported yet."
+                )
+
             return int(existing["semantic_class_id"])
 
         with self.transaction():
@@ -1818,21 +1833,26 @@ class USAPPackage:
         scheme: str | None = None,
         is_ade: bool | None = None,
         search: str | None = None,
+        in_use: bool | None = None,
     ) -> list[dict[str, Any]]:
         """
         List concepts currently registered in the package.
 
         These are the concepts accepted by annotate_elements(...).
+
+        Each concept carries annotation_count and in_use (True when at least
+        one annotation in this package references it). Pass in_use=True/False
+        to keep only used/unused concepts.
         """
         where: list[str] = []
         params: list[Any] = []
 
         if scheme is not None:
-            where.append("scheme = ?")
+            where.append("sc.scheme = ?")
             params.append(scheme)
 
         if is_ade is not None:
-            where.append("is_ade = ?")
+            where.append("sc.is_ade = ?")
             params.append(1 if is_ade else 0)
 
         if search is not None:
@@ -1840,9 +1860,9 @@ class USAPPackage:
             where.append(
                 """
                 (
-                    local_name LIKE ?
-                    OR class_uri LIKE ?
-                    OR scheme LIKE ?
+                    sc.local_name LIKE ?
+                    OR sc.class_uri LIKE ?
+                    OR sc.scheme LIKE ?
                 )
                 """
             )
@@ -1853,19 +1873,31 @@ class USAPPackage:
         if where:
             where_sql = "WHERE " + " AND ".join(where)
 
+        having_sql = ""
+
+        if in_use is True:
+            having_sql = "HAVING COUNT(a.annotation_id) > 0"
+        elif in_use is False:
+            having_sql = "HAVING COUNT(a.annotation_id) = 0"
+
         rows = self.conn.execute(
             f"""
             SELECT
-                semantic_class_id,
-                scheme,
-                scheme_version,
-                class_uri,
-                local_name,
-                parent_class_id,
-                is_ade
-            FROM usap_semantic_class
+                sc.semantic_class_id,
+                sc.scheme,
+                sc.scheme_version,
+                sc.class_uri,
+                sc.local_name,
+                sc.parent_class_id,
+                sc.is_ade,
+                COUNT(a.annotation_id) AS annotation_count
+            FROM usap_semantic_class AS sc
+            LEFT JOIN usap_annotation AS a
+                ON a.semantic_class_id = sc.semantic_class_id
             {where_sql}
-            ORDER BY is_ade, scheme, local_name, semantic_class_id
+            GROUP BY sc.semantic_class_id
+            {having_sql}
+            ORDER BY sc.is_ade, sc.scheme, sc.local_name, sc.semantic_class_id
             """,
             params,
         ).fetchall()
@@ -1875,6 +1907,8 @@ class USAPPackage:
         for row in rows:
             item = dict(row)
             item["is_ade"] = bool(item["is_ade"])
+            item["annotation_count"] = int(item["annotation_count"])
+            item["in_use"] = item["annotation_count"] > 0
             result.append(item)
 
         return result

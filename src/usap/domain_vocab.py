@@ -43,6 +43,13 @@ def seed_vocabulary_file(
     Richer per-concept metadata (definitions, units, applicable features, ...)
     is deliberately out of scope here: that is the application schema
     (e.g. the CityGML ADE XSD / SHACL), not the concept scheme.
+
+    Minimal / no-ontology vocabularies: class_uri may be omitted, in which
+    case it is derived as "{scheme}:{local_name}". parent_uri accepts either
+    a class_uri or the local name of an already-registered concept (resolved
+    within the same scheme first). Re-running this function on an updated
+    file is additive and idempotent; changing an existing concept's parent
+    raises instead of silently rewiring the hierarchy.
     """
     vocab_path = Path(path)
 
@@ -72,7 +79,14 @@ def seed_vocabulary_file(
             raise ValueError(f"Invalid concept entry in {vocab_path}: {item!r}")
 
         local_name = require_str(item, "local_name", source=str(vocab_path))
-        class_uri = require_str(item, "class_uri", source=str(vocab_path))
+
+        if item.get("class_uri") is not None:
+            class_uri = require_str(item, "class_uri", source=str(vocab_path))
+        else:
+            # Minimal-vocabulary convenience: a concept without an explicit
+            # URI gets a scheme-derived one, so local/temporary schemes only
+            # need names.
+            class_uri = f"{scheme}:{local_name}"
 
         parent_class_id = None
         parent_uri = item.get("parent_uri")

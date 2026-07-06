@@ -328,11 +328,13 @@ VisualBuilding
 VisualFacade
 ```
 
-List accepted concepts:
+List accepted concepts (each carries `annotation_count` and `in_use` — whether at least
+one annotation in the package references it; `--used` / `in_use=True` filters to those):
 
 ```bash
 python examples/list_concepts_demo.py
 python examples/list_concepts_demo.py --search Roof
+python examples/list_concepts_demo.py --used
 ```
 
 In Python:
@@ -345,8 +347,19 @@ with USAPPackage.create("concepts.usap.gpkg", schema_path="sql/schema.sql", over
     seed_default_ade_vocabulary(pkg)
 
     for concept in pkg.list_accepted_concepts(search="Roof"):
-        print(concept["local_name"], concept["class_uri"])
+        print(concept["local_name"], concept["class_uri"], concept["in_use"])
 ```
+
+### Minimal vocabulary without an ontology
+
+When no CityGML+ADE registry or ontology is provided, a vocabulary file only needs a
+`scheme` and concept `local_name`s — `class_uri` is derived as `scheme:local_name` when
+omitted, and `parent_uri` accepts either a `class_uri` or the local name of an
+already-registered concept (same-scheme resolution first). See
+`vocabularies/local_minimal_example.json`. Re-loading an updated copy is additive and
+idempotent; changing an existing concept's parent raises. Concepts declared this way stay
+identifiable by their scheme (`list_accepted_concepts(scheme="local")`) for later
+alignment with a full ontology-backed package.
 
 ---
 

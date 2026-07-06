@@ -149,6 +149,13 @@ CREATE TABLE usap_semantic_class_closure (
     PRIMARY KEY (ancestor_class_id, descendant_class_id)
 ) WITHOUT ROWID;
 
+-- The PK serves ancestor -> descendants; this serves the reverse direction,
+-- used when a new class inherits all of its parent's ancestors.
+CREATE INDEX usap_scc_by_descendant
+ON usap_semantic_class_closure(
+    descendant_class_id
+);
+
 CREATE TABLE usap_city_object (
     city_object_id     INTEGER PRIMARY KEY,
     object_uid         TEXT NOT NULL UNIQUE,
@@ -247,6 +254,13 @@ CREATE TABLE usap_annotation (
 
     created_at             TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at             TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Lets class-hierarchy queries start from the (small) closure and reach
+-- annotations by index instead of scanning all membership blocks.
+CREATE INDEX usap_annotation_by_class
+ON usap_annotation(
+    semantic_class_id
 );
 
 CREATE TABLE usap_annotation_object (

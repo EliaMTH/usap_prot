@@ -101,7 +101,8 @@ its minimal identity:
 
 - `scheme` — the vocabulary/namespace it belongs to
 - `local_name` — its label
-- `class_uri` — its globally-unique identifier
+- `class_uri` — its globally-unique identifier (optional: derived as
+  `scheme:local_name` when omitted)
 - *(optional)* `parent_uri` (parent concept, for hierarchy), `scheme_version`, `is_ade`
 
 Annotations then **reference** the registered concept; they do not re-describe it.
@@ -125,13 +126,36 @@ scheme; list parents before children):
 }
 ```
 
-Required: top-level `scheme`; `concepts[]` each with `local_name` + `class_uri`. Optional:
-`parent_uri`, `scheme_version`, `is_ade`. **Any other keys are ignored.** This minimal shape is
+Required: top-level `scheme`; `concepts[]` each with `local_name`. Optional: `class_uri`
+(derived as `scheme:local_name` when omitted — recommended explicit for ontology-backed
+schemes), `parent_uri` (accepts a `class_uri` **or** the local name of an
+already-registered concept, resolved within the same scheme first), `scheme_version`,
+`is_ade`. **Any other keys are ignored.** This minimal shape is
 intentionally a thin JSON form of a **SKOS** concept scheme (`class_uri` → concept IRI,
 `local_name` → `skos:prefLabel`, `parent_uri` → `skos:broader`, `scheme` →
 `skos:ConceptScheme`). Richer per-concept metadata (definitions, units, properties) is
 deliberately out of scope — that is the *application schema* (e.g. a CityGML ADE XSD / SHACL),
 not the concept scheme.
+
+**No ontology yet? Use a minimal local scheme.** If no CityGML+ADE registry or ontology is
+available, declare just the names you need (plus optional parent-child links) under a
+temporary scheme and annotate right away — hierarchy-accelerated queries work the same:
+
+```json
+{
+  "scheme": "local",
+  "concepts": [
+    { "local_name": "TempRoof" },
+    { "local_name": "TempChimney", "parent_uri": "TempRoof" }
+  ]
+}
+```
+
+See [`vocabularies/local_minimal_example.json`](vocabularies/local_minimal_example.json).
+Re-loading an updated copy of the file is additive and idempotent (changing an existing
+concept's parent raises). Local concepts stay identifiable by their scheme
+(`list_accepted_concepts(scheme="local")`), so annotations made this way can later be
+aligned to a full ontology-based package — that transfer tooling is future work.
 
 **Bring your own adapter for other formats.** If your authoritative taxonomy lives in another
 format (a CityGML ADE registry, an XSD, OWL/SKOS, ...), write a small adapter that emits the
@@ -277,10 +301,12 @@ straight from the built package:
 ```bash
 python examples/list_concepts_demo.py --db outputs/my_area.usap.gpkg
 python examples/list_concepts_demo.py --db outputs/my_area.usap.gpkg --search Roof
+python examples/list_concepts_demo.py --db outputs/my_area.usap.gpkg --used
 ```
 
 Each line shows the concept's local name, whether it is a standard CityGML or an
-ADE/custom concept, its scheme, and its full `class_uri`.
+ADE/custom concept, whether it is used by annotations in this package (`used:N` /
+`unused`; `--used` filters to used ones), its scheme, and its full `class_uri`.
 
 A ready-to-run Catania config
 ([`project_configs/example_project_catania.json`](project_configs/example_project_catania.json))

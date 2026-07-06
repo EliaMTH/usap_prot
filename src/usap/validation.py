@@ -95,17 +95,24 @@ def validate_connection(conn: sqlite3.Connection) -> ValidationReport:
 
     It validates internal USAP consistency, not external asset correctness.
     """
-    
+
     report = ValidationReport()
 
-    _validate_geopackage_metadata(conn, report)
-    _validate_profile(conn, report)
-    _validate_semantic_class_registry(conn, report)
-    _validate_orphans(conn, report)
-    _validate_membership_blocks(conn, report)
-    _validate_semantic_class_closure(conn, report)
-    _validate_city_object_closure(conn, report)
-    
+    # The checks read columns by name, so the connection must produce
+    # sqlite3.Row rows; restore whatever factory the caller had set.
+    original_row_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+
+    try:
+        _validate_geopackage_metadata(conn, report)
+        _validate_profile(conn, report)
+        _validate_semantic_class_registry(conn, report)
+        _validate_orphans(conn, report)
+        _validate_membership_blocks(conn, report)
+        _validate_semantic_class_closure(conn, report)
+        _validate_city_object_closure(conn, report)
+    finally:
+        conn.row_factory = original_row_factory
 
     return report
 

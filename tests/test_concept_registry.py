@@ -7,8 +7,8 @@ import pytest
 from usap import (
     USAPError,
     USAPPackage,
-    seed_citygml_basic_classes,
-    seed_prototype_ade_classes,
+    seed_default_citygml_vocabulary,
+    seed_default_ade_vocabulary,
 )
 
 
@@ -20,8 +20,8 @@ def test_vocabulary_seeding_is_idempotent(tmp_path: Path) -> None:
         schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        first_citygml = seed_citygml_basic_classes(pkg)
-        first_ade = seed_prototype_ade_classes(pkg)
+        first_citygml = seed_default_citygml_vocabulary(pkg)
+        first_ade = seed_default_ade_vocabulary(pkg)
 
         count_after_first = pkg.conn.execute(
             """
@@ -30,8 +30,8 @@ def test_vocabulary_seeding_is_idempotent(tmp_path: Path) -> None:
             """
         ).fetchone()["n"]
 
-        second_citygml = seed_citygml_basic_classes(pkg)
-        second_ade = seed_prototype_ade_classes(pkg)
+        second_citygml = seed_default_citygml_vocabulary(pkg)
+        second_ade = seed_default_ade_vocabulary(pkg)
 
         count_after_second = pkg.conn.execute(
             """
@@ -64,8 +64,8 @@ def test_list_accepted_concepts(tmp_path: Path) -> None:
         schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        seed_citygml_basic_classes(pkg)
-        seed_prototype_ade_classes(pkg)
+        seed_default_citygml_vocabulary(pkg)
+        seed_default_ade_vocabulary(pkg)
 
         all_concepts = pkg.list_accepted_concepts()
         ade_concepts = pkg.list_accepted_concepts(is_ade=True)
@@ -98,8 +98,8 @@ def test_get_semantic_class_and_concept_exists(tmp_path: Path) -> None:
         schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        seed_citygml_basic_classes(pkg)
-        seed_prototype_ade_classes(pkg)
+        seed_default_citygml_vocabulary(pkg)
+        seed_default_ade_vocabulary(pkg)
 
         roof = pkg.get_semantic_class("RoofSurface")
         energy = pkg.get_semantic_class("EnergyRoof")
@@ -125,7 +125,7 @@ def test_unknown_concept_fails_loudly(tmp_path: Path) -> None:
         schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        seed_citygml_basic_classes(pkg)
+        seed_default_citygml_vocabulary(pkg)
 
         with pytest.raises(USAPError):
             pkg.resolve_semantic_class("NotRegistered")

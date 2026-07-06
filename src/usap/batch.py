@@ -90,27 +90,29 @@ def apply_annotation_batch(
     vocabularies = data.get("vocabularies", [])
     annotations = data.get("annotations")
 
-    if load_vocabularies:
-        if not isinstance(vocabularies, list):
-            raise ValueError("'vocabularies' must be a list when provided.")
-
-        for vocab in vocabularies:
-            if not isinstance(vocab, str):
-                raise ValueError(f"Invalid vocabulary path: {vocab!r}")
-
-            vocab_path = Path(vocab)
-
-            if not vocab_path.is_absolute():
-                vocab_path = base_path / vocab_path
-
-            seed_vocabulary_file(pkg, vocab_path)
+    if load_vocabularies and not isinstance(vocabularies, list):
+        raise ValueError("'vocabularies' must be a list when provided.")
 
     if not isinstance(annotations, list):
         raise ValueError("Batch data must contain an 'annotations' list.")
 
     result = BatchImportResult()
 
+    # One transaction for the whole batch, vocabularies included, so a
+    # failing annotation does not leave half-seeded vocabularies behind.
     with pkg.transaction():
+        if load_vocabularies:
+            for vocab in vocabularies:
+                if not isinstance(vocab, str):
+                    raise ValueError(f"Invalid vocabulary path: {vocab!r}")
+
+                vocab_path = Path(vocab)
+
+                if not vocab_path.is_absolute():
+                    vocab_path = base_path / vocab_path
+
+                seed_vocabulary_file(pkg, vocab_path)
+
         for item in annotations:
             annotation_result = _apply_one_annotation(
                 pkg,

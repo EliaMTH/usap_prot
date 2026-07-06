@@ -30,10 +30,8 @@ from .adapters import (
 )
 from .domain_vocab import (
     VocabularyResult,
-    seed_citygml_basic_classes,
     seed_default_ade_vocabulary,
     seed_default_citygml_vocabulary,
-    seed_prototype_ade_classes,
     seed_vocabulary_file,
 )
 from .batch import (
@@ -71,8 +69,6 @@ __all__ = [
     "LASRegistrationResult",
     "register_las_asset",
     "VocabularyResult",
-    "seed_citygml_basic_classes",
-    "seed_prototype_ade_classes",
     "CityGMLImportResult",
     "ImportedCityObject",
     "ImportedRelationship",

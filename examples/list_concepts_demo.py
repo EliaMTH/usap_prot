@@ -5,8 +5,8 @@ import argparse
 from usap import (
     USAPPackage,
     import_citygml_semantics,
-    seed_citygml_basic_classes,
-    seed_prototype_ade_classes,
+    seed_default_citygml_vocabulary,
+    seed_default_ade_vocabulary,
 )
 
 
@@ -42,8 +42,8 @@ def main() -> None:
             schema_path="sql/schema.sql",
             overwrite=True,
         ) as pkg:
-            seed_citygml_basic_classes(pkg)
-            seed_prototype_ade_classes(pkg)
+            seed_default_citygml_vocabulary(pkg)
+            seed_default_ade_vocabulary(pkg)
 
             if args.citygml is not None:
                 import_citygml_semantics(pkg, args.citygml)

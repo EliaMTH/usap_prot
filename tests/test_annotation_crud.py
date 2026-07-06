@@ -8,8 +8,8 @@ from usap import (
     ELEMENT_KIND_FACE,
     USAPPackage,
     register_mesh_asset,
-    seed_citygml_basic_classes,
-    seed_prototype_ade_classes,
+    seed_default_citygml_vocabulary,
+    seed_default_ade_vocabulary,
 )
 
 
@@ -21,7 +21,7 @@ def test_get_and_update_annotation(tmp_path: Path) -> None:
         schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        classes = seed_citygml_basic_classes(pkg)
+        classes = seed_default_citygml_vocabulary(pkg)
 
         building_id = pkg.create_city_object(
             object_uid="building_1",
@@ -113,8 +113,8 @@ def test_list_annotations_with_filters(tmp_path: Path) -> None:
         schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        classes = seed_citygml_basic_classes(pkg)
-        ade = seed_prototype_ade_classes(pkg)
+        classes = seed_default_citygml_vocabulary(pkg)
+        ade = seed_default_ade_vocabulary(pkg)
 
         roof_object_id = pkg.create_city_object(
             object_uid="roof_1",
@@ -175,7 +175,7 @@ def test_delete_annotation_cascades_membership(tmp_path: Path) -> None:
         schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        classes = seed_citygml_basic_classes(pkg)
+        classes = seed_default_citygml_vocabulary(pkg)
 
         mesh = register_mesh_asset(
             pkg,

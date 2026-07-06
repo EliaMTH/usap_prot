@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .._util import sha256_file
 from ..constants import ELEMENT_KIND_FACE
 from ..core import USAPPackage
+
+if TYPE_CHECKING:
+    import trimesh
 
 
 @dataclass(frozen=True)

@@ -14,8 +14,12 @@ class VocabularyResult:
     by_uri: dict[str, int]
 
 
-DEFAULT_CITYGML_VOCABULARY_PATH = Path("vocabularies/citygml_3_0_mvp.json")
-DEFAULT_ADE_VOCABULARY_PATH = Path("vocabularies/usap_ade_prototype.json")
+# Anchored to the repo root (src/usap/ -> repo), not the process CWD, so the
+# default vocabularies load no matter where the caller runs from.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+DEFAULT_CITYGML_VOCABULARY_PATH = _REPO_ROOT / "vocabularies" / "citygml_3_0_mvp.json"
+DEFAULT_ADE_VOCABULARY_PATH = _REPO_ROOT / "vocabularies" / "usap_ade_prototype.json"
 
 
 def seed_vocabulary_file(
@@ -72,21 +76,11 @@ def seed_vocabulary_file(
 
         parent_class_id = None
         parent_uri = item.get("parent_uri")
-        parent_name = item.get("parent_name")
 
         if parent_uri is not None:
             parent_class_id = _resolve_optional_parent(
                 pkg,
                 parent_uri,
-                scheme=scheme,
-                vocab_path=vocab_path,
-                child_uri=class_uri,
-            )
-
-        elif parent_name is not None:
-            parent_class_id = _resolve_optional_parent(
-                pkg,
-                parent_name,
                 scheme=scheme,
                 vocab_path=vocab_path,
                 child_uri=class_uri,
@@ -115,16 +109,6 @@ def seed_default_citygml_vocabulary(pkg: USAPPackage) -> VocabularyResult:
 
 def seed_default_ade_vocabulary(pkg: USAPPackage) -> VocabularyResult:
     return seed_vocabulary_file(pkg, DEFAULT_ADE_VOCABULARY_PATH)
-
-
-# Backward-compatible names used by earlier tests/examples.
-
-def seed_citygml_basic_classes(pkg: USAPPackage) -> VocabularyResult:
-    return seed_default_citygml_vocabulary(pkg)
-
-
-def seed_prototype_ade_classes(pkg: USAPPackage) -> VocabularyResult:
-    return seed_default_ade_vocabulary(pkg)
 
 
 def _resolve_optional_parent(

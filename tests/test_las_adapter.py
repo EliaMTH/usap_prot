@@ -7,7 +7,7 @@ from usap import (
     ELEMENT_KIND_POINT,
     USAPPackage,
     register_las_asset,
-    seed_citygml_basic_classes,
+    seed_default_citygml_vocabulary,
 )
 
 
@@ -22,7 +22,7 @@ def test_register_las_asset_and_annotate_points(tmp_path: Path) -> None:
         schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        classes = seed_citygml_basic_classes(pkg)
+        classes = seed_default_citygml_vocabulary(pkg)
 
         las = register_las_asset(pkg, las_path)
 

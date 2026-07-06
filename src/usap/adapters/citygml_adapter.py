@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from .._util import sha256_file
 from ..core import USAPPackage
-from ..domain_vocab import seed_citygml_basic_classes
+from ..domain_vocab import seed_default_citygml_vocabulary
 
 if TYPE_CHECKING:
     from lxml import etree
@@ -202,33 +202,15 @@ def import_citygml_semantics(
             metadata_json=json.dumps(asset_metadata),
         )
 
-        classes = seed_citygml_basic_classes(pkg)
+        # Only elements named in the seeded vocabulary are imported as city
+        # objects, so their class ids can be read straight from that mapping.
+        classes = seed_default_citygml_vocabulary(pkg)
         citygml_object_classes = set(classes.by_name.keys())
 
         imported_objects: list[ImportedCityObject] = []
         imported_relationships: list[ImportedRelationship] = []
 
         sequence_number = 0
-
-        def ensure_class(local_name: str) -> int:
-            if local_name in classes.by_name:
-                return classes.by_name[local_name]
-
-            class_uri = f"citygml:{local_name}"
-
-            class_id = pkg.create_semantic_class(
-                scheme="citygml",
-                scheme_version=version_hint,
-                class_uri=class_uri,
-                local_name=local_name,
-                parent_class_id=None,
-                is_ade=False,
-            )
-
-            classes.by_name[local_name] = class_id
-            classes.by_uri[class_uri] = class_id
-
-            return class_id
 
         def add_relationship(
             *,
@@ -297,7 +279,7 @@ def import_citygml_semantics(
                     sequence_number=sequence_number,
                 )
 
-                semantic_class_id = ensure_class(local_name)
+                semantic_class_id = classes.by_name[local_name]
 
                 city_object_id = pkg.create_city_object(
                     object_uid=object_uid,

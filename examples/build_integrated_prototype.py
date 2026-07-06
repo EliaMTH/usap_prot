@@ -10,7 +10,7 @@ from usap import (
     import_citygml_semantics,
     register_las_asset,
     register_mesh_asset,
-    seed_prototype_ade_classes,
+    seed_default_ade_vocabulary,
 )
 
 
@@ -155,7 +155,7 @@ def main() -> None:
             lod=args.lod,
         )
 
-        ade_classes = seed_prototype_ade_classes(pkg)
+        ade_classes = seed_default_ade_vocabulary(pkg)
 
         if args.city_object_uid is not None:
             city_object = _find_city_object_by_uid(

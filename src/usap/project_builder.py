@@ -14,8 +14,12 @@ from .adapters import (
     register_mesh_asset,
 )
 from ._util import require_str
-from .core import USAPPackage
-from .domain_vocab import seed_vocabulary_file
+from .core import DEFAULT_SCHEMA_PATH, USAPPackage
+from .domain_vocab import (
+    DEFAULT_ADE_VOCABULARY_PATH,
+    DEFAULT_CITYGML_VOCABULARY_PATH,
+    seed_vocabulary_file,
+)
 from .errors import USAPError
 
 
@@ -72,7 +76,7 @@ def build_project_package(
     )
 
     schema_path = _resolve_path(
-        config.get("schema_path", "sql/schema.sql"),
+        config.get("schema_path", DEFAULT_SCHEMA_PATH),
         base_path=base_path,
         must_exist=True,
     )
@@ -164,8 +168,8 @@ def _seed_config_vocabularies(
     vocabularies = config.get(
         "vocabularies",
         [
-            "vocabularies/citygml_3_0_mvp.json",
-            "vocabularies/usap_ade_prototype.json",
+            str(DEFAULT_CITYGML_VOCABULARY_PATH),
+            str(DEFAULT_ADE_VOCABULARY_PATH),
         ],
     )
 

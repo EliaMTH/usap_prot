@@ -11,7 +11,7 @@ from usap import (
     import_citygml_semantics,
     register_las_asset,
     register_mesh_asset,
-    seed_prototype_ade_classes,
+    seed_default_ade_vocabulary,
 )
 
 
@@ -64,7 +64,7 @@ def test_integrated_citygml_las_mesh_ade_annotation(tmp_path: Path) -> None:
             lod=None,
         )
 
-        ade_classes = seed_prototype_ade_classes(pkg)
+        ade_classes = seed_default_ade_vocabulary(pkg)
 
         roof_row = pkg.conn.execute(
             """

@@ -90,6 +90,14 @@ from .geopackage import initialize_geopackage_metadata
 
 _UNSET = object()
 
+# Anchored to the repo root (src/usap/ -> repo), not the process CWD, so the
+# default schema loads no matter where the caller runs from.
+DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "sql" / "schema.sql"
+
+# SQLite binds one variable per IN-list member and its variable limit can be
+# as low as 999, so large id lists are queried in chunks of this size.
+_MAX_SQL_IN_VARS = 900
+
 class USAPPackage:
     """
     Tiny phase-1 USAP SDK. It controls common database edits and queries.
@@ -111,6 +119,12 @@ class USAPPackage:
         transaction. This lets SDK methods be safe when called individually,
         but also fast when many edits are grouped together.
 
+        If a transaction is already open on the connection from raw writes on
+        ``pkg.conn`` (sqlite3 starts one implicitly), the outermost block
+        adopts it: no ``BEGIN`` is issued, but the block still commits or
+        rolls back at exit, raw writes included. Otherwise those writes would
+        silently be rolled back when the package is closed.
+
         Example:
 
             with pkg.transaction():
@@ -118,7 +132,7 @@ class USAPPackage:
                 pkg.create_annotation(...)
                 pkg.replace_annotation_membership(...)
         """
-        if self._transaction_depth > 0 or self.conn.in_transaction:
+        if self._transaction_depth > 0:
             self._transaction_depth += 1
             try:
                 yield
@@ -129,7 +143,8 @@ class USAPPackage:
         self._transaction_depth = 1
 
         try:
-            self.conn.execute("BEGIN")
+            if not self.conn.in_transaction:
+                self.conn.execute("BEGIN")
             yield
         except Exception:
             self.conn.rollback()
@@ -147,7 +162,7 @@ class USAPPackage:
     def create(
         cls,
         db_path: str | Path,
-        schema_path: str | Path = "schema.sql",
+        schema_path: str | Path = DEFAULT_SCHEMA_PATH,
         overwrite: bool = False,
         profile_version: str = "0.1.0",
     ) -> "USAPPackage":
@@ -947,14 +962,19 @@ class USAPPackage:
         params.append(annotation_id)
 
         with self.transaction():
-            cur = self.conn.execute(
-                f"""
-                UPDATE usap_annotation
-                SET {", ".join(updates)}
-                WHERE annotation_id = ?
-                """,
-                params,
-            )
+            try:
+                cur = self.conn.execute(
+                    f"""
+                    UPDATE usap_annotation
+                    SET {", ".join(updates)}
+                    WHERE annotation_id = ?
+                    """,
+                    params,
+                )
+            except sqlite3.IntegrityError as exc:
+                raise USAPError(
+                    f"Annotation update violates a constraint: {exc}"
+                ) from exc
 
             if cur.rowcount != 1:
                 raise USAPError(f"Annotation not found: {annotation_id}")
@@ -1056,7 +1076,7 @@ class USAPPackage:
     ) -> int:
         existing = self.conn.execute(
             """
-            SELECT annotation_id
+            SELECT annotation_id, semantic_class_id
             FROM usap_annotation
             WHERE annotation_uid = ?
             """,
@@ -1064,6 +1084,16 @@ class USAPPackage:
         ).fetchone()
 
         if existing is not None:
+            existing_class_id = int(existing["semantic_class_id"])
+
+            if existing_class_id != semantic_class_id:
+                raise USAPError(
+                    f"Annotation already exists with a different semantic class: "
+                    f"{annotation_uid!r} has semantic_class_id {existing_class_id}, "
+                    f"requested {semantic_class_id}. "
+                    "Use update_annotation to change its class."
+                )
+
             return int(existing["annotation_id"])
 
         with self.transaction():
@@ -1151,12 +1181,13 @@ class USAPPackage:
 
         unique_indices = sorted(set(element_indices))
 
-        for index in unique_indices:
-            if index < 0:
-                raise USAPError(f"Negative element index: {index}")
-            if index >= element_count:
+        # The list is sorted, so checking both ends covers every index.
+        if unique_indices:
+            if unique_indices[0] < 0:
+                raise USAPError(f"Negative element index: {unique_indices[0]}")
+            if unique_indices[-1] >= element_count:
                 raise USAPError(
-                    f"Element index {index} is out of range. "
+                    f"Element index {unique_indices[-1]} is out of range. "
                     f"Asset part has {element_count} elements."
                 )
 
@@ -1184,6 +1215,18 @@ class USAPPackage:
         element_kind = normalize_element_kind(element_kind)
         if encoding != "u32-zlib":
             raise USAPError(f"Unsupported encoding in phase 1: {encoding}")
+
+        annotation = self.conn.execute(
+            """
+            SELECT annotation_id
+            FROM usap_annotation
+            WHERE annotation_id = ?
+            """,
+            (annotation_id,),
+        ).fetchone()
+
+        if annotation is None:
+            raise USAPError(f"Annotation not found: {annotation_id}")
 
         block_size = self.get_default_block_size()
 
@@ -1335,43 +1378,52 @@ class USAPPackage:
 
         block_starts = sorted(selected_by_block)
 
-        placeholders = ",".join("?" for _ in block_starts)
+        # Chunked so a huge selection cannot exceed the SQLite variable limit.
+        # Chunks partition block_starts, so each candidate block row appears
+        # exactly once and the merge below is unaffected.
+        rows: list[sqlite3.Row] = []
 
-        rows = self.conn.execute(
-            f"""
-            SELECT
-                mb.annotation_id,
-                mb.block_start,
-                mb.payload,
+        for chunk_index in range(0, len(block_starts), _MAX_SQL_IN_VARS):
+            chunk = block_starts[chunk_index : chunk_index + _MAX_SQL_IN_VARS]
+            placeholders = ",".join("?" for _ in chunk)
 
-                a.annotation_uid,
-                a.label,
-                a.status,
+            rows.extend(
+                self.conn.execute(
+                    f"""
+                    SELECT
+                        mb.annotation_id,
+                        mb.block_start,
+                        mb.payload,
 
-                sc.local_name AS semantic_class,
-                sc.class_uri AS semantic_class_uri,
+                        a.annotation_uid,
+                        a.label,
+                        a.status,
 
-                co.object_uid AS primary_city_object_uid
-            FROM usap_membership_block AS mb
-            JOIN usap_annotation AS a
-                ON a.annotation_id = mb.annotation_id
-            JOIN usap_semantic_class AS sc
-                ON sc.semantic_class_id = a.semantic_class_id
-            LEFT JOIN usap_city_object AS co
-                ON co.city_object_id = a.primary_city_object_id
-            WHERE mb.asset_part_id = ?
-            AND mb.element_kind = ?
-            AND mb.block_start IN ({placeholders})
-            ORDER BY
-                mb.block_start,
-                mb.annotation_id
-            """,
-            (
-                asset_part_id,
-                element_kind,
-                *block_starts,
-            ),
-        ).fetchall()
+                        sc.local_name AS semantic_class,
+                        sc.class_uri AS semantic_class_uri,
+
+                        co.object_uid AS primary_city_object_uid
+                    FROM usap_membership_block AS mb
+                    JOIN usap_annotation AS a
+                        ON a.annotation_id = mb.annotation_id
+                    JOIN usap_semantic_class AS sc
+                        ON sc.semantic_class_id = a.semantic_class_id
+                    LEFT JOIN usap_city_object AS co
+                        ON co.city_object_id = a.primary_city_object_id
+                    WHERE mb.asset_part_id = ?
+                    AND mb.element_kind = ?
+                    AND mb.block_start IN ({placeholders})
+                    ORDER BY
+                        mb.block_start,
+                        mb.annotation_id
+                    """,
+                    (
+                        asset_part_id,
+                        element_kind,
+                        *chunk,
+                    ),
+                ).fetchall()
+            )
 
         matches_by_annotation: dict[int, dict[str, Any]] = {}
 
@@ -1560,42 +1612,62 @@ class USAPPackage:
         if not object_ids:
             return []
 
-        placeholders = ",".join("?" for _ in object_ids)
+        # Chunked so a huge descendant set cannot exceed the SQLite variable
+        # limit; the id list is bound twice per query, hence the halved chunk.
+        # An annotation linked to objects in different chunks returns its
+        # blocks more than once, so rows are deduplicated by block id.
+        rows_by_block_id: dict[int, sqlite3.Row] = {}
+        chunk_size = _MAX_SQL_IN_VARS // 2
 
-        rows = self.conn.execute(
-            f"""
-            SELECT
-                mb.membership_block_id,
-                mb.annotation_id,
-                mb.asset_part_id,
-                mb.element_kind,
-                mb.block_start,
-                mb.block_size,
-                mb.encoding,
-                mb.element_count,
-                mb.min_element_index,
-                mb.max_element_index,
-                mb.payload
-            FROM usap_membership_block AS mb
-            WHERE mb.annotation_id IN (
-                SELECT ao.annotation_id
-                FROM usap_annotation_object AS ao
-                WHERE ao.city_object_id IN ({placeholders})
-                UNION
-                SELECT a.annotation_id
-                FROM usap_annotation AS a
-                WHERE a.primary_city_object_id IN ({placeholders})
-            )
-            ORDER BY
-                mb.asset_part_id,
-                mb.element_kind,
-                mb.block_start,
-                mb.annotation_id
-            """,
-            [*object_ids, *object_ids],
-        ).fetchall()
+        for chunk_index in range(0, len(object_ids), chunk_size):
+            chunk = object_ids[chunk_index : chunk_index + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
 
-        return [self._membership_block_row_to_dict(row, expand=expand) for row in rows]
+            rows = self.conn.execute(
+                f"""
+                SELECT
+                    mb.membership_block_id,
+                    mb.annotation_id,
+                    mb.asset_part_id,
+                    mb.element_kind,
+                    mb.block_start,
+                    mb.block_size,
+                    mb.encoding,
+                    mb.element_count,
+                    mb.min_element_index,
+                    mb.max_element_index,
+                    mb.payload
+                FROM usap_membership_block AS mb
+                WHERE mb.annotation_id IN (
+                    SELECT ao.annotation_id
+                    FROM usap_annotation_object AS ao
+                    WHERE ao.city_object_id IN ({placeholders})
+                    UNION
+                    SELECT a.annotation_id
+                    FROM usap_annotation AS a
+                    WHERE a.primary_city_object_id IN ({placeholders})
+                )
+                """,
+                [*chunk, *chunk],
+            ).fetchall()
+
+            for row in rows:
+                rows_by_block_id[int(row["membership_block_id"])] = row
+
+        merged_rows = sorted(
+            rows_by_block_id.values(),
+            key=lambda row: (
+                int(row["asset_part_id"]),
+                int(row["element_kind"]),
+                int(row["block_start"]),
+                int(row["annotation_id"]),
+            ),
+        )
+
+        return [
+            self._membership_block_row_to_dict(row, expand=expand)
+            for row in merged_rows
+        ]
 
     # ---------------------------------------------------------------------
     # Validation

@@ -7,8 +7,8 @@ from usap import (
     ELEMENT_KIND_POINT,
     USAPPackage,
     register_las_asset,
-    seed_citygml_basic_classes,
-    seed_prototype_ade_classes,
+    seed_default_citygml_vocabulary,
+    seed_default_ade_vocabulary,
 )
 
 
@@ -30,8 +30,8 @@ def main() -> None:
         schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        citygml_classes = seed_citygml_basic_classes(pkg)
-        ade_classes = seed_prototype_ade_classes(pkg)
+        citygml_classes = seed_default_citygml_vocabulary(pkg)
+        ade_classes = seed_default_ade_vocabulary(pkg)
 
         las = register_las_asset(pkg, args.las_path)
 

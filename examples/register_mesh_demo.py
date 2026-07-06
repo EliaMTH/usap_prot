@@ -6,7 +6,7 @@ from usap import (
     ELEMENT_KIND_FACE,
     USAPPackage,
     register_mesh_asset,
-    seed_citygml_basic_classes,
+    seed_default_citygml_vocabulary,
 )
 
 
@@ -45,7 +45,7 @@ def main() -> None:
         schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        classes = seed_citygml_basic_classes(pkg)
+        classes = seed_default_citygml_vocabulary(pkg)
 
         mesh = register_mesh_asset(
             pkg,

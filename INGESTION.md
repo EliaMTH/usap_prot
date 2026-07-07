@@ -170,3 +170,16 @@ unnoticed.
 If your pipeline already knows the element counts, assets can also be
 declared without reading the files at all: `register_asset` +
 `register_asset_part` in the SDK.
+
+## GIS interoperability
+
+Every package built by these procedures opens in QGIS/GDAL: three read-only
+attribute layers (annotations, concepts, city objects) plus a features layer
+drawing one **derived 2D bounding box per asset** — written automatically at
+registration from the stored part bounds (for LAS, literally the header box;
+no geometry file is re-read). Declare the package CRS with `"srs_id"` in the
+project config when you know it (an EPSG code found in the LAS CRS is promoted
+automatically when unambiguous); local-coordinate meshes stay in the undefined
+SRS (−1). Since assets are immutable in USAP, boxes are written once and
+removed by cascade when an asset is deleted and re-ingested. See
+"Opening a package in QGIS" in REFERENCE.md.

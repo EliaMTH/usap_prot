@@ -31,6 +31,7 @@
 -- 12. usap_value_block
 -- 13. optional indexes
 -- 14. optional helper tables
+-- 15. GIS-facing views (attributes + features layers for QGIS/GDAL)
 
 PRAGMA foreign_keys = ON; -- ensure key consistency between tables (i.e.: prevent operations that would break relationship between tables); need to be declare as it is off by default for backwards compatibility
 
@@ -73,6 +74,26 @@ CREATE TABLE gpkg_extensions (
     scope TEXT NOT NULL,
     CONSTRAINT ge_tce
         UNIQUE (table_name, column_name, extension_name)
+);
+
+CREATE TABLE gpkg_geometry_columns (
+    table_name          TEXT NOT NULL,
+    column_name         TEXT NOT NULL,
+    geometry_type_name  TEXT NOT NULL,
+    srs_id              INTEGER NOT NULL,
+    z                   TINYINT NOT NULL,
+    m                   TINYINT NOT NULL,
+
+    CONSTRAINT pk_geom_cols
+        PRIMARY KEY (table_name, column_name),
+
+    CONSTRAINT fk_gc_contents
+        FOREIGN KEY (table_name)
+        REFERENCES gpkg_contents(table_name),
+
+    CONSTRAINT fk_gc_srs
+        FOREIGN KEY (srs_id)
+        REFERENCES gpkg_spatial_ref_sys(srs_id)
 );
 
 CREATE TABLE usap_profile (
@@ -118,6 +139,19 @@ CREATE TABLE usap_asset_part (
     metadata_json   TEXT,
 
     UNIQUE(asset_id, part_path, element_kind)
+);
+
+-- Derived cartographic summary: one GPKG-encoded 2D bounding-box polygon per
+-- asset, the union of its parts' stored bounds. Written by
+-- register_asset_part; regenerable at any time from usap_asset_part — never
+-- authoritative geometry. Exposed to GIS tools via the usap_asset_extents
+-- view (registered as a features layer).
+CREATE TABLE usap_asset_extent (
+    asset_id  INTEGER PRIMARY KEY
+        REFERENCES usap_asset(asset_id)
+        ON DELETE CASCADE,
+
+    geom      BLOB NOT NULL   -- GeoPackageBinary (magic 'GP') POLYGON
 );
 
 CREATE TABLE usap_semantic_class (
@@ -366,3 +400,89 @@ CREATE TABLE usap_edit_log (
     details_json  TEXT,
     created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- -------------------------------------------------------------------------
+-- GIS-facing views. Registered in gpkg_contents (see geopackage.py) so
+-- QGIS/GDAL can browse USAP content: three read-only 'attributes' layers
+-- plus one 'features' layer of derived per-asset extent boxes. Internal
+-- tables (blocks, closures, edit log) are deliberately not exposed.
+-- -------------------------------------------------------------------------
+
+CREATE VIEW usap_annotations_view AS
+SELECT
+    a.annotation_id,
+    a.annotation_uid,
+    sc.local_name AS concept,
+    sc.class_uri AS concept_uri,
+    sc.scheme,
+    co.object_uid AS city_object_uid,
+    a.label,
+    a.status,
+    a.confidence,
+    (
+        SELECT COALESCE(SUM(mb.element_count), 0)
+        FROM usap_membership_block AS mb
+        WHERE mb.annotation_id = a.annotation_id
+    ) AS selected_element_count,
+    (
+        SELECT COUNT(DISTINCT vb.asset_part_id)
+        FROM usap_value_block AS vb
+        WHERE vb.annotation_id = a.annotation_id
+    ) AS value_field_count,
+    a.attributes_json,
+    a.created_at,
+    a.updated_at
+FROM usap_annotation AS a
+JOIN usap_semantic_class AS sc
+    ON sc.semantic_class_id = a.semantic_class_id
+LEFT JOIN usap_city_object AS co
+    ON co.city_object_id = a.primary_city_object_id;
+
+CREATE VIEW usap_concepts_view AS
+SELECT
+    sc.semantic_class_id,
+    sc.scheme,
+    sc.scheme_version,
+    sc.class_uri,
+    sc.local_name,
+    sc.is_ade,
+    COUNT(a.annotation_id) AS annotation_count,
+    CASE WHEN COUNT(a.annotation_id) > 0 THEN 1 ELSE 0 END AS in_use
+FROM usap_semantic_class AS sc
+LEFT JOIN usap_annotation AS a
+    ON a.semantic_class_id = sc.semantic_class_id
+GROUP BY sc.semantic_class_id;
+
+CREATE VIEW usap_city_objects_view AS
+SELECT
+    co.city_object_id,
+    co.object_uid,
+    sc.local_name AS semantic_class,
+    co.object_status,
+    co.gml_id,
+    src.uri AS source_asset_uri
+FROM usap_city_object AS co
+LEFT JOIN usap_semantic_class AS sc
+    ON sc.semantic_class_id = co.semantic_class_id
+LEFT JOIN usap_asset AS src
+    ON src.asset_id = co.source_asset_id;
+
+CREATE VIEW usap_asset_extents AS
+SELECT
+    e.asset_id AS fid,
+    e.geom,
+    a.uri,
+    a.asset_kind,
+    (
+        SELECT COUNT(*)
+        FROM usap_asset_part AS ap
+        WHERE ap.asset_id = e.asset_id
+    ) AS part_count,
+    (
+        SELECT COALESCE(SUM(ap.element_count), 0)
+        FROM usap_asset_part AS ap
+        WHERE ap.asset_id = e.asset_id
+    ) AS element_count
+FROM usap_asset_extent AS e
+JOIN usap_asset AS a
+    ON a.asset_id = e.asset_id;

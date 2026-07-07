@@ -33,6 +33,8 @@ Implemented:
 - JSON batch annotation importer.
 - Real-project package builder.
 - End-to-end smoke-test workflow.
+- GIS-facing GeoPackage layers: attribute views + a derived per-asset
+  extent-box features layer (QGIS/GDAL browsable).
 
 Not yet implemented:
 
@@ -453,13 +455,18 @@ The Catania config looks like this:
 }
 ```
 
-Two further optional keys:
+Further optional keys:
 
 - `"annotation_batches": ["links.json"]` — batch files applied right after the
   assets are registered, so one build call ingests the annotations too.
 - assets accept an explicit `"uri"` (a stable logical name); batch memberships
   can then reference parts as `"asset_uri": "<that name>"` instead of the
   numeric `asset_part_id` from the manifest.
+- `"srs_id": 25833` (+ optional `"srs_wkt"`) — declares the package CRS for the
+  GIS extent layer (one CRS per package). Without it, an EPSG code found in the
+  LAS files' CRS WKT is promoted automatically when they all agree; otherwise
+  the layer stays in the undefined SRS (−1), which is honest for
+  local-coordinate meshes.
 
 Run:
 
@@ -481,6 +488,35 @@ To apply a config to an **existing** package — add assets, apply editing
 batches — pass `--update` (Python: `build_project_package_from_file(path,
 update=True)`). Registration is idempotent, and in update mode batches run
 with `replace_existing=True`.
+
+---
+
+## Opening a package in QGIS
+
+A `.usap.gpkg` is a valid GeoPackage. Adding it to QGIS (or listing it with
+`ogrinfo`) shows four read-only layers:
+
+```text
+usap_annotations_view    attributes   annotations with concept, city object,
+                                      status, and element counts
+usap_concepts_view       attributes   accepted concept registry + usage
+usap_city_objects_view   attributes   city objects (carriers show
+                                      object_status = 'temporary')
+usap_asset_extents       features     one derived 2D bounding box per
+                                      registered asset
+```
+
+Notes:
+
+- The extent boxes are **derived summaries** (the union of each asset's part
+  bounds, captured at registration) — never actual geometry. They are written
+  automatically, kept by `ON DELETE CASCADE`, and checked by `validate_report()`
+  against the part bounds.
+- The layer CRS defaults to the undefined SRS (−1) until declared — see the
+  `"srs_id"` config key above or `set_package_srs(pkg.conn, epsg)` from Python
+  (safe before or after registration; existing boxes are re-encoded).
+- Fine-grained content — element memberships, value fields — is not exposed as
+  layers; use the Python API for those.
 
 ---
 

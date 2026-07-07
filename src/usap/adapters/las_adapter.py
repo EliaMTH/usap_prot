@@ -7,6 +7,7 @@ from pathlib import Path
 from .._util import sha256_file
 from ..constants import ELEMENT_KIND_POINT
 from ..core import USAPPackage
+from ..geopackage import ensure_srs_row, epsg_from_wkt
 
 
 @dataclass(frozen=True)
@@ -111,12 +112,21 @@ def register_las_asset(
         ),
     }
 
+    # Best-effort EPSG from the LAS CRS WKT: registers the SRS row and
+    # records it on the asset. The package-level layer CRS is promoted by
+    # the project builder (or set_package_srs), not here.
+    srs_id = epsg_from_wkt(crs_wkt)
+
     with pkg.transaction():
+        if srs_id is not None:
+            ensure_srs_row(pkg.conn, srs_id, definition_wkt=crs_wkt)
+
         asset_id = pkg.register_asset(
             uri=uri if uri is not None else str(path),
             asset_kind="pointcloud",
             media_type=_guess_las_media_type(path),
             content_hash=content_hash,
+            srs_id=srs_id,
             metadata_json=json.dumps(asset_metadata),
         )
 

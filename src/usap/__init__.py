@@ -17,7 +17,9 @@ from .geopackage import (
     GPKG_APPLICATION_ID,
     GPKG_USER_VERSION,
     USAP_EXTENSION_NAME,
+    epsg_from_wkt,
     read_geopackage_header,
+    set_package_srs,
 )
 from .adapters import (
     CityGMLImportResult,
@@ -71,6 +73,8 @@ __all__ = [
     "GPKG_USER_VERSION",
     "USAP_EXTENSION_NAME",
     "read_geopackage_header",
+    "set_package_srs",
+    "epsg_from_wkt",
     "LASRegistrationResult",
     "register_las_asset",
     "VocabularyResult",

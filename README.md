@@ -217,7 +217,7 @@ defers to, several existing technologies:
 | **CityGML / CityJSON / 3DCityDB** | Full semantic 3D city model (geometry **and** semantics together) | USAP is an *overlay*, not a city model. It mirrors only identity/class/relationships and leaves geometry and full attributes in the source. |
 | **3D Tiles + glTF `EXT_mesh_features` / `EXT_structural_metadata`** | Feature IDs and metadata attached to mesh features | The closest analog for *mesh* semantics. USAP differs by being an editable working file, not embedded in the tiles, and by spanning multiple representations of one object. |
 | **LAS ASPRS `classification` + extra dimensions** | A semantic class stored *inside* the point cloud | The closest analog for *point* semantics. USAP differs by supporting arbitrary vocabularies, cross-asset links, and editing without rewriting a large file. |
-| **GeoPackage** | OGC SQLite container | Used as the container. USAP currently uses only minimal GeoPackage metadata (see Limitations). |
+| **GeoPackage** | OGC SQLite container | Used as the container. Packages open in QGIS/GDAL: browsable attribute layers plus a derived per-asset extent-box features layer (see Limitations). |
 | **W3C Web Annotation Data Model** | Generic `target + selector + body` annotations | The conceptual ancestor. USAP is essentially this pattern specialized to 3D urban data, with the "selector" being element indices inside an asset part. |
 
 The novel combination USAP is testing is: **element-level, editable,
@@ -250,9 +250,14 @@ See [REFERENCE.md](REFERENCE.md) for the full feature list.
 - **Membership encoding is deliberately simple** (sorted `uint32` offsets + zlib,
   in blocks). A production system would likely use *roaring bitmaps*; this is a
   simple-first, dependency-light choice. Roaring bitmaps will be adopted in the first actual release.
-- **"GeoPackage" is minimal.** The file carries the GeoPackage container magic and
-  a few `gpkg_*` tables, but USAP is **not** a registered OGC extension. Generic
-  GIS tools may open the container but will not understand USAP semantics. This will be for sure dealt in the first actual release.
+- **GIS tools see a summary, not the semantics.** A `.usap.gpkg` opens in
+  QGIS/GDAL as a real GeoPackage: three read-only attribute layers (annotations,
+  concepts, city objects) and one features layer drawing a derived 2D bounding
+  box per registered asset (from the bounds captured at registration — never
+  actual geometry). Fine-grained USAP content (element memberships, value
+  fields) still requires the SDK, and USAP is **not** a registered OGC
+  extension. Declare the package CRS with `"srs_id"` in the project config;
+  otherwise the extent layer stays in an undefined SRS.
 - **CityGML import is semantic-only**: identity (`gml:id`), class names, basic
   nesting, and provenance. No geometry import, no full schema validation, no
   xlink resolution, no complete ADE XML interpretation.

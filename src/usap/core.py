@@ -103,7 +103,12 @@ from .encoding import (
 )
 from .sqlite_utils import require_lastrowid
 from .validation import validate_connection
-from .geopackage import initialize_geopackage_metadata
+from .geopackage import (
+    DEFAULT_EXTENT_SRS_ID,
+    USAP_FEATURES_LAYER,
+    encode_gpkg_bbox_polygon,
+    initialize_geopackage_metadata,
+)
 
 _UNSET = object()
 
@@ -509,6 +514,7 @@ class USAPPackage:
                 ),
             )
             asset_part_id = require_lastrowid(cur)
+            self._refresh_asset_extent(asset_id)
             self.log_edit(
                 "register_asset_part",
                 "usap_asset_part",
@@ -516,6 +522,75 @@ class USAPPackage:
             )
 
         return asset_part_id
+
+    def _refresh_asset_extent(self, asset_id: int) -> None:
+        """
+        Upsert the asset's derived 2D extent box (the union of its parts'
+        stored bounds) for the GIS features layer. Parts without full 2D
+        bounds are ignored; an asset with none keeps no extent row.
+        """
+        has_extent_table = self.conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'usap_asset_extent'
+            """
+        ).fetchone()
+
+        if has_extent_table is None:
+            return  # package predates the extents layer
+
+        box = self.conn.execute(
+            """
+            SELECT
+                MIN(minx) AS minx,
+                MIN(miny) AS miny,
+                MAX(maxx) AS maxx,
+                MAX(maxy) AS maxy
+            FROM usap_asset_part
+            WHERE asset_id = ?
+              AND minx IS NOT NULL
+              AND miny IS NOT NULL
+              AND maxx IS NOT NULL
+              AND maxy IS NOT NULL
+            """,
+            (asset_id,),
+        ).fetchone()
+
+        if box is None or box["minx"] is None:
+            return
+
+        srs_row = self.conn.execute(
+            """
+            SELECT srs_id
+            FROM gpkg_geometry_columns
+            WHERE table_name = ?
+            """,
+            (USAP_FEATURES_LAYER,),
+        ).fetchone()
+
+        srs_id = (
+            int(srs_row["srs_id"]) if srs_row is not None
+            else DEFAULT_EXTENT_SRS_ID
+        )
+
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO usap_asset_extent (asset_id, geom)
+            VALUES (?, ?)
+            """,
+            (
+                asset_id,
+                encode_gpkg_bbox_polygon(
+                    float(box["minx"]),
+                    float(box["miny"]),
+                    float(box["maxx"]),
+                    float(box["maxy"]),
+                    srs_id,
+                ),
+            ),
+        )
 
     # ---------------------------------------------------------------------
     # Semantic classes

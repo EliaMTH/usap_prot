@@ -22,6 +22,7 @@ from .domain_vocab import (
     seed_vocabulary_file,
 )
 from .errors import USAPError
+from .geopackage import epsg_from_wkt, set_package_srs
 
 
 @dataclass(frozen=True)
@@ -112,7 +113,19 @@ def build_project_package(
             overwrite=overwrite,
         )
 
+    config_srs_id = config.get("srs_id")
+
     with pkg_context as pkg:
+        # Declared package CRS wins and is set before registration so extent
+        # blobs are encoded with it from the start.
+        if config_srs_id is not None:
+            with pkg.transaction():
+                set_package_srs(
+                    pkg.conn,
+                    int(config_srs_id),
+                    definition_wkt=config.get("srs_wkt"),
+                )
+
         _seed_config_vocabularies(
             pkg,
             config=config,
@@ -136,6 +149,22 @@ def build_project_package(
             config=config,
             base_path=base_path,
         )
+
+        # No declared CRS: when the LAS files agree on exactly one EPSG,
+        # promote it to the extents layer (single-CRS-per-package
+        # assumption). Mixed or no CRS -> the layer stays undefined (-1).
+        if config_srs_id is None:
+            sniffed = {
+                (epsg_from_wkt(item.crs_wkt), item.crs_wkt)
+                for item in las_results
+                if epsg_from_wkt(item.crs_wkt) is not None
+            }
+
+            if len({code for code, _ in sniffed}) == 1:
+                code, wkt = next(iter(sniffed))
+
+                with pkg.transaction():
+                    set_package_srs(pkg.conn, code, definition_wkt=wkt)
 
         batch_results = _apply_config_batches(
             pkg,

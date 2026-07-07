@@ -8,11 +8,15 @@ import numpy as np
 
 from .constants import DEFAULT_ENCODING, VALUE_DTYPES
 from .encoding import decode_u32_zlib, decode_value_block
+from .errors import USAPError
 from .geopackage import (
     GPKG_APPLICATION_ID,
     GPKG_USER_VERSION,
+    USAP_ATTRIBUTE_LAYERS,
     USAP_EXTENSION_NAME,
     USAP_EXTENSION_TABLES,
+    USAP_FEATURES_LAYER,
+    decode_gpkg_envelope,
     read_geopackage_header,
 )
 
@@ -107,6 +111,8 @@ def validate_connection(conn: sqlite3.Connection) -> ValidationReport:
 
     try:
         _validate_geopackage_metadata(conn, report)
+        _validate_gis_layers(conn, report)
+        _validate_asset_extents(conn, report)
         _validate_profile(conn, report)
         _validate_semantic_class_registry(conn, report)
         _validate_orphans(conn, report)
@@ -886,6 +892,275 @@ def _validate_city_object_closure(
                 },
             )
     
+def _view_exists(conn: sqlite3.Connection, view_name: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'view'
+          AND name = ?
+        """,
+        (view_name,),
+    ).fetchone()
+
+    return row is not None
+
+
+def _validate_gis_layers(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    """
+    Check that the GIS-facing views are present and registered so generic
+    tools (QGIS/GDAL) can browse the package. Absence is a warning: packages
+    created before the layers existed are still valid USAP files.
+    """
+    if not _table_exists(conn, "gpkg_contents"):
+        return  # already reported by _validate_geopackage_metadata
+
+    for view_name, _identifier, _description in USAP_ATTRIBUTE_LAYERS:
+        registered = conn.execute(
+            """
+            SELECT 1
+            FROM gpkg_contents
+            WHERE table_name = ?
+              AND data_type = 'attributes'
+            """,
+            (view_name,),
+        ).fetchone()
+
+        if not _view_exists(conn, view_name) or registered is None:
+            report.add(
+                severity="warning",
+                code="MISSING_GIS_ATTRIBUTE_LAYER",
+                message=(
+                    "GIS attribute layer is missing or not registered in "
+                    "gpkg_contents."
+                ),
+                table="gpkg_contents",
+                details={"layer": view_name},
+            )
+
+    features_row = conn.execute(
+        """
+        SELECT srs_id
+        FROM gpkg_contents
+        WHERE table_name = ?
+          AND data_type = 'features'
+        """,
+        (USAP_FEATURES_LAYER,),
+    ).fetchone()
+
+    geometry_row = None
+
+    if _table_exists(conn, "gpkg_geometry_columns"):
+        geometry_row = conn.execute(
+            """
+            SELECT srs_id
+            FROM gpkg_geometry_columns
+            WHERE table_name = ?
+            """,
+            (USAP_FEATURES_LAYER,),
+        ).fetchone()
+
+    has_view = _view_exists(conn, USAP_FEATURES_LAYER)
+
+    if features_row is None and geometry_row is None and not has_view:
+        report.add(
+            severity="warning",
+            code="MISSING_GIS_FEATURES_LAYER",
+            message="GIS features layer (asset extents) is not present.",
+            table="gpkg_contents",
+            details={"layer": USAP_FEATURES_LAYER},
+        )
+        return
+
+    if features_row is None or geometry_row is None or not has_view:
+        report.add(
+            severity="error",
+            code="INCONSISTENT_FEATURES_LAYER",
+            message=(
+                "Asset-extents features layer is only partially registered "
+                "(view / gpkg_contents / gpkg_geometry_columns disagree)."
+            ),
+            table="gpkg_contents",
+            details={
+                "layer": USAP_FEATURES_LAYER,
+                "view_exists": has_view,
+                "contents_row": features_row is not None,
+                "geometry_columns_row": geometry_row is not None,
+            },
+        )
+        return
+
+    if features_row["srs_id"] != geometry_row["srs_id"]:
+        report.add(
+            severity="error",
+            code="FEATURES_LAYER_SRS_MISMATCH",
+            message=(
+                "gpkg_contents and gpkg_geometry_columns declare different "
+                "srs_id for the asset-extents layer."
+            ),
+            table="gpkg_geometry_columns",
+            details={
+                "gpkg_contents_srs_id": features_row["srs_id"],
+                "gpkg_geometry_columns_srs_id": geometry_row["srs_id"],
+            },
+        )
+
+
+def _validate_asset_extents(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    if not _table_exists(conn, "usap_asset_extent"):
+        return  # old package; the layer warning already covers it
+
+    layer_srs_id = None
+
+    if _table_exists(conn, "gpkg_geometry_columns"):
+        row = conn.execute(
+            """
+            SELECT srs_id
+            FROM gpkg_geometry_columns
+            WHERE table_name = ?
+            """,
+            (USAP_FEATURES_LAYER,),
+        ).fetchone()
+
+        if row is not None:
+            layer_srs_id = int(row["srs_id"])
+
+    rows = conn.execute(
+        """
+        SELECT
+            e.asset_id,
+            e.geom,
+            a.asset_id AS existing_asset_id
+        FROM usap_asset_extent AS e
+        LEFT JOIN usap_asset AS a
+            ON a.asset_id = e.asset_id
+        ORDER BY e.asset_id
+        """
+    ).fetchall()
+
+    for row in rows:
+        asset_id = int(row["asset_id"])
+
+        if row["existing_asset_id"] is None:
+            report.add(
+                severity="error",
+                code="ORPHAN_ASSET_EXTENT",
+                message="Asset extent references a missing asset.",
+                table="usap_asset_extent",
+                row_id=asset_id,
+            )
+            continue
+
+        try:
+            envelope = decode_gpkg_envelope(row["geom"])
+        except USAPError as exc:
+            report.add(
+                severity="error",
+                code="CORRUPT_EXTENT_BLOB",
+                message=f"Could not decode extent geometry blob: {exc}",
+                table="usap_asset_extent",
+                row_id=asset_id,
+            )
+            continue
+
+        box = conn.execute(
+            """
+            SELECT
+                MIN(minx) AS minx,
+                MIN(miny) AS miny,
+                MAX(maxx) AS maxx,
+                MAX(maxy) AS maxy
+            FROM usap_asset_part
+            WHERE asset_id = ?
+              AND minx IS NOT NULL
+              AND miny IS NOT NULL
+              AND maxx IS NOT NULL
+              AND maxy IS NOT NULL
+            """,
+            (asset_id,),
+        ).fetchone()
+
+        expected = (
+            None
+            if box is None or box["minx"] is None
+            else {
+                "minx": float(box["minx"]),
+                "miny": float(box["miny"]),
+                "maxx": float(box["maxx"]),
+                "maxy": float(box["maxy"]),
+            }
+        )
+
+        actual = {
+            "minx": envelope["minx"],
+            "miny": envelope["miny"],
+            "maxx": envelope["maxx"],
+            "maxy": envelope["maxy"],
+        }
+
+        if expected != actual:
+            report.add(
+                severity="error",
+                code="EXTENT_ENVELOPE_MISMATCH",
+                message=(
+                    "Stored extent envelope does not match the union of the "
+                    "asset's part bounds."
+                ),
+                table="usap_asset_extent",
+                row_id=asset_id,
+                details={"stored": actual, "expected": expected},
+            )
+
+        if layer_srs_id is not None and envelope["srs_id"] != layer_srs_id:
+            report.add(
+                severity="error",
+                code="EXTENT_SRS_MISMATCH",
+                message=(
+                    "Extent blob srs_id differs from the features layer's "
+                    "declared srs_id."
+                ),
+                table="usap_asset_extent",
+                row_id=asset_id,
+                details={
+                    "blob_srs_id": envelope["srs_id"],
+                    "layer_srs_id": layer_srs_id,
+                },
+            )
+
+    missing = conn.execute(
+        """
+        SELECT DISTINCT ap.asset_id
+        FROM usap_asset_part AS ap
+        LEFT JOIN usap_asset_extent AS e
+            ON e.asset_id = ap.asset_id
+        WHERE ap.minx IS NOT NULL
+          AND ap.miny IS NOT NULL
+          AND ap.maxx IS NOT NULL
+          AND ap.maxy IS NOT NULL
+          AND e.asset_id IS NULL
+        ORDER BY ap.asset_id
+        """
+    ).fetchall()
+
+    for row in missing:
+        report.add(
+            severity="warning",
+            code="MISSING_ASSET_EXTENT",
+            message=(
+                "Asset has bounded parts but no extent row; the features "
+                "layer will not show it."
+            ),
+            table="usap_asset_extent",
+            row_id=int(row["asset_id"]),
+        )
+
+
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     row = conn.execute(
         """

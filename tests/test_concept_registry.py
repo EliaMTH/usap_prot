@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from usap import (
+    USAPAmbiguityError,
     USAPError,
     USAPPackage,
     seed_default_citygml_vocabulary,
@@ -53,7 +54,7 @@ def test_vocabulary_seeding_is_idempotent(tmp_path: Path) -> None:
         )
 
         report = pkg.validate_report()
-        assert report.is_ok
+        assert report.is_ok, [issue.format() for issue in report.issues]
 
 
 def test_list_accepted_concepts(tmp_path: Path) -> None:
@@ -127,10 +128,12 @@ def test_unknown_concept_fails_loudly(tmp_path: Path) -> None:
     ) as pkg:
         seed_default_citygml_vocabulary(pkg)
 
-        with pytest.raises(USAPError):
+        with pytest.raises(USAPError, match="not found"):
             pkg.resolve_semantic_class("NotRegistered")
 
-        with pytest.raises(USAPError):
+        # match= guards against passing because of the nonexistent
+        # asset_part_id instead of the unknown concept.
+        with pytest.raises(USAPError, match="concept not found"):
             pkg.annotate_elements(
                 concept="NotRegistered",
                 asset_part_id=1,
@@ -163,7 +166,8 @@ def test_ambiguous_local_name_requires_scheme_or_uri(tmp_path: Path) -> None:
             is_ade=True,
         )
 
-        with pytest.raises(USAPError):
+        # Ambiguity has its own exception type since the second audit.
+        with pytest.raises(USAPAmbiguityError, match="ambiguous"):
             pkg.resolve_semantic_class("Roof")
 
         assert (

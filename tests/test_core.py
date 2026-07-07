@@ -187,18 +187,10 @@ def test_city_object_query_finds_annotation_without_object_link(tmp_path: Path) 
         annotation_ids = {block["annotation_id"] for block in blocks}
         assert unlinked_id in annotation_ids
 
-    finally:
-        pkg.close()
-
-
-def test_validation_is_ok_for_tiny_package(tmp_path: Path) -> None:
-    db_path = tmp_path / "test.usap.gpkg"
-
-    pkg, _asset_part_id, _roof_class_id, _annotation_id = build_tiny_package(db_path)
-
-    try:
+        # Validation of this fixture rides along here instead of having a
+        # dedicated (redundant) test.
         report = pkg.validate_report()
-        assert report.issues == []
+        assert report.issues == [], [i.format() for i in report.issues]
 
     finally:
         pkg.close()

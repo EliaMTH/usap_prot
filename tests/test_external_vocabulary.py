@@ -6,7 +6,6 @@ from usap import (
     USAPPackage,
     seed_default_ade_vocabulary,
     seed_default_citygml_vocabulary,
-    seed_vocabulary_file,
 )
 
 
@@ -45,7 +44,7 @@ def test_seed_default_citygml_vocabulary(tmp_path: Path) -> None:
         assert "TrafficSpace" in names
 
         report = pkg.validate_report()
-        assert report.is_ok
+        assert report.is_ok, [issue.format() for issue in report.issues]
 
 
 def test_seed_default_ade_vocabulary(tmp_path: Path) -> None:
@@ -68,25 +67,6 @@ def test_seed_default_ade_vocabulary(tmp_path: Path) -> None:
         assert "EnergyRoof" in names
         assert "VisualFacade" in names
 
-
-def test_seed_vocabulary_file_is_idempotent(tmp_path: Path) -> None:
-    db_path = tmp_path / "idempotent_vocab.usap.gpkg"
-
-    with USAPPackage.create(
-        db_path,
-        schema_path="sql/schema.sql",
-        overwrite=True,
-    ) as pkg:
-        seed_vocabulary_file(pkg, "vocabularies/citygml_3_0_mvp.json")
-
-        count_1 = pkg.conn.execute(
-            "SELECT COUNT(*) AS n FROM usap_semantic_class"
-        ).fetchone()["n"]
-
-        seed_vocabulary_file(pkg, "vocabularies/citygml_3_0_mvp.json")
-
-        count_2 = pkg.conn.execute(
-            "SELECT COUNT(*) AS n FROM usap_semantic_class"
-        ).fetchone()["n"]
-
-        assert count_2 == count_1
+# NOTE: seeding idempotency is covered (as a superset: both vocabularies,
+# stable ids, validation) by
+# test_concept_registry.py::test_vocabulary_seeding_is_idempotent.

@@ -106,7 +106,7 @@ def test_apply_annotation_batch_with_las_and_mesh(tmp_path: Path) -> None:
         assert mesh_matches[0]["annotation_uid"] == "ann_batch_energy_roof"
 
         report = pkg.validate_report()
-        assert report.is_ok
+        assert report.is_ok, [issue.format() for issue in report.issues]
 
 
 def test_batch_rejects_unknown_concept(tmp_path: Path) -> None:
@@ -138,7 +138,7 @@ def test_batch_rejects_unknown_concept(tmp_path: Path) -> None:
             ]
         }
 
-        with pytest.raises(USAPError):
+        with pytest.raises(USAPError, match="concept not found"):
             apply_annotation_batch(pkg, batch)
 
 
@@ -172,7 +172,7 @@ def test_batch_rejects_out_of_range_indices(tmp_path: Path) -> None:
             ]
         }
 
-        with pytest.raises(USAPError):
+        with pytest.raises(USAPError, match="out of range"):
             apply_annotation_batch(pkg, batch)
 
 
@@ -226,7 +226,7 @@ def test_batch_replace_existing(tmp_path: Path) -> None:
 
         apply_annotation_batch(pkg, batch_1)
 
-        with pytest.raises(USAPError):
+        with pytest.raises(USAPError, match="already exists"):
             apply_annotation_batch(pkg, batch_2)
 
         apply_annotation_batch(

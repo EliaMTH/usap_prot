@@ -153,4 +153,4 @@ def test_integrated_citygml_las_mesh_ade_annotation(tmp_path: Path) -> None:
         assert citygml.object_count == 4
 
         report = pkg.validate_report()
-        assert report.is_ok
+        assert report.is_ok, [issue.format() for issue in report.issues]

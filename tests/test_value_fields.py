@@ -16,6 +16,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from conftest import assert_package_valid
+
 from usap import (
     ELEMENT_KIND_FACE,
     USAPError,
@@ -78,7 +80,7 @@ def test_round_trip_with_nan_holes(tmp_path: Path) -> None:
         assert summary[0]["asset_part_id"] == part
         assert summary[0]["value_count"] == 50
 
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
 
 def test_elements_where_query_intent(tmp_path: Path) -> None:
@@ -215,7 +217,7 @@ def test_chunking_and_block_pruning(tmp_path: Path) -> None:
         # returned must still be absolute
         assert pkg.elements_where(annotation_id, (">", 0.5)) == hit_indices
 
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
 
 def test_replace_overwrites_old_field(tmp_path: Path) -> None:
@@ -304,8 +306,11 @@ def test_error_paths(tmp_path: Path) -> None:
         with pytest.raises(USAPError, match="Annotation not found"):
             pkg.replace_value_field(99999, part, "face", [1.0] * 10)
 
+        # The setup call stays outside the raises block: only the read may
+        # raise, or the test could pass for the wrong reason.
+        annotation = pkg.create_concept_annotation(concept="ShadowFraction")
+
         with pytest.raises(USAPError, match="No value field"):
-            annotation = pkg.create_concept_annotation(concept="ShadowFraction")
             pkg.values_for_annotation(int(annotation["annotation_id"]))
 
 
@@ -322,7 +327,7 @@ def test_validation_flags_corrupt_value_blocks(tmp_path: Path) -> None:
         )
         annotation_id = int(annotation["annotation_id"])
 
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
         # inject corruption directly
         with pkg.transaction():
@@ -365,7 +370,7 @@ def test_validation_flags_corrupt_value_blocks(tmp_path: Path) -> None:
         ).fetchone()
 
         assert int(remaining["n"]) == 0
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
 
 def test_batch_value_fields(tmp_path: Path) -> None:

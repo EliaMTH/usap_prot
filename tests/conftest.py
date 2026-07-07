@@ -7,6 +7,15 @@ import numpy as np
 import trimesh
 
 
+def assert_package_valid(pkg) -> None:
+    """
+    Assert validate_report() is clean, printing the issues on failure
+    (a bare `assert report.is_ok` fails without saying why).
+    """
+    report = pkg.validate_report()
+    assert report.is_ok, [issue.format() for issue in report.issues]
+
+
 def write_tiny_las(path: Path, point_count: int = 10) -> None:
     """
     Write a minimal LAS file with `point_count` points for tests.

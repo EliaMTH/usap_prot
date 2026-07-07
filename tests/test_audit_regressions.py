@@ -108,7 +108,7 @@ def test_validate_connection_accepts_plain_connection(tmp_path: Path) -> None:
     try:
         report = validate_connection(conn)
 
-        assert report.is_ok
+        assert report.is_ok, [issue.format() for issue in report.issues]
         # The caller's row factory must be restored, not hijacked.
         assert conn.row_factory is None
     finally:

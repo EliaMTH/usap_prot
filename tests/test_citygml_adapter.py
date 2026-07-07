@@ -124,4 +124,4 @@ def test_import_tiny_citygml_semantics(tmp_path: Path) -> None:
         assert "building_1_door_1" in descendants
 
         report = pkg.validate_report()
-        assert report.is_ok
+        assert report.is_ok, [issue.format() for issue in report.issues]

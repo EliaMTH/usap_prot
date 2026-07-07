@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import assert_package_valid
+
 from usap import ELEMENT_KIND_FACE, USAPError, USAPPackage, seed_vocabulary_file
 
 SCHEMA_PATH = Path("sql/schema.sql").resolve()
@@ -108,7 +110,7 @@ def test_minimal_vocabulary_seeds_and_annotates(tmp_path: Path) -> None:
 
         assert [block["elements"] for block in blocks] == [[3, 4]]
 
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
 
 def test_minimal_vocabulary_reingest_is_additive(tmp_path: Path) -> None:
@@ -140,7 +142,7 @@ def test_minimal_vocabulary_reingest_is_additive(tmp_path: Path) -> None:
         ).fetchone()
 
         assert int(count["n"]) == 4
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
 
 def test_changing_parent_on_reingest_raises(tmp_path: Path) -> None:

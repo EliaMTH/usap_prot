@@ -9,7 +9,7 @@ from ._util import require_str
 from .core import USAPPackage
 from .errors import USAPAmbiguityError, USAPError
 from .domain_vocab import seed_vocabulary_file
-from .constants import normalize_element_kind
+from .constants import DEFAULT_GRAPH_NAME, normalize_element_kind
 
 
 @dataclass(frozen=True)
@@ -149,9 +149,22 @@ def apply_annotation_batch(
         result.created_city_object_count = len(result.created_city_object_uids)
 
         # Carriers need their closure self-rows, or object-level queries
-        # (elements_for_city_object) cannot see them.
+        # (elements_for_city_object) cannot see them. Every named graph must
+        # be rebuilt (e.g. citygml_import from a CityGML import), since each
+        # graph's closure carries self-rows for all objects.
         if result.created_city_object_uids:
-            pkg.rebuild_city_object_closure()
+            graph_names = {
+                row["graph_name"]
+                for row in pkg.conn.execute(
+                    """
+                    SELECT DISTINCT graph_name
+                    FROM usap_city_object_relationship
+                    """
+                ).fetchall()
+            } | {DEFAULT_GRAPH_NAME}
+
+            for graph_name in sorted(graph_names):
+                pkg.rebuild_city_object_closure(graph_name=graph_name)
 
     return result
 

@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import assert_package_valid
 from conftest import write_tiny_mesh as _write_tiny_mesh
 
 from usap import (
@@ -120,7 +121,7 @@ def test_procedure_1_citygml_init_is_one_call(tmp_path: Path) -> None:
             blocks = pkg.elements_for_city_object(object_uid, expand=True)
             assert [b["elements"] for b in blocks] == [[0, 1]]
 
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
 
 def _procedure_2_files(tmp_path: Path) -> Path:
@@ -206,7 +207,7 @@ def test_procedure_2_minimal_init_is_fully_queryable(tmp_path: Path) -> None:
             "ann_tower_A_roof_TempRoof"
         ]
 
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
     # Manifest lists the carrier like any other object.
     manifest = json.loads(
@@ -261,6 +262,53 @@ def test_unknown_city_object_fails_without_the_flag(tmp_path: Path) -> None:
         apply_annotation_batch(pkg, batch)
 
         assert pkg.elements_for_city_object("tower_A_roof", expand=True)
+
+
+def test_carriers_close_over_every_graph(tmp_path: Path) -> None:
+    # A CityGML import creates a second named graph (citygml_import); a
+    # carrier created afterwards must get closure self-rows in ALL graphs,
+    # or validation fails and graph-scoped object queries silently miss it.
+    from usap import apply_annotation_batch as apply_batch
+    from usap import import_citygml_semantics
+
+    (tmp_path / "city.gml").write_text(TINY_CITYGML, encoding="utf-8")
+
+    with _minimal_pkg(tmp_path) as pkg:
+        import_citygml_semantics(pkg, tmp_path / "city.gml")
+
+        apply_batch(
+            pkg,
+            {
+                "create_missing_city_objects": True,
+                "annotations": [
+                    {
+                        "city_object_uid": "tower_A_roof",
+                        "concept": "TempRoof",
+                        "memberships": [
+                            {"asset_uri": "city_mesh", "element_indices": [0]}
+                        ],
+                    }
+                ],
+            },
+        )
+
+        report = pkg.validate_report()
+        assert report.is_ok, [i.format() for i in report.issues]
+
+        graphs = {
+            row["graph_name"]
+            for row in pkg.conn.execute(
+                """
+                SELECT DISTINCT c.graph_name
+                FROM usap_city_object_closure AS c
+                JOIN usap_city_object AS co
+                    ON co.city_object_id = c.ancestor_city_object_id
+                WHERE co.object_uid = 'tower_A_roof'
+                """
+            ).fetchall()
+        }
+
+        assert graphs == {"usap_default", "citygml_import"}
 
 
 def test_new_carrier_requires_a_concept(tmp_path: Path) -> None:
@@ -395,7 +443,7 @@ def test_procedure_3_update_adds_assets_and_edits(tmp_path: Path) -> None:
             annotation_uid="ann_building_1_roof_1_RoofSurface"
         ) is not None
 
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
 
 def test_update_mode_requires_an_existing_package(tmp_path: Path) -> None:

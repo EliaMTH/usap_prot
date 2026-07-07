@@ -57,4 +57,4 @@ def test_register_las_asset_and_annotate_points(tmp_path: Path) -> None:
         assert matches[0]["matched_elements"] == [2]
 
         report = pkg.validate_report()
-        assert report.is_ok
+        assert report.is_ok, [issue.format() for issue in report.issues]

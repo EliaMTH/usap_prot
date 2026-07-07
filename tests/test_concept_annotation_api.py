@@ -12,30 +12,10 @@ from usap import (
 )
 
 
-def test_resolve_citygml_and_ade_concepts(tmp_path: Path) -> None:
-    db_path = tmp_path / "concepts.usap.gpkg"
-
-    with USAPPackage.create(
-        db_path,
-        schema_path="sql/schema.sql",
-        overwrite=True,
-    ) as pkg:
-        citygml = seed_default_citygml_vocabulary(pkg)
-        ade = seed_default_ade_vocabulary(pkg)
-
-        assert pkg.resolve_semantic_class("RoofSurface") == citygml.by_name["RoofSurface"]
-        assert pkg.resolve_semantic_class("EnergyRoof") == ade.by_name["EnergyRoof"]
-
-        assert (
-            pkg.resolve_semantic_class("citygml-3.0:building:RoofSurface")
-            == citygml.by_name["RoofSurface"]
-        )
-
-        assert (
-            pkg.resolve_semantic_class("usap-ade-prototype:energy:EnergyRoof")
-            == ade.by_name["EnergyRoof"]
-        )
-
+# NOTE: bare concept resolution (name + class_uri, CityGML and ADE) is
+# covered by test_external_vocabulary.py and
+# test_concept_registry.py::test_get_semantic_class_and_concept_exists;
+# this file tests resolution through the annotation API.
 
 def test_annotate_elements_with_citygml_concept(tmp_path: Path) -> None:
     mesh_path = tmp_path / "mesh.ply"

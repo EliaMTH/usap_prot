@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import assert_package_valid
 from conftest import write_tiny_las as _write_tiny_las
 from conftest import write_tiny_mesh as _write_tiny_mesh
 
@@ -179,7 +180,7 @@ def test_asset_extent_is_union_of_part_bounds(tmp_path: Path) -> None:
         assert view_row["part_count"] == 2
         assert view_row["element_count"] == 15
 
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
 
 def test_part_without_bounds_gets_no_extent(tmp_path: Path) -> None:
@@ -219,7 +220,7 @@ def test_adapters_produce_extents(tmp_path: Path) -> None:
         assert extents[las.asset_id]["minx"] == las.minx
         assert extents[las.asset_id]["maxy"] == las.maxy
 
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
 
 def test_asset_delete_cascades_extent(tmp_path: Path) -> None:
@@ -240,7 +241,7 @@ def test_asset_delete_cascades_extent(tmp_path: Path) -> None:
         ).fetchone()["n"]
 
         assert count == 0
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
 
 def test_tampered_extent_fails_validation(tmp_path: Path) -> None:
@@ -321,7 +322,7 @@ def test_set_package_srs_updates_layer_and_blobs(tmp_path: Path) -> None:
         assert srs_row is not None
         assert "25833" in srs_row["definition"]
 
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)
 
 
 def test_builder_config_srs_and_las_sniffing(tmp_path: Path, monkeypatch) -> None:
@@ -383,4 +384,4 @@ def test_builder_config_srs_and_las_sniffing(tmp_path: Path, monkeypatch) -> Non
         ).fetchone()["srs_id"]
         assert las_asset_srs == 25833
 
-        assert pkg.validate_report().is_ok
+        assert_package_valid(pkg)

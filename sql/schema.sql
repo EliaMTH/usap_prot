@@ -408,9 +408,12 @@ CREATE TABLE usap_edit_log (
 -- tables (blocks, closures, edit log) are deliberately not exposed.
 -- -------------------------------------------------------------------------
 
+-- Every view exposes its integer key as "fid": SQLite views have no rowid,
+-- and OGR/QGIS reliably map a column named fid to the feature id (older
+-- GDAL versions fail to open views without it).
 CREATE VIEW usap_annotations_view AS
 SELECT
-    a.annotation_id,
+    a.annotation_id AS fid,
     a.annotation_uid,
     sc.local_name AS concept,
     sc.class_uri AS concept_uri,
@@ -440,7 +443,7 @@ LEFT JOIN usap_city_object AS co
 
 CREATE VIEW usap_concepts_view AS
 SELECT
-    sc.semantic_class_id,
+    sc.semantic_class_id AS fid,
     sc.scheme,
     sc.scheme_version,
     sc.class_uri,
@@ -455,7 +458,7 @@ GROUP BY sc.semantic_class_id;
 
 CREATE VIEW usap_city_objects_view AS
 SELECT
-    co.city_object_id,
+    co.city_object_id AS fid,
     co.object_uid,
     sc.local_name AS semantic_class,
     co.object_status,

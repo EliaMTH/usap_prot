@@ -508,6 +508,14 @@ usap_asset_extents       features     one derived 2D bounding box per
 
 Notes:
 
+- **Add the package by dragging the `.gpkg` file** (or Layer → Add Vector
+  Layer): the dialog offers exactly these four layers. QGIS's *Browser panel*
+  additionally lists every internal `usap_*` table (a GeoPackage is a SQLite
+  file, and the browser shows all tables) — those are **not** published
+  layers, and adding one from the tree yields "layer source could not be
+  found". That is deliberate: internal tables stay unregistered so a GIS
+  session cannot edit them and bypass the SDK's invariants; the views are
+  read-only by nature.
 - The extent boxes are **derived summaries** (the union of each asset's part
   bounds, captured at registration) — never actual geometry. They are written
   automatically, kept by `ON DELETE CASCADE`, and checked by `validate_report()`

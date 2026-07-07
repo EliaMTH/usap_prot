@@ -80,21 +80,12 @@ def test_integrated_citygml_las_mesh_ade_annotation(tmp_path: Path) -> None:
         assert roof_row is not None
         assert roof_row["object_uid"] == "building_1_roof_1"
 
+        # Claim-level metadata only; object properties stay in the semantic
+        # source (CityGML/ADE), reachable through the linked city object.
         attributes = {
             "domain": "energy_emissions",
-            "geometric_attributes": {
-                "roof_slope": None,
-                "orientation": None,
-                "shading": None,
-            },
-            "non_geometric_attributes": {
-                "construction_era": None,
-                "use": None,
-            },
-            "derived_indicators": {
-                "specific_energy_kwh_m2": None,
-                "co2_emissions": None,
-            },
+            "method": "integrated_prototype_test",
+            "assessed_at": "2026-06-30T14:00:00Z",
         }
 
         annotation_id = pkg.create_annotation(

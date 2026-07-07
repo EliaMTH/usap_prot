@@ -28,8 +28,9 @@
 -- 9. usap_annotation
 -- 10. usap_annotation_object
 -- 11. usap_membership_block
--- 12. optional indexes
--- 13. optional helper tables
+-- 12. usap_value_block
+-- 13. optional indexes
+-- 14. optional helper tables
 
 PRAGMA foreign_keys = ON; -- ensure key consistency between tables (i.e.: prevent operations that would break relationship between tables); need to be declare as it is off by default for backwards compatibility
 
@@ -300,9 +301,14 @@ CREATE TABLE usap_membership_block (
 
     payload             BLOB NOT NULL,
 
+    -- The auto-index behind this constraint doubles as the annotation-first
+    -- lookup index (forward queries, annotation-delete cascade); do not add
+    -- an explicit index on the same columns.
     UNIQUE(annotation_id, asset_part_id, element_kind, block_start)
 );
 
+-- Serves the reverse element query (annotations_for_elements) and the
+-- ON DELETE CASCADE scan from usap_asset_part.
 CREATE INDEX usap_mb_by_element_block
 ON usap_membership_block(
     asset_part_id,
@@ -310,12 +316,46 @@ ON usap_membership_block(
     block_start
 );
 
-CREATE INDEX usap_mb_by_annotation
-ON usap_membership_block(
-    annotation_id,
+-- Per-element value fields: dense scalar arrays over an asset part's
+-- elements (element i's value = decoded[i - block_start]). Sibling of
+-- usap_membership_block: membership stores WHICH elements are a concept,
+-- value blocks store the VALUE of a property at each element. Bound to the
+-- asset part only — never to a city object.
+CREATE TABLE usap_value_block (
+    value_block_id      INTEGER PRIMARY KEY,
+
+    annotation_id       INTEGER NOT NULL
+        REFERENCES usap_annotation(annotation_id)
+        ON DELETE CASCADE,
+
+    asset_part_id       INTEGER NOT NULL
+        REFERENCES usap_asset_part(asset_part_id)
+        ON DELETE CASCADE,
+
+    element_kind        INTEGER NOT NULL,
+
+    block_start         INTEGER NOT NULL,
+    element_count       INTEGER NOT NULL,
+
+    value_dtype         TEXT NOT NULL,   -- 'f4', 'f2', 'u1', ... little-endian
+
+    value_min           REAL,            -- NaN-ignoring block min; NULL if all-NaN
+    value_max           REAL,
+
+    payload             BLOB NOT NULL,   -- zlib(values.tobytes())
+
+    -- The auto-index behind this constraint doubles as the annotation-first
+    -- lookup index (value readers, annotation-delete cascade); do not add
+    -- an explicit index on the same columns.
+    UNIQUE(annotation_id, asset_part_id, element_kind, block_start)
+);
+
+-- Serves the ON DELETE CASCADE scan from usap_asset_part (no part-level
+-- value query exists yet).
+CREATE INDEX usap_vb_by_part
+ON usap_value_block(
     asset_part_id,
-    element_kind,
-    block_start
+    element_kind
 );
 
 CREATE TABLE usap_edit_log (

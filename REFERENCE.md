@@ -278,13 +278,24 @@ building_1_window_1
 
 A semantic claim linked to one concept and optionally to one city object.
 
+**What belongs in USAP vs the semantic source.** USAP is authoritative for the
+*claim layer*: which elements, under which concept, with what status,
+confidence, and provenance. The CityGML/ADE (or other semantic source) is
+authoritative for the *meaning layer*: which concepts and objects exist, their
+properties, and their hierarchy. Accordingly, an annotation's `attributes`
+must hold **claim-level metadata only** — how/when/by what the claim was
+produced (`method`, `source`, `assessed_at`, and for value fields `unit`,
+`validAt`) — never object properties (roof slope, use, construction era, ...).
+Those stay in the semantic source, reachable through the linked city object,
+so there is exactly one authority for them and nothing to keep synchronized.
+
 Example:
 
 ```text
 annotation_uid: ann_energy_roof_001
 concept: EnergyRoof
 primary city object: building_1_roof_1
-attributes: energy/emissions JSON metadata
+attributes: claim metadata (method, source, assessed_at)
 ```
 
 ### Membership block
@@ -297,6 +308,31 @@ Example:
 annotation ann_energy_roof_001
 asset part area.las points/all
 selected point indices [100, 101, 102]
+```
+
+### Value block
+
+A compressed dense array of per-element scalar values for one annotation and one asset
+part: element *i*'s value is `decoded[i - block_start]`. Membership stores *which*
+elements are a concept; value blocks store the *value* of a property at each element
+(e.g. shadow fraction per face). Value fields are bound to the geometry asset only —
+never to a city object — and must cover every element of the part (v1; NaN = "no
+value" in float fields). Stored little-endian, dtype per block (`f4` default; see
+`VALUE_DTYPES`), with per-block min/max for decode-free stats and query pruning.
+
+Writing is strict about the requested dtype: values that an integer dtype cannot
+represent exactly (out of range, non-integral, NaN/inf) raise `USAPError` instead of
+wrapping or truncating, and finite values that would overflow a narrow float dtype to
+inf raise too — only float precision rounding (e.g. f8 → f4) is allowed. All readers
+(`values_for_annotation`, `elements_where`, `value_field_stats`) reject partial fields:
+the blocks must tile the whole asset part.
+
+Example:
+
+```text
+annotation ann_shadow_1400 (concept ShadowFraction, no city object)
+asset part area_lod2.obj geometry/0
+values float32 [0.0, 0.73, 0.5, ...]   one per face
 ```
 
 ---
@@ -365,6 +401,10 @@ alignment with a full ontology-backed package.
 
 ## Build a real project package
 
+> The three supported ingestion/editing procedures (CityGML init, minimal-
+> vocabulary init, editing) are documented end to end in
+> [INGESTION.md](INGESTION.md). This section describes the config keys.
+
 Two project configs are provided:
 
 - `project_configs/example_project_catania.json` — ready to run against the bundled
@@ -413,6 +453,14 @@ The Catania config looks like this:
 }
 ```
 
+Two further optional keys:
+
+- `"annotation_batches": ["links.json"]` — batch files applied right after the
+  assets are registered, so one build call ingests the annotations too.
+- assets accept an explicit `"uri"` (a stable logical name); batch memberships
+  can then reference parts as `"asset_uri": "<that name>"` instead of the
+  numeric `asset_part_id` from the manifest.
+
 Run:
 
 ```bash
@@ -426,7 +474,13 @@ outputs/example_project_catania.usap.gpkg
 outputs/example_project_catania_manifest.json
 ```
 
-The manifest tells you which `asset_part_id` values to use in annotation batches.
+The manifest lists each part's `asset_part_id` (usable in batches as an
+alternative to `asset_uri`).
+
+To apply a config to an **existing** package — add assets, apply editing
+batches — pass `--update` (Python: `build_project_package_from_file(path,
+update=True)`). Registration is idempotent, and in update mode batches run
+with `replace_existing=True`.
 
 ---
 
@@ -485,9 +539,26 @@ python examples/smoke_test_project_package.py \
 
 ## Batch annotation format
 
-Batch annotations are JSON files.
+Batch annotations (the "linking JSON" of [INGESTION.md](INGESTION.md)) are
+JSON files. Several fields are derivable, so the minimal entry is just
+*object + elements* (procedure 1) or *object + concept + elements*
+(procedure 2):
 
-Example:
+- `concept` — optional when the linked city object already has a class
+  (inherited from it); required otherwise, and when creating carriers.
+- `annotation_uid` — optional when a city object is linked; derived as
+  `ann_{object_uid}_{concept_local_name}` (stable across re-runs, so
+  re-applying with `--replace-existing` edits in place).
+- `element_kind` — optional; defaults to the asset part's stored kind.
+- parts are referenced by `asset_part_id` (int) **or** `asset_uri`
+  (+ `part_path` when the asset has several parts) — exactly one of the two.
+- top-level `"create_missing_city_objects": true` (minimal-vocabulary
+  procedure only) lets unknown `city_object_uid`s create carrier city
+  objects: classed by the entry's concept, `object_status='temporary'`
+  (the marker for later CityGML alignment), nothing else. Without the flag,
+  unknown names fail loudly.
+
+Full-form example:
 
 ```json
 {
@@ -501,19 +572,9 @@ Example:
       "confidence": 0.8,
       "attributes": {
         "domain": "energy_emissions",
-        "geometric_attributes": {
-          "roof_slope": 31.5,
-          "orientation": "SE",
-          "shading": "partial"
-        },
-        "non_geometric_attributes": {
-          "construction_era": "1946-1970",
-          "use": "residential"
-        },
-        "derived_indicators": {
-          "specific_energy_kwh_m2": null,
-          "co2_emissions": null
-        }
+        "method": "roof_detector_v2",
+        "source": "survey_2026_06",
+        "assessed_at": "2026-06-30T14:00:00Z"
       },
       "memberships": [
         {
@@ -522,8 +583,7 @@ Example:
           "element_indices": [100, 101, 102]
         },
         {
-          "asset_part_id": 3,
-          "element_kind": "face",
+          "asset_uri": "area_lod2",
           "element_indices": [40, 41, 42]
         }
       ]
@@ -549,14 +609,39 @@ python examples/apply_annotation_batch.py \
   --replace-existing
 ```
 
+An annotation may carry `"value_fields"` instead of (or alongside) `"memberships"` —
+at least one of the two is required. Values are listed inline, one per element of the
+asset part, with JSON `null` meaning "no value" (stored as NaN; float dtypes only):
+
+```json
+{
+  "annotations": [
+    {
+      "annotation_uid": "ann_shadow_1400",
+      "concept": "ShadowFraction",
+      "attributes": { "validAt": "2026-06-21T14:00:00Z", "unit": "fraction" },
+      "value_fields": [
+        {
+          "asset_part_id": 3,
+          "element_kind": "face",
+          "values": [0.0, 0.73, null, 0.5],
+          "value_dtype": "f4"
+        }
+      ]
+    }
+  ]
+}
+```
+
 The batch importer validates:
 
 ```text
-concept is registered
-city object exists
-asset part exists
-element kind matches asset part
+concept is registered (or inheritable from the linked object's class)
+city object exists (unless create_missing_city_objects is set)
+asset part exists and the asset_uri reference is unambiguous
+element kind matches asset part (when given; defaulted otherwise)
 element indices are in range
+value fields cover the whole asset part; dtype is supported
 annotation UID is not duplicated unless replacement is requested
 ```
 
@@ -635,9 +720,8 @@ annotation = pkg.annotate_elements(
     element_indices=[100, 101, 102],
     attributes={
         "domain": "energy_emissions",
-        "geometric_attributes": {
-            "roof_slope": 31.5
-        }
+        "method": "manual_selection",
+        "assessed_at": "2026-06-30T14:00:00Z",
     },
 )
 ```
@@ -683,6 +767,32 @@ updated = pkg.update_annotation(
 )
 
 pkg.delete_annotation(annotation["annotation_id"])
+```
+
+### Per-element value fields
+
+```python
+import numpy as np
+
+# one value per face of the asset part; NaN = "no value"
+shadow = np.clip(np.random.default_rng(0).normal(0.4, 0.2, mesh_face_count), 0, 1)
+
+ann = pkg.annotate_value_field(
+    concept="ShadowFraction",          # any registered concept: CityGML, ADE, or local
+    asset_part_id=mesh_part_id,
+    element_kind="face",
+    values=shadow,                     # dtype: explicit > whitelisted ndarray dtype > 'f4'
+    attributes={"validAt": "2026-06-21T14:00:00Z", "unit": "fraction"},
+)
+annotation_id = ann["annotation_id"]   # primary_city_object_id is always NULL
+
+values = pkg.values_for_annotation(annotation_id)          # full dense array back
+faces = pkg.elements_where(annotation_id, (">", 0.5))      # sorted face-index set
+dim = pkg.elements_where(annotation_id, lambda v: (v > 0.2) & (v < 0.8))
+stats = pkg.value_field_stats(annotation_id)               # min/max/count, no decode
+
+# editing is whole-field rewrite (the exception path)
+pkg.replace_value_field(annotation_id, mesh_part_id, "face", corrected_values)
 ```
 
 ---

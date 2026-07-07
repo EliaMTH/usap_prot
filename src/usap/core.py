@@ -57,11 +57,15 @@ Method map (matches the ``# ---`` section banners below):
     Queries .................... annotations_for_elements (reverse: elements →
                                   annotations), elements_for_annotation /
                                   _semantic_class / _city_object (forward)
+    Value fields ............... annotate_value_field, replace_value_field,
+                                  values_for_annotation, elements_where,
+                                  value_field_stats (dense per-element scalar
+                                  fields, asset-bound — never city-object-bound)
     Validation ................. validate_report
-    Concept-level API .......... resolve_semantic_class / resolve_city_object,
-                                  create_concept_annotation, annotate_elements,
-                                  attach_annotation_elements (the high-level
-                                  entry points most callers use)
+    Concept-level API .......... resolve_semantic_class / resolve_city_object /
+                                  resolve_asset_part, create_concept_annotation,
+                                  annotate_elements, attach_annotation_elements
+                                  (the high-level entry points most callers use)
 """
 
 from __future__ import annotations
@@ -76,14 +80,27 @@ from typing import Any
 import json
 import uuid
 
-from .errors import USAPError
+import numpy as np
+
+from .errors import USAPAmbiguityError, USAPError
 from .constants import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_ENCODING,
     DEFAULT_GRAPH_NAME,
+    DEFAULT_VALUE_DTYPE,
+    VALUE_CHUNK_SIZE,
+    VALUE_DTYPES,
     normalize_element_kind,
+    normalize_value_dtype,
 )
-from .encoding import encode_u32_zlib, decode_u32_zlib, block_start_for_index, split_indices_into_blocks
+from .encoding import (
+    block_start_for_index,
+    decode_u32_zlib,
+    decode_value_block,
+    encode_u32_zlib,
+    encode_value_block,
+    split_indices_into_blocks,
+)
 from .sqlite_utils import require_lastrowid
 from .validation import validate_connection
 from .geopackage import initialize_geopackage_metadata
@@ -97,6 +114,98 @@ DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "sql" / "schema.sql"
 # SQLite binds one variable per IN-list member and its variable limit can be
 # as low as 999, so large id lists are queried in chunks of this size.
 _MAX_SQL_IN_VARS = 900
+
+_COMPARISON_OPS = {
+    ">": np.greater,
+    ">=": np.greater_equal,
+    "<": np.less,
+    "<=": np.less_equal,
+    "==": np.equal,
+    "!=": np.not_equal,
+}
+
+
+def _block_cannot_match(
+    op: str,
+    threshold: float,
+    value_min: float | None,
+    value_max: float | None,
+) -> bool:
+    """
+    True when a value block's stored NaN-ignoring [min, max] range proves the
+    comparison cannot match any element (NaN never matches any predicate).
+    """
+    if value_min is None or value_max is None:
+        return True  # all-NaN block
+
+    if op == ">":
+        return value_max <= threshold
+    if op == ">=":
+        return value_max < threshold
+    if op == "<":
+        return value_min >= threshold
+    if op == "<=":
+        return value_min > threshold
+    if op == "==":
+        return threshold < value_min or threshold > value_max
+    # "!=": every real value equals the threshold -> nothing can differ.
+    return value_min == value_max == threshold
+
+
+def _check_value_cast(
+    array: np.ndarray,
+    target_dtype: np.dtype,
+    value_dtype: str,
+) -> None:
+    """
+    Reject casts that would silently corrupt values: wraparound/truncation
+    into integer dtypes, or finite values overflowing to inf in a narrower
+    float dtype. Plain precision rounding (f8 -> f4) is inherent to the
+    requested dtype and stays allowed.
+    """
+    if array.size == 0 or array.dtype.kind not in "buif":
+        return
+
+    if target_dtype.kind in "ui":
+        if array.dtype.kind == "f" and not bool(np.isfinite(array).all()):
+            raise USAPError(
+                f"Non-finite values are not representable in integer "
+                f"value_dtype {value_dtype!r}. Use a float dtype."
+            )
+
+        info = np.iinfo(target_dtype)
+        lo = array.min()
+        hi = array.max()
+
+        if lo < info.min or hi > info.max:
+            raise USAPError(
+                f"Value field has values outside the {value_dtype!r} range "
+                f"[{info.min}, {info.max}]: min {lo}, max {hi}. "
+                "They would wrap around silently."
+            )
+
+        if array.dtype.kind == "f" and bool((np.floor(array) != array).any()):
+            raise USAPError(
+                f"Value field has non-integral values; integer value_dtype "
+                f"{value_dtype!r} would truncate them. Use a float dtype."
+            )
+    elif array.dtype != target_dtype:
+        finite = array
+
+        if array.dtype.kind == "f":
+            finite = array[np.isfinite(array)]
+
+        if finite.size:
+            magnitude = max(abs(float(finite.min())), abs(float(finite.max())))
+
+            if magnitude > float(np.finfo(target_dtype).max):
+                raise USAPError(
+                    f"Value field has finite values beyond the "
+                    f"{value_dtype!r} range "
+                    f"(max magnitude {np.finfo(target_dtype).max}); "
+                    "the cast would produce inf."
+                )
+
 
 class USAPPackage:
     """
@@ -746,6 +855,9 @@ class USAPPackage:
         Read one annotation by id or uid.
 
         Returns None if no annotation is found.
+
+        include_membership_summary=True also attaches value_field_summary
+        (both are per-asset-part payload rollups).
         """
         if annotation_id is None and annotation_uid is None:
             raise USAPError("Provide annotation_id or annotation_uid.")
@@ -797,6 +909,9 @@ class USAPPackage:
             result["membership_summary"] = self._annotation_membership_summary(
                 int(result["annotation_id"])
             )
+            result["value_field_summary"] = self._annotation_value_field_summary(
+                int(result["annotation_id"])
+            )
 
         return result
 
@@ -820,6 +935,9 @@ class USAPPackage:
         city_object_id / city_object_uid matches either:
         - annotation.primary_city_object_id
         - usap_annotation_object links
+
+        include_membership_summary=True also attaches value_field_summary
+        (both are per-asset-part payload rollups).
         """
         where: list[str] = []
         params: list[Any] = []
@@ -919,6 +1037,9 @@ class USAPPackage:
         if include_membership_summary:
             for item in result:
                 item["membership_summary"] = self._annotation_membership_summary(
+                    int(item["annotation_id"])
+                )
+                item["value_field_summary"] = self._annotation_value_field_summary(
                     int(item["annotation_id"])
                 )
 
@@ -1685,6 +1806,571 @@ class USAPPackage:
         ]
 
     # ---------------------------------------------------------------------
+    # Value fields (dense per-element scalar fields)
+    # ---------------------------------------------------------------------
+    #
+    # Membership blocks store WHICH elements are a concept; value blocks
+    # store the VALUE of a property at each element (e.g. shadow fraction
+    # per face). A value field binds a registered concept to the elements of
+    # one asset part — it is a property of the geometry asset, so this API
+    # takes no city-object parameters and the owning annotation's
+    # primary_city_object_id stays NULL.
+    #
+    # V1 contract: a field covers every element of its asset part
+    # (len(values) == element_count); "no value" is NaN inside a float
+    # array. Partial/sub-range fields are a future format — readers raise.
+
+    def replace_value_field(
+        self,
+        annotation_id: int,
+        asset_part_id: int,
+        element_kind: int | str,
+        values: Any,
+        value_dtype: str | None = None,
+    ) -> None:
+        """
+        Replace the whole value field for one annotation on one asset part.
+
+        Editing is whole-field rewrite by design (write-once, read-many).
+        Dtype resolution: explicit value_dtype > the ndarray's own dtype when
+        it is in VALUE_DTYPES > 'f4'.
+        """
+        element_kind = normalize_element_kind(element_kind)
+
+        annotation = self.conn.execute(
+            """
+            SELECT annotation_id
+            FROM usap_annotation
+            WHERE annotation_id = ?
+            """,
+            (annotation_id,),
+        ).fetchone()
+
+        if annotation is None:
+            raise USAPError(f"Annotation not found: {annotation_id}")
+
+        asset_part = self.conn.execute(
+            """
+            SELECT element_kind, element_count
+            FROM usap_asset_part
+            WHERE asset_part_id = ?
+            """,
+            (asset_part_id,),
+        ).fetchone()
+
+        if asset_part is None:
+            raise USAPError(f"Unknown asset_part_id: {asset_part_id}")
+
+        expected_kind = int(asset_part["element_kind"])
+        part_element_count = int(asset_part["element_count"])
+
+        if element_kind != expected_kind:
+            raise USAPError(
+                f"Element kind mismatch: asset part expects "
+                f"{expected_kind}, got {element_kind}"
+            )
+
+        array = np.asarray(values)
+
+        if array.ndim != 1:
+            raise USAPError(
+                f"Value field must be one-dimensional, got shape {array.shape}."
+            )
+
+        if len(array) != part_element_count:
+            raise USAPError(
+                f"Value field must cover the whole asset part: got "
+                f"{len(array)} values, asset part has {part_element_count} "
+                "elements. Use NaN for elements without a value."
+            )
+
+        if value_dtype is not None:
+            value_dtype = normalize_value_dtype(value_dtype)
+        elif isinstance(values, np.ndarray) and array.dtype.str[1:] in VALUE_DTYPES:
+            value_dtype = array.dtype.str[1:]
+        else:
+            value_dtype = DEFAULT_VALUE_DTYPE
+
+        target_dtype = np.dtype("<" + value_dtype)
+
+        if (
+            target_dtype.kind != "f"
+            and array.dtype.kind == "f"
+            and bool(np.isnan(array).any())
+        ):
+            raise USAPError(
+                f"NaN is not representable in integer value_dtype "
+                f"{value_dtype!r}. Use a float dtype for fields with "
+                "missing values."
+            )
+
+        _check_value_cast(array, target_dtype, value_dtype)
+
+        typed = np.ascontiguousarray(array, dtype=target_dtype)
+
+        with self.transaction():
+            self.conn.execute(
+                """
+                DELETE FROM usap_value_block
+                WHERE annotation_id = ?
+                AND asset_part_id = ?
+                AND element_kind = ?
+                """,
+                (annotation_id, asset_part_id, element_kind),
+            )
+
+            for block_start in range(0, len(typed), VALUE_CHUNK_SIZE):
+                chunk = typed[block_start : block_start + VALUE_CHUNK_SIZE]
+
+                if target_dtype.kind == "f":
+                    real = chunk[~np.isnan(chunk)]
+                else:
+                    real = chunk
+
+                value_min = float(real.min()) if real.size else None
+                value_max = float(real.max()) if real.size else None
+
+                self.conn.execute(
+                    """
+                    INSERT INTO usap_value_block (
+                        annotation_id,
+                        asset_part_id,
+                        element_kind,
+                        block_start,
+                        element_count,
+                        value_dtype,
+                        value_min,
+                        value_max,
+                        payload
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        annotation_id,
+                        asset_part_id,
+                        element_kind,
+                        block_start,
+                        len(chunk),
+                        value_dtype,
+                        value_min,
+                        value_max,
+                        encode_value_block(chunk, value_dtype),
+                    ),
+                )
+
+            self.log_edit(
+                "replace_value_field",
+                "usap_annotation",
+                annotation_id,
+                f'{{"asset_part_id": {asset_part_id}, '
+                f'"element_kind": {element_kind}, '
+                f'"element_count": {len(typed)}, '
+                f'"value_dtype": "{value_dtype}"}}',
+            )
+
+    def annotate_value_field(
+        self,
+        *,
+        concept: int | str,
+        asset_part_id: int,
+        element_kind: int | str,
+        values: Any,
+        value_dtype: str | None = None,
+        annotation_uid: str | None = None,
+        label: str | None = None,
+        status: str = "draft",
+        confidence: float | None = None,
+        attributes: dict[str, Any] | None = None,
+        attributes_json: str | None = None,
+        scheme: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Create an annotation for a concept and attach a per-element value
+        field in one step:
+
+            this asset part carries these values, meaning this concept.
+
+        The concept must be registered (CityGML, ADE, or a minimal local
+        vocabulary — any scheme). Field metadata (unit, validAt, method, ...)
+        belongs in `attributes`. There are deliberately no city-object
+        parameters: a value field is a property of the geometry asset.
+        """
+        element_kind = normalize_element_kind(element_kind)
+
+        with self.transaction():
+            annotation = self.create_concept_annotation(
+                concept=concept,
+                annotation_uid=annotation_uid,
+                label=label,
+                status=status,
+                confidence=confidence,
+                attributes=attributes,
+                attributes_json=attributes_json,
+                scheme=scheme,
+            )
+
+            annotation_id = int(annotation["annotation_id"])
+
+            self.replace_value_field(
+                annotation_id=annotation_id,
+                asset_part_id=asset_part_id,
+                element_kind=element_kind,
+                values=values,
+                value_dtype=value_dtype,
+            )
+
+        result = self.get_annotation(
+            annotation_id,
+            include_membership_summary=True,
+        )
+
+        if result is None:
+            raise USAPError(
+                f"Annotation disappeared after value-field annotation: "
+                f"{annotation_id}"
+            )
+
+        return result
+
+    def _value_blocks_for_annotation(
+        self,
+        annotation_id: int,
+        asset_part_id: int | None,
+        element_kind: int | None,
+    ) -> list[sqlite3.Row]:
+        """
+        Fetch one annotation's value blocks (optionally filtered) and check
+        that they belong to exactly one (asset part, element kind) pair,
+        share one dtype, and tile the whole asset part (v1 full coverage) —
+        so every reader enforces the same contract.
+        """
+        where = ["vb.annotation_id = ?"]
+        params: list[Any] = [annotation_id]
+
+        if asset_part_id is not None:
+            where.append("vb.asset_part_id = ?")
+            params.append(asset_part_id)
+
+        if element_kind is not None:
+            where.append("vb.element_kind = ?")
+            params.append(element_kind)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                vb.value_block_id,
+                vb.asset_part_id,
+                vb.element_kind,
+                vb.block_start,
+                vb.element_count,
+                vb.value_dtype,
+                vb.value_min,
+                vb.value_max,
+                vb.payload,
+                ap.element_count AS part_element_count
+            FROM usap_value_block AS vb
+            JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = vb.asset_part_id
+            WHERE {" AND ".join(where)}
+            ORDER BY vb.asset_part_id, vb.element_kind, vb.block_start
+            """,
+            params,
+        ).fetchall()
+
+        if not rows:
+            raise USAPError(
+                f"No value field found for annotation {annotation_id}."
+            )
+
+        targets = {(int(r["asset_part_id"]), int(r["element_kind"])) for r in rows}
+
+        if len(targets) > 1:
+            raise USAPError(
+                f"Annotation {annotation_id} has value fields on several "
+                f"asset parts: {sorted(targets)}. Pass asset_part_id."
+            )
+
+        dtypes = {r["value_dtype"] for r in rows}
+
+        if len(dtypes) > 1:
+            raise USAPError(
+                f"Value field of annotation {annotation_id} mixes dtypes "
+                f"{sorted(dtypes)}; the field is corrupt."
+            )
+
+        expected_start = 0
+
+        for row in rows:
+            if int(row["block_start"]) != expected_start:
+                raise USAPError(
+                    f"Value field of annotation {annotation_id} has a gap at "
+                    f"element {expected_start}; partial fields are not "
+                    "supported in v1."
+                )
+
+            expected_start += int(row["element_count"])
+
+        part_element_count = int(rows[0]["part_element_count"])
+
+        if expected_start != part_element_count:
+            raise USAPError(
+                f"Value field of annotation {annotation_id} covers "
+                f"{expected_start} of {part_element_count} elements; partial "
+                "fields are not supported in v1."
+            )
+
+        return rows
+
+    def values_for_annotation(
+        self,
+        annotation_id: int,
+        *,
+        asset_part_id: int | None = None,
+        element_kind: int | str | None = None,
+    ) -> np.ndarray:
+        """
+        Forward query: annotation -> its dense value array.
+
+        Element i's value is result[i]; the array always spans the whole
+        asset part (v1 contract), with NaN marking "no value" in float fields.
+        """
+        if element_kind is not None:
+            element_kind = normalize_element_kind(element_kind)
+
+        rows = self._value_blocks_for_annotation(
+            annotation_id, asset_part_id, element_kind
+        )
+
+        value_dtype = rows[0]["value_dtype"]
+
+        # Tiling/coverage was already verified by _value_blocks_for_annotation.
+        return np.concatenate(
+            [
+                decode_value_block(
+                    row["payload"], value_dtype, int(row["element_count"])
+                )
+                for row in rows
+            ]
+        )
+
+    def elements_where(
+        self,
+        annotation_id: int,
+        predicate: tuple[str, float] | Any,
+        *,
+        asset_part_id: int | None = None,
+    ) -> list[int]:
+        """
+        Value query: element indices where the field satisfies a predicate.
+
+            elements_where(ann_id, (">", 0.5))
+            elements_where(ann_id, lambda v: (v > 0.2) & (v < 0.8))
+
+        The output is a sorted element-index set — the same shape as a
+        membership query result, so it plugs into the same downstream paths.
+        NaN never matches. Comparison predicates skip blocks whose stored
+        min/max cannot match.
+        """
+        op: str | None = None
+        threshold: float | None = None
+        mask_fn = None
+
+        if isinstance(predicate, tuple):
+            if len(predicate) != 2 or predicate[0] not in _COMPARISON_OPS:
+                raise USAPError(
+                    f"Unsupported predicate {predicate!r}. Use (op, threshold) "
+                    f"with op in {sorted(_COMPARISON_OPS)}, or a callable."
+                )
+            op, threshold = predicate[0], float(predicate[1])
+        elif callable(predicate):
+            mask_fn = predicate
+        else:
+            raise USAPError(
+                f"Unsupported predicate {predicate!r}. Use (op, threshold) "
+                "or a callable returning a boolean mask."
+            )
+
+        rows = self._value_blocks_for_annotation(
+            annotation_id, asset_part_id, None
+        )
+
+        value_dtype = rows[0]["value_dtype"]
+        hits: list[np.ndarray] = []
+
+        for row in rows:
+            if op is not None and _block_cannot_match(
+                op,
+                threshold,
+                row["value_min"],
+                row["value_max"],
+            ):
+                continue
+
+            block = decode_value_block(
+                row["payload"], value_dtype, int(row["element_count"])
+            )
+
+            with np.errstate(invalid="ignore"):
+                if mask_fn is not None:
+                    mask = np.asarray(mask_fn(block), dtype=bool)
+
+                    if mask.shape != block.shape:
+                        raise USAPError(
+                            "Callable predicate must return a boolean mask of "
+                            f"the block's shape; got {mask.shape} for "
+                            f"{block.shape}."
+                        )
+                else:
+                    mask = _COMPARISON_OPS[op](block, threshold)
+
+                # NaN means "no value" and never matches — numpy would let
+                # NaN satisfy "!=" (and callables may not handle it).
+                if block.dtype.kind == "f":
+                    mask = mask & ~np.isnan(block)
+
+            block_hits = np.nonzero(mask)[0]
+
+            if block_hits.size:
+                hits.append(block_hits + int(row["block_start"]))
+
+        if not hits:
+            return []
+
+        # Blocks are visited in ascending block_start order and hits are
+        # ascending within each block, so the result is already sorted.
+        return np.concatenate(hits).tolist()
+
+    def value_field_stats(
+        self,
+        annotation_id: int,
+        *,
+        asset_part_id: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Field stats from the stored per-block min/max — no payload decode.
+
+        min/max ignore NaN; count is the total number of stored values
+        (NaN included).
+        """
+        where = ["vb.annotation_id = ?"]
+        params: list[Any] = [annotation_id]
+
+        if asset_part_id is not None:
+            where.append("vb.asset_part_id = ?")
+            params.append(asset_part_id)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                vb.asset_part_id,
+                vb.element_kind,
+                vb.value_dtype,
+                MIN(vb.value_min) AS value_min,
+                MAX(vb.value_max) AS value_max,
+                SUM(vb.element_count) AS value_count,
+                MIN(vb.block_start) AS first_block_start,
+                COUNT(*) AS block_count,
+                ap.element_count AS part_element_count
+            FROM usap_value_block AS vb
+            JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = vb.asset_part_id
+            WHERE {" AND ".join(where)}
+            GROUP BY vb.asset_part_id, vb.element_kind, vb.value_dtype
+            """,
+            params,
+        ).fetchall()
+
+        if not rows:
+            raise USAPError(
+                f"No value field found for annotation {annotation_id}."
+            )
+
+        if len(rows) > 1:
+            targets = {
+                (int(r["asset_part_id"]), int(r["element_kind"])) for r in rows
+            }
+
+            if len(targets) > 1:
+                raise USAPError(
+                    f"Annotation {annotation_id} has value fields on several "
+                    f"asset parts: {sorted(targets)}. Pass asset_part_id."
+                )
+
+            raise USAPError(
+                f"Value field of annotation {annotation_id} mixes dtypes "
+                f"{sorted(r['value_dtype'] for r in rows)}; the field is "
+                "corrupt."
+            )
+
+        row = rows[0]
+
+        # Same v1 contract as the decoding readers, kept SQL-only: the field
+        # must start at element 0 and account for every element of the part.
+        if (
+            int(row["first_block_start"]) != 0
+            or int(row["value_count"]) != int(row["part_element_count"])
+        ):
+            raise USAPError(
+                f"Value field of annotation {annotation_id} covers "
+                f"{int(row['value_count'])} of "
+                f"{int(row['part_element_count'])} elements; partial fields "
+                "are not supported in v1."
+            )
+
+        return {
+            "annotation_id": annotation_id,
+            "asset_part_id": int(row["asset_part_id"]),
+            "element_kind": int(row["element_kind"]),
+            "value_dtype": row["value_dtype"],
+            "min": row["value_min"],
+            "max": row["value_max"],
+            "count": int(row["value_count"]),
+            "block_count": int(row["block_count"]),
+        }
+
+    def _annotation_value_field_summary(
+        self,
+        annotation_id: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Summarize which asset parts an annotation carries value fields on.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT
+                vb.asset_part_id,
+                ap.asset_id,
+                asset.uri AS asset_uri,
+                asset.asset_kind,
+                ap.part_path,
+                vb.element_kind,
+                vb.value_dtype,
+                SUM(vb.element_count) AS value_count,
+                COUNT(*) AS block_count,
+                MIN(vb.value_min) AS value_min,
+                MAX(vb.value_max) AS value_max
+            FROM usap_value_block AS vb
+            JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = vb.asset_part_id
+            JOIN usap_asset AS asset
+                ON asset.asset_id = ap.asset_id
+            WHERE vb.annotation_id = ?
+            GROUP BY
+                vb.asset_part_id,
+                ap.asset_id,
+                asset.uri,
+                asset.asset_kind,
+                ap.part_path,
+                vb.element_kind,
+                vb.value_dtype
+            ORDER BY vb.asset_part_id
+            """,
+            (annotation_id,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    # ---------------------------------------------------------------------
     # Validation
     # ---------------------------------------------------------------------
 
@@ -1779,7 +2465,7 @@ class USAPPackage:
                 for row in rows
             ]
 
-            raise USAPError(
+            raise USAPAmbiguityError(
                 "Semantic class concept is ambiguous. "
                 f"Use a class_uri, semantic_class_id, or scheme. "
                 f"Concept: {concept}. Options: {options}"
@@ -1933,6 +2619,88 @@ class USAPPackage:
 
         return True
     
+    def resolve_asset_part(
+        self,
+        asset_part: int | str,
+        *,
+        part_path: str | None = None,
+    ) -> int:
+        """
+        Resolve an asset-part reference to asset_part_id.
+
+        Accepted forms:
+        - asset_part_id as int
+        - asset uri as str, plus part_path when the asset has several parts
+
+        Lets batch files reference parts by name (the asset's uri) instead of
+        the numeric id from the build manifest.
+        """
+        if isinstance(asset_part, int):
+            if part_path is not None:
+                raise USAPError(
+                    "part_path only applies when the asset part is referenced "
+                    "by asset uri."
+                )
+
+            row = self.conn.execute(
+                """
+                SELECT asset_part_id
+                FROM usap_asset_part
+                WHERE asset_part_id = ?
+                """,
+                (asset_part,),
+            ).fetchone()
+
+            if row is None:
+                raise USAPError(f"Unknown asset_part_id: {asset_part}")
+
+            return int(row["asset_part_id"])
+
+        where = "a.uri = ?"
+        params: list[Any] = [asset_part]
+
+        if part_path is not None:
+            where += " AND ap.part_path = ?"
+            params.append(part_path)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                ap.asset_part_id,
+                ap.part_path,
+                a.uri
+            FROM usap_asset_part AS ap
+            JOIN usap_asset AS a
+                ON a.asset_id = ap.asset_id
+            WHERE {where}
+            ORDER BY ap.asset_part_id
+            """,
+            params,
+        ).fetchall()
+
+        if not rows:
+            raise USAPError(
+                f"Asset part not found: {asset_part!r}"
+                + (f" (part_path {part_path!r})" if part_path is not None else "")
+            )
+
+        if len(rows) > 1:
+            options = [
+                {
+                    "asset_part_id": int(row["asset_part_id"]),
+                    "part_path": row["part_path"],
+                    "uri": row["uri"],
+                }
+                for row in rows
+            ]
+
+            raise USAPAmbiguityError(
+                "Asset part reference is ambiguous. Add part_path or use "
+                f"asset_part_id. Reference: {asset_part!r}. Options: {options}"
+            )
+
+        return int(rows[0]["asset_part_id"])
+
     def resolve_city_object(
         self,
         city_object: int | str,
@@ -1984,7 +2752,7 @@ class USAPPackage:
                 for row in rows
             ]
 
-            raise USAPError(
+            raise USAPAmbiguityError(
                 "City object reference is ambiguous. "
                 f"Use city_object_id. Reference: {city_object}. Options: {options}"
             )

@@ -40,7 +40,13 @@ A `*.usap.gpkg` file stores, for one study area:
   — as compressed *membership blocks*;
 - the **semantic concept** of each annotation (e.g. `RoofSurface`, `EnergyRoof`),
   drawn from external vocabulary registries;
-- editable **annotation records** with label, status, confidence, attributes;
+- editable **annotation records** with label, status, confidence, attributes
+  (attributes hold *claim-level* metadata only — method, source, timestamps;
+  object properties stay in the semantic source, e.g. CityGML/ADE, so there
+  is exactly one authority for them);
+- optional **per-element value fields** — a dense scalar per point/face (e.g.
+  shadow fraction per face at hour H), stored as compressed typed blocks and
+  queryable by value;
 - a lightweight mirror of **city-object identity** and a typed **relationship
   graph** — used to retrieve annotations across an object and its parts (e.g. a
   building together with its roof and walls), not as a general-purpose graph
@@ -165,6 +171,42 @@ are **examples only**, not a built-in taxonomy.
 
 ---
 
+## Per-element value fields
+
+Besides membership sets ("these faces *are* a RoofSurface"), an annotation can carry a
+**value field**: one scalar per element of an asset part — e.g. the shadow fraction of
+every mesh face at 14:00. Rule of thumb: booleans and categories are **sets** (native
+membership — "shadowed at 14:00" is just a concept plus the shadowed faces); reach for a
+value field only for genuinely **continuous** values.
+
+A value field is a property of the *geometry asset*: it binds a registered concept
+(CityGML, ADE, or a minimal local scheme) to the elements of one asset part, and never
+references a city object. Field metadata (unit, timestamp, method) lives in the
+annotation's attributes; many timesteps = many annotations, one per (field, timestep).
+
+```python
+ann = pkg.annotate_value_field(
+    concept="ShadowFraction",              # must be registered, like any annotation
+    asset_part_id=mesh_part_id,
+    element_kind="face",
+    values=shadow,                         # one value per face; NaN = "no value"
+    attributes={"validAt": "2026-06-21T14:00:00Z", "unit": "fraction"},
+)
+
+faces = pkg.elements_where(ann["annotation_id"], (">", 0.5))
+# -> sorted face indices, the same shape as a membership query result
+```
+
+Values are stored as zlib-compressed little-endian typed blocks (`f4` by default, see
+`VALUE_DTYPES`), must cover every element of the part (v1 contract), and are edited by
+whole-field rewrite. Casting is strict: an explicit dtype must represent the data exactly
+(out-of-range or non-integral values for an integer dtype raise instead of silently
+wrapping/truncating; only float precision rounding is allowed). Annotation batches can
+carry them too (`"value_fields"`, with JSON `null` as "no value"). See
+[VALUE_FIELDS_DESIGN.md](VALUE_FIELDS_DESIGN.md) for the full design.
+
+---
+
 ## How it relates to existing work
 
 To be clear, USAP is not a new city-model standard. It overlaps with, and deliberately
@@ -233,8 +275,11 @@ python -m pytest                 # run the test suite
 
 ### Build a package from a config file (recommended)
 
-The easiest way to create a USAP package is to describe your study area in **one
-JSON config** and run the builder — no Python required.
+The supported creation/ingestion/editing flows are **three explicit
+procedures** — init from CityGML, init from a minimal vocabulary (no
+ontology), and editing an existing package — documented step by step in
+[INGESTION.md](INGESTION.md). In short: describe the study area in **one JSON
+config** and run the builder once.
 
 **1. Point a config at your data.** Copy
 [`project_configs/example_project.json`](project_configs/example_project.json)
@@ -252,47 +297,43 @@ resolved relative to the config file:
   ],
   "citygml": { "path": "../data/area.gml", "also_usap_default": true },
   "las":     [ { "path": "../data/area.las", "part_path": "points/all" } ],
-  "meshes":  [ { "path": "../data/area_lod2.obj", "representation_name": "buildings_lod2", "lod": "LoD2" } ]
+  "meshes":  [ { "path": "../data/area_lod2.obj", "uri": "area_lod2", "representation_name": "buildings_lod2", "lod": "LoD2" } ],
+  "annotation_batches": [ "../batches/my_links.json" ]
 }
 ```
 
-**2. Build the package** (run from the repo root):
-
-```bash
-python examples/build_project_package.py project_configs/my_area.json
-```
-
-This registers every asset, imports the CityGML semantic objects, loads the
-concept registries, and writes two files:
-
-```text
-outputs/my_area.usap.gpkg      ← the USAP package
-outputs/my_area_manifest.json  ← lists the asset_part_id of each point cloud / mesh
-```
-
-You need the `asset_part_id` values from the manifest to write annotations.
-
-**3. Annotate** by applying a JSON batch that references those `asset_part_id`s:
+**2. Write the linking JSON** (`my_links.json`) — which city object owns
+which elements. The minimal entry is object + elements; `concept`,
+`annotation_uid`, and `element_kind` are derived when omitted, and assets are
+referenced by the `uri` you gave them (numeric `asset_part_id` from the
+manifest also works):
 
 ```json
 {
   "annotations": [
     {
-      "annotation_uid": "ann_energy_roof_001",
-      "concept": "EnergyRoof",
       "city_object_uid": "building_1_roof_1",
       "memberships": [
-        { "asset_part_id": 2, "element_kind": "point", "element_indices": [100, 101, 102] }
+        { "asset_uri": "area_lod2", "element_indices": [100, 101, 102] }
       ]
     }
   ]
 }
 ```
 
+**3. Build** (run from the repo root) — registers the assets, imports the
+CityGML objects, loads the vocabularies, applies the linking JSON, validates,
+and writes the manifest:
+
 ```bash
-python examples/apply_annotation_batch.py outputs/my_area.usap.gpkg my_batch.json
+python examples/build_project_package.py project_configs/my_area.json
 python examples/validate_package.py     outputs/my_area.usap.gpkg
 ```
+
+To **edit** an existing package later (add assets, change annotations), point
+a config at the same `db_path` and add `--update`; to build **without any
+CityGML** using a minimal vocabulary and auto-created carrier objects, see
+procedure 2 in [INGESTION.md](INGESTION.md).
 
 **4. See which concepts the package accepts.** USAP only accepts annotations
 whose `concept` is in the loaded vocabularies. List them — optionally filtered —

@@ -1,6 +1,11 @@
 # Design draft — Per-element value fields in USAP
 
-**Status:** draft, not implemented. Captures a design discussion (2026-06-26).
+**Status:** implemented (v1, 2026-07-06) — `usap_value_block` + the
+`annotate_value_field` / `values_for_annotation` / `elements_where` /
+`value_field_stats` API in `src/usap/core.py`; batch `"value_fields"` support;
+validation in `validate_report()`. V1 requires full coverage (NaN = "no value");
+partial/sub-range fields, sparse overlays, and acceleration indexes remain future
+work. Originally a design discussion (2026-06-26).
 **One-liner:** add a second element-level payload type — a *value per element* (a scalar
 field over a mesh's faces / a cloud's points) — alongside the existing *set membership*,
 so fields like "shadowing per face at hour H" can be stored, queried by value, and

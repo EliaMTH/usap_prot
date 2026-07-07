@@ -60,26 +60,15 @@ def main() -> None:
         )
 
         # Example 2: ADE/domain annotation over the same point indices.
+        # Attributes hold claim-level metadata only (how/when/by what this
+        # annotation was produced). Object properties (roof slope, use,
+        # construction era, ...) belong to the CityGML/ADE source, reachable
+        # through the linked city object — never duplicated into USAP.
         energy_attributes = {
             "domain": "energy_emissions",
-            "geometric_attributes": {
-                "roof_slope": None,
-                "footprint_area": None,
-                "height": None,
-                "orientation": None,
-                "shading": None,
-            },
-            "non_geometric_attributes": {
-                "construction_era": None,
-                "use": None,
-                "archetype": None,
-                "technology": None,
-                "conservation_state": None,
-            },
-            "derived_indicators": {
-                "specific_energy_kwh_m2": None,
-                "co2_emissions": None,
-            },
+            "method": "manual_selection",
+            "source": "register_las_demo",
+            "assessed_at": "2026-06-30T14:00:00Z",
         }
 
         energy_annotation_id = pkg.create_annotation(

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ._util import require_str
 from .core import USAPPackage
+from .errors import USAPAmbiguityError, USAPError
 
 
 @dataclass(frozen=True)
@@ -139,14 +140,20 @@ def _resolve_optional_parent(
             parent_ref,
             scheme=scheme,
         )
-    except Exception:
+    except USAPAmbiguityError:
+        # Ambiguity is definitive (and its message lists the options);
+        # do not mask it as "not registered".
+        raise
+    except USAPError:
         pass
 
     try:
         # Then try global resolution. This allows ADE/custom concepts
         # to inherit from CityGML class URIs.
         return pkg.resolve_semantic_class(parent_ref)
-    except Exception as exc:
+    except USAPAmbiguityError:
+        raise
+    except USAPError as exc:
         raise ValueError(
             f"{vocab_path}: parent concept {parent_ref!r} for "
             f"{child_uri!r} is not registered yet. Put parent concepts "

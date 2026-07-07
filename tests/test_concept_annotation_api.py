@@ -124,9 +124,8 @@ def test_annotate_elements_with_ade_concept_and_city_object(tmp_path: Path) -> N
             status="draft",
             attributes={
                 "domain": "energy_emissions",
-                "geometric_attributes": {
-                    "roof_slope": 31.5,
-                },
+                "method": "manual_selection",
+                "assessed_at": "2026-06-30T14:00:00Z",
             },
         )
 

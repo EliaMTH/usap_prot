@@ -2,13 +2,15 @@ from .constants import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_ENCODING,
     DEFAULT_GRAPH_NAME,
+    DEFAULT_VALUE_DTYPE,
     ELEMENT_KIND_FACE,
     ELEMENT_KIND_FEATURE,
     ELEMENT_KIND_POINT,
     ELEMENT_KIND_VERTEX,
+    VALUE_DTYPES,
 )
 from .core import USAPPackage
-from .errors import USAPError
+from .errors import USAPAmbiguityError, USAPError
 from .synthetic import SyntheticConfig, SyntheticResult, create_synthetic_package
 from .validation import ValidationIssue, ValidationReport, validate_connection
 from .geopackage import (
@@ -49,6 +51,7 @@ from .project_builder import (
 __all__ = [
     "USAPPackage",
     "USAPError",
+    "USAPAmbiguityError",
     "ELEMENT_KIND_FACE",
     "ELEMENT_KIND_POINT",
     "ELEMENT_KIND_VERTEX",
@@ -56,6 +59,8 @@ __all__ = [
     "DEFAULT_BLOCK_SIZE",
     "DEFAULT_ENCODING",
     "DEFAULT_GRAPH_NAME",
+    "DEFAULT_VALUE_DTYPE",
+    "VALUE_DTYPES",
     "SyntheticConfig",
     "SyntheticResult",
     "create_synthetic_package",

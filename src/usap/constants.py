@@ -30,6 +30,28 @@ DEFAULT_ENCODING = "u32-zlib"
 
 DEFAULT_GRAPH_NAME = "usap_default"
 
+# Per-element value fields. Dtype tags are numpy-style and stored
+# little-endian on disk regardless of the host byte order.
+VALUE_DTYPES = frozenset({"u1", "i1", "u2", "i2", "u4", "i4", "f2", "f4", "f8"})
+DEFAULT_VALUE_DTYPE = "f4"
+VALUE_CHUNK_SIZE = 65536  # elements per value block
+
+
+def normalize_value_dtype(value: Any) -> str:
+    """
+    Validate a value-field dtype tag against the supported whitelist.
+    """
+    if isinstance(value, str):
+        tag = value.strip().lower()
+
+        if tag in VALUE_DTYPES:
+            return tag
+
+    raise ValueError(
+        f"Unsupported value_dtype {value!r}. "
+        f"Use one of: {', '.join(sorted(VALUE_DTYPES))}."
+    )
+
 
 def normalize_element_kind(value: Any) -> int:
     """

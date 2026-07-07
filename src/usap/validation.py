@@ -4,8 +4,10 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
-from .constants import DEFAULT_ENCODING
-from .encoding import decode_u32_zlib
+import numpy as np
+
+from .constants import DEFAULT_ENCODING, VALUE_DTYPES
+from .encoding import decode_u32_zlib, decode_value_block
 from .geopackage import (
     GPKG_APPLICATION_ID,
     GPKG_USER_VERSION,
@@ -109,6 +111,7 @@ def validate_connection(conn: sqlite3.Connection) -> ValidationReport:
         _validate_semantic_class_registry(conn, report)
         _validate_orphans(conn, report)
         _validate_membership_blocks(conn, report)
+        _validate_value_blocks(conn, report)
         _validate_semantic_class_closure(conn, report)
         _validate_city_object_closure(conn, report)
     finally:
@@ -193,6 +196,30 @@ def _validate_orphans(conn: sqlite3.Connection, report: ValidationReport) -> Non
             WHERE ap.asset_part_id IS NULL
             """,
             "Membership block references a missing asset part.",
+        ),
+        (
+            "ORPHAN_VALUE_BLOCK_ANNOTATION",
+            "usap_value_block",
+            """
+            SELECT COUNT(*) AS n
+            FROM usap_value_block AS vb
+            LEFT JOIN usap_annotation AS a
+                ON a.annotation_id = vb.annotation_id
+            WHERE a.annotation_id IS NULL
+            """,
+            "Value block references a missing annotation.",
+        ),
+        (
+            "ORPHAN_VALUE_BLOCK_ASSET_PART",
+            "usap_value_block",
+            """
+            SELECT COUNT(*) AS n
+            FROM usap_value_block AS vb
+            LEFT JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = vb.asset_part_id
+            WHERE ap.asset_part_id IS NULL
+            """,
+            "Value block references a missing asset part.",
         ),
         (
             "ORPHAN_ANNOTATION_CLASS",
@@ -500,6 +527,235 @@ def _validate_membership_blocks(
                         "asset_part_element_kind": asset_part_element_kind,
                     },
                 )
+
+
+def _validate_value_blocks(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    rows = conn.execute(
+        """
+        SELECT
+            vb.value_block_id,
+            vb.annotation_id,
+            vb.asset_part_id,
+            vb.element_kind,
+            vb.block_start,
+            vb.element_count,
+            vb.value_dtype,
+            vb.value_min,
+            vb.value_max,
+            vb.payload,
+
+            ap.element_kind AS asset_part_element_kind,
+            ap.element_count AS asset_part_element_count
+        FROM usap_value_block AS vb
+        LEFT JOIN usap_asset_part AS ap
+            ON ap.asset_part_id = vb.asset_part_id
+        ORDER BY
+            vb.annotation_id,
+            vb.asset_part_id,
+            vb.element_kind,
+            vb.block_start
+        """
+    ).fetchall()
+
+    groups: dict[tuple[int, int, int], list[sqlite3.Row]] = {}
+
+    for row in rows:
+        key = (
+            int(row["annotation_id"]),
+            int(row["asset_part_id"]),
+            int(row["element_kind"]),
+        )
+        groups.setdefault(key, []).append(row)
+
+    for (annotation_id, asset_part_id, element_kind), block_rows in groups.items():
+        expected_next_start = 0
+        has_gap = False
+
+        for row in block_rows:
+            block_id = int(row["value_block_id"])
+            block_start = int(row["block_start"])
+            element_count = int(row["element_count"])
+            value_dtype = row["value_dtype"]
+
+            if value_dtype not in VALUE_DTYPES:
+                report.add(
+                    severity="error",
+                    code="UNSUPPORTED_VALUE_DTYPE",
+                    message=f"Unsupported value_dtype: {value_dtype!r}.",
+                    table="usap_value_block",
+                    row_id=block_id,
+                )
+                continue
+
+            if element_count <= 0:
+                report.add(
+                    severity="error",
+                    code="EMPTY_VALUE_BLOCK",
+                    message="Value block has zero or negative element_count.",
+                    table="usap_value_block",
+                    row_id=block_id,
+                )
+                continue
+
+            if block_start < 0:
+                report.add(
+                    severity="error",
+                    code="INVALID_VALUE_BLOCK_START",
+                    message="Value block has negative block_start.",
+                    table="usap_value_block",
+                    row_id=block_id,
+                )
+
+            asset_part_element_kind = row["asset_part_element_kind"]
+
+            if (
+                asset_part_element_kind is not None
+                and element_kind != int(asset_part_element_kind)
+            ):
+                report.add(
+                    severity="error",
+                    code="VALUE_ELEMENT_KIND_MISMATCH",
+                    message=(
+                        "Value block element_kind differs from asset part "
+                        "element_kind."
+                    ),
+                    table="usap_value_block",
+                    row_id=block_id,
+                    details={
+                        "value_block_element_kind": element_kind,
+                        "asset_part_element_kind": int(asset_part_element_kind),
+                    },
+                )
+
+            asset_part_element_count = row["asset_part_element_count"]
+
+            if (
+                asset_part_element_count is not None
+                and block_start + element_count > int(asset_part_element_count)
+            ):
+                report.add(
+                    severity="error",
+                    code="VALUE_BLOCK_OUT_OF_RANGE",
+                    message=(
+                        "Value block covers element indices outside the "
+                        "asset part element_count."
+                    ),
+                    table="usap_value_block",
+                    row_id=block_id,
+                    details={
+                        "block_start": block_start,
+                        "element_count": element_count,
+                        "asset_part_element_count": int(asset_part_element_count),
+                    },
+                )
+
+            # Overlap is corruption; gaps are just partial coverage.
+            if block_start < expected_next_start:
+                report.add(
+                    severity="error",
+                    code="OVERLAPPING_VALUE_BLOCKS",
+                    message=(
+                        "Value block overlaps the previous block of the "
+                        "same field."
+                    ),
+                    table="usap_value_block",
+                    row_id=block_id,
+                    details={
+                        "block_start": block_start,
+                        "expected_next_start": expected_next_start,
+                    },
+                )
+            elif block_start > expected_next_start:
+                has_gap = True
+
+            expected_next_start = max(
+                expected_next_start, block_start + element_count
+            )
+
+            try:
+                values = decode_value_block(
+                    row["payload"], value_dtype, element_count
+                )
+            except Exception as exc:
+                report.add(
+                    severity="error",
+                    code="CORRUPT_VALUE_PAYLOAD",
+                    message=f"Could not decode value-block payload: {exc}",
+                    table="usap_value_block",
+                    row_id=block_id,
+                )
+                continue
+
+            if values.dtype.kind == "f":
+                real = values[~np.isnan(values)]
+            else:
+                real = values
+
+            actual_min = float(real.min()) if real.size else None
+            actual_max = float(real.max()) if real.size else None
+
+            stored_min = row["value_min"]
+            stored_max = row["value_max"]
+
+            if stored_min != actual_min or stored_max != actual_max:
+                report.add(
+                    severity="error",
+                    code="VALUE_MIN_MAX_MISMATCH",
+                    message=(
+                        "Stored value_min/value_max do not match the payload."
+                    ),
+                    table="usap_value_block",
+                    row_id=block_id,
+                    details={
+                        "stored": [stored_min, stored_max],
+                        "actual": [actual_min, actual_max],
+                    },
+                )
+
+        # One field = one dtype; readers refuse mixed-dtype fields as
+        # corrupt, so a clean report must refuse them too.
+        group_dtypes = sorted({row["value_dtype"] for row in block_rows})
+
+        if len(group_dtypes) > 1:
+            report.add(
+                severity="error",
+                code="MIXED_VALUE_DTYPE_FIELD",
+                message="Value field mixes dtypes across its blocks.",
+                table="usap_value_block",
+                details={
+                    "annotation_id": annotation_id,
+                    "asset_part_id": asset_part_id,
+                    "element_kind": element_kind,
+                    "value_dtypes": group_dtypes,
+                },
+            )
+
+        # V1 writers always produce full coverage; partial coverage is a
+        # future format, not corruption — flag it softly.
+        asset_part_element_count = block_rows[0]["asset_part_element_count"]
+
+        if asset_part_element_count is not None and (
+            has_gap or expected_next_start != int(asset_part_element_count)
+        ):
+            report.add(
+                severity="warning",
+                code="PARTIAL_VALUE_FIELD_COVERAGE",
+                message=(
+                    "Value field does not cover the whole asset part; "
+                    "v1 readers will reject it."
+                ),
+                table="usap_value_block",
+                details={
+                    "annotation_id": annotation_id,
+                    "asset_part_id": asset_part_id,
+                    "element_kind": element_kind,
+                    "covered_until": expected_next_start,
+                    "asset_part_element_count": int(asset_part_element_count),
+                },
+            )
 
 
 def _validate_semantic_class_closure(

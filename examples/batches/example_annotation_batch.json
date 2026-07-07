@@ -13,19 +13,10 @@
       "confidence": 0.8,
       "attributes": {
         "domain": "energy_emissions",
-        "geometric_attributes": {
-          "roof_slope": 31.5,
-          "orientation": "SE",
-          "shading": "partial"
-        },
-        "non_geometric_attributes": {
-          "construction_era": "1946-1970",
-          "use": "residential"
-        },
-        "derived_indicators": {
-          "specific_energy_kwh_m2": null,
-          "co2_emissions": null
-        }
+        "method": "roof_detector_v2",
+        "source": "survey_2026_06",
+        "assessed_at": "2026-06-30T14:00:00Z",
+        "note": "Attributes hold claim-level metadata only (how/when/by what this annotation was made). Object properties such as roof slope, use, or construction era live in the CityGML/ADE source, reachable through city_object_uid - never duplicated into USAP."
       },
       "memberships": [
         {
@@ -34,8 +25,8 @@
           "element_indices": [1, 2, 3]
         },
         {
-          "asset_part_id": 2,
-          "element_kind": "face",
+          "asset_uri": "area_lod2",
+          "part_path": "geometry/0:default",
           "element_indices": [0, 1]
         }
       ]

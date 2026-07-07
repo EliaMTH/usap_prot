@@ -25,6 +25,7 @@ USAP_EXTENSION_TABLES = [
     "usap_annotation",
     "usap_annotation_object",
     "usap_membership_block",
+    "usap_value_block",
     "usap_edit_log",
 ]
 

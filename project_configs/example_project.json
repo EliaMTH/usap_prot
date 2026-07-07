@@ -33,6 +33,7 @@
     },
     {
       "path": "../data/area_lod2.obj",
+      "uri": "area_lod2",
       "representation_name": "buildings_lod2",
       "representation_kind": "building_mesh",
       "lod": "LoD2",
@@ -45,5 +46,9 @@
       "lod": null,
       "compute_hash": true
     }
+  ],
+
+  "annotation_batches": [
+    "../examples/batches/example_annotation_batch.json"
   ]
 }

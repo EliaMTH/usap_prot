@@ -4,6 +4,9 @@ import struct
 import zlib
 from collections import defaultdict
 
+import numpy as np
+
+from .constants import VALUE_DTYPES
 from .errors import USAPError
 
 
@@ -32,6 +35,49 @@ def decode_u32_zlib(payload: bytes) -> list[int]:
         return []
 
     return list(struct.unpack("<" + "I" * count, raw))
+
+
+def encode_value_block(values: np.ndarray, value_dtype: str) -> bytes:
+    """
+    Encode one dense value block: little-endian typed bytes, zlib-compressed.
+
+    `values` must already be numerically valid for `value_dtype` (the caller
+    rejects NaN before casting to integer dtypes).
+    """
+    if value_dtype not in VALUE_DTYPES:
+        raise USAPError(f"Unsupported value_dtype: {value_dtype!r}")
+
+    little_endian = np.ascontiguousarray(values, dtype=np.dtype("<" + value_dtype))
+
+    return zlib.compress(little_endian.tobytes())
+
+
+def decode_value_block(
+    payload: bytes,
+    value_dtype: str,
+    element_count: int,
+) -> np.ndarray:
+    """
+    Decode one value block back to a numpy array of exactly element_count
+    values.
+    """
+    if value_dtype not in VALUE_DTYPES:
+        raise USAPError(f"Unsupported value_dtype: {value_dtype!r}")
+
+    try:
+        raw = zlib.decompress(payload)
+    except zlib.error as exc:
+        raise USAPError(f"Corrupt value-block payload: {exc}") from exc
+
+    dtype = np.dtype("<" + value_dtype)
+
+    if len(raw) != element_count * dtype.itemsize:
+        raise USAPError(
+            f"Value-block payload holds {len(raw) // dtype.itemsize} values, "
+            f"declared element_count is {element_count}."
+        )
+
+    return np.frombuffer(raw, dtype=dtype)
 
 
 def block_start_for_index(index: int, block_size: int) -> int:

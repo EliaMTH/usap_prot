@@ -18,7 +18,6 @@ from usap import ELEMENT_KIND_FACE, USAPPackage
 def main() -> None:
     with USAPPackage.create(
         "demo_sdk.usap.gpkg",
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         # ------------------------------------------------------------

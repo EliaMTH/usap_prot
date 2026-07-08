@@ -18,7 +18,6 @@ def test_vocabulary_seeding_is_idempotent(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         first_citygml = seed_default_citygml_vocabulary(pkg)
@@ -62,7 +61,6 @@ def test_list_accepted_concepts(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         seed_default_citygml_vocabulary(pkg)
@@ -96,7 +94,6 @@ def test_get_semantic_class_and_concept_exists(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         seed_default_citygml_vocabulary(pkg)
@@ -123,7 +120,6 @@ def test_unknown_concept_fails_loudly(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         seed_default_citygml_vocabulary(pkg)
@@ -147,7 +143,6 @@ def test_ambiguous_local_name_requires_scheme_or_uri(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         citygml_roof = pkg.create_semantic_class(

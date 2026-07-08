@@ -119,6 +119,7 @@ def validate_connection(conn: sqlite3.Connection) -> ValidationReport:
         _validate_membership_blocks(conn, report)
         _validate_value_blocks(conn, report)
         _validate_semantic_class_closure(conn, report)
+        _validate_city_object_relationships(conn, report)
         _validate_city_object_closure(conn, report)
     finally:
         conn.row_factory = original_row_factory
@@ -173,6 +174,52 @@ def _validate_semantic_class_registry(
             table="usap_semantic_class",
             details={
                 "class_uri": row["class_uri"],
+                "count": int(row["n"]),
+            },
+        )
+
+def _validate_city_object_relationships(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    """
+    Flag duplicate relationship edges.
+
+    link_city_objects is idempotent, so identical edges should not repeat;
+    duplicates indicate a package built before that guard existed (or raw
+    SQL writes). Warning, not error: such packages must keep opening.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            graph_name,
+            parent_city_object_id,
+            child_city_object_id,
+            relationship_type,
+            COUNT(*) AS n
+        FROM usap_city_object_relationship
+        GROUP BY
+            graph_name,
+            parent_city_object_id,
+            child_city_object_id,
+            relationship_type,
+            role,
+            source_relation_id
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+
+    for row in rows:
+        report.add(
+            severity="warning",
+            code="DUPLICATE_RELATIONSHIP_EDGE",
+            message="Identical relationship edge stored more than once.",
+            table="usap_city_object_relationship",
+            details={
+                "graph_name": row["graph_name"],
+                "parent_city_object_id": int(row["parent_city_object_id"]),
+                "child_city_object_id": int(row["child_city_object_id"]),
+                "relationship_type": row["relationship_type"],
                 "count": int(row["n"]),
             },
         )

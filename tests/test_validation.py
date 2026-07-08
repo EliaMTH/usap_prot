@@ -1,19 +1,21 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
+from conftest import make_pkg
 from usap import (
     ELEMENT_KIND_FACE,
     SyntheticConfig,
     USAPPackage,
     create_synthetic_package,
+    validate_connection,
 )
 
 
 def _create_small_valid_package(db_path: Path):
     return create_synthetic_package(
         db_path,
-        schema_path="sql/schema.sql",
         config=SyntheticConfig(
             building_count=5,
             roof_faces_per_building=20,
@@ -154,6 +156,45 @@ def test_validation_catches_missing_semantic_class_closure(
         assert "MISSING_SEMANTIC_CLASS_SELF_CLOSURE" in _codes(report)
 
 
+def test_validation_warns_on_duplicate_relationship_edges(pkg: USAPPackage) -> None:
+    # link_city_objects dedups identical edges, but packages written before
+    # that guard (or via raw SQL) may hold duplicates. Validation must
+    # surface them — as a warning, not an error, because such packages must
+    # keep opening and updating.
+    parent = pkg.create_city_object(object_uid="b1")
+    child = pkg.create_city_object(object_uid="b1_roof")
+
+    pkg.link_city_objects(
+        parent_city_object_id=parent,
+        child_city_object_id=child,
+        relationship_type="boundedBy",
+        role="roof",
+    )
+
+    # Simulate a legacy duplicate behind the API's back.
+    with pkg.transaction():
+        pkg.conn.execute(
+            """
+            INSERT INTO usap_city_object_relationship (
+                graph_name, parent_city_object_id, child_city_object_id,
+                relationship_type, role
+            )
+            VALUES ('usap_default', ?, ?, 'boundedBy', 'roof')
+            """,
+            (parent, child),
+        )
+
+    report = pkg.validate_report()
+    duplicates = [
+        issue for issue in report.issues
+        if issue.code == "DUPLICATE_RELATIONSHIP_EDGE"
+    ]
+
+    assert len(duplicates) == 1
+    assert duplicates[0].severity == "warning"
+    assert report.is_ok  # a warning must not make the package invalid
+
+
 def test_validation_catches_unsupported_encoding(tmp_path: Path) -> None:
     db_path = tmp_path / "bad_encoding.usap.gpkg"
 
@@ -173,3 +214,21 @@ def test_validation_catches_unsupported_encoding(tmp_path: Path) -> None:
 
         assert not report.is_ok
         assert "UNSUPPORTED_MEMBERSHIP_ENCODING" in _codes(report)
+
+def test_validate_connection_accepts_plain_connection(tmp_path: Path) -> None:
+    # Validation must work on a bare sqlite3.Connection and restore the
+    # caller's row factory, not hijack it.
+    db_path = tmp_path / "plain.usap.gpkg"
+
+    with make_pkg(tmp_path, "plain.usap.gpkg"):
+        pass
+
+    conn = sqlite3.connect(db_path)
+
+    try:
+        report = validate_connection(conn)
+
+        assert report.is_ok, [issue.format() for issue in report.issues]
+        assert conn.row_factory is None
+    finally:
+        conn.close()

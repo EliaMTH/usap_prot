@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from .._util import sha256_file
 from ..core import USAPPackage
 from ..domain_vocab import seed_default_citygml_vocabulary
+from ..errors import USAPError
 
 if TYPE_CHECKING:
     from lxml import etree
@@ -175,10 +176,12 @@ def import_citygml_semantics(
     parser = etree.XMLParser(
         huge_tree=True,
         remove_blank_text=True,
-        recover=True,
     )
 
-    tree = etree.parse(str(path), parser)
+    try:
+        tree = etree.parse(str(path), parser)
+    except etree.XMLSyntaxError as exc:
+        raise USAPError(f"Malformed CityGML file: {path}: {exc}") from exc
     root = tree.getroot()
 
     version_hint = _citygml_version_hint(root)

@@ -5,11 +5,13 @@ from pathlib import Path
 
 import pytest
 
+from conftest import make_mesh_part, make_pkg
 from conftest import write_tiny_las as _write_tiny_las, write_tiny_mesh as _write_tiny_mesh
 from usap import (
     USAPError,
     USAPPackage,
     apply_annotation_batch,
+    apply_annotation_batch_file,
     register_las_asset,
     register_mesh_asset,
     seed_default_ade_vocabulary,
@@ -27,7 +29,6 @@ def test_apply_annotation_batch_with_las_and_mesh(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         citygml_vocab = seed_default_citygml_vocabulary(pkg)
@@ -117,7 +118,6 @@ def test_batch_rejects_unknown_concept(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         register_las_asset(pkg, las_path)
@@ -150,7 +150,6 @@ def test_batch_rejects_out_of_range_indices(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         seed_default_citygml_vocabulary(pkg)
@@ -184,7 +183,6 @@ def test_batch_replace_existing(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         seed_default_citygml_vocabulary(pkg)
@@ -271,7 +269,6 @@ def test_batch_replace_preserves_omitted_fields(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         citygml_vocab = seed_default_citygml_vocabulary(pkg)
@@ -351,3 +348,45 @@ def test_batch_replace_preserves_omitted_fields(tmp_path: Path) -> None:
 
         assert matches_new[0]["annotation_uid"] == "ann_preserve"
         assert matches_old == []
+
+def test_apply_annotation_batch_file(tmp_path: Path) -> None:
+    # INGESTION.md procedure 3 relies on this file entry point for
+    # standalone edits; it must behave exactly like the in-memory batch
+    # and fail loudly on a missing path.
+    with make_pkg(tmp_path) as pkg:
+        make_mesh_part(pkg)
+        pkg.create_semantic_class(
+            scheme="local", class_uri="local:TempRoof", local_name="TempRoof"
+        )
+
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(
+            json.dumps(
+                {
+                    "create_missing_city_objects": True,
+                    "annotations": [
+                        {
+                            "city_object_uid": "tower_A_roof",
+                            "concept": "TempRoof",
+                            "memberships": [
+                                {
+                                    "asset_uri": "mesh.glb",
+                                    "element_indices": [0, 1],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = apply_annotation_batch_file(pkg, batch_path)
+
+        assert result.annotation_count == 1
+
+        blocks = pkg.elements_for_city_object("tower_A_roof", expand=True)
+        assert [b["elements"] for b in blocks] == [[0, 1]]
+
+        with pytest.raises(FileNotFoundError, match="Batch file not found"):
+            apply_annotation_batch_file(pkg, tmp_path / "missing.json")

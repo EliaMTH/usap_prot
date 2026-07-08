@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from conftest import make_mesh_part, make_pkg
 from conftest import write_tiny_mesh as _write_tiny_mesh
 from usap import (
     ELEMENT_KIND_FACE,
+    USAPError,
     USAPPackage,
     register_mesh_asset,
     seed_default_citygml_vocabulary,
@@ -18,7 +22,6 @@ def test_get_and_update_annotation(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         classes = seed_default_citygml_vocabulary(pkg)
@@ -110,7 +113,6 @@ def test_list_annotations_with_filters(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         classes = seed_default_citygml_vocabulary(pkg)
@@ -172,7 +174,6 @@ def test_delete_annotation_cascades_membership(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         classes = seed_default_citygml_vocabulary(pkg)
@@ -227,3 +228,71 @@ def test_delete_annotation_cascades_membership(tmp_path: Path) -> None:
         assert after["n"] == 0
 
         assert pkg.delete_annotation(annotation_id, missing_ok=True) is False
+
+def test_create_annotation_rejects_conflicting_concept(tmp_path: Path) -> None:
+    # Re-using an annotation_uid with a different concept must raise, not
+    # silently replace the existing claim.
+    with make_pkg(tmp_path) as pkg:
+        part = make_mesh_part(pkg)
+        pkg.create_semantic_class(scheme="s", class_uri="s:Roof", local_name="Roof")
+        pkg.create_semantic_class(scheme="s", class_uri="s:Wall", local_name="Wall")
+
+        pkg.annotate_elements(
+            concept="Roof",
+            annotation_uid="ann_x",
+            asset_part_id=part,
+            element_kind="face",
+            element_indices=[1, 2],
+        )
+
+        with pytest.raises(USAPError, match="different semantic class"):
+            pkg.annotate_elements(
+                concept="Wall",
+                annotation_uid="ann_x",
+                asset_part_id=part,
+                element_kind="face",
+                element_indices=[50, 51],
+            )
+
+        # The rejected call must not have touched the annotation or its
+        # membership (the old behavior silently replaced the indices).
+        annotation = pkg.get_annotation(annotation_uid="ann_x")
+
+        assert annotation is not None
+        assert annotation["semantic_class"] == "Roof"
+
+        blocks = pkg.elements_for_annotation(
+            int(annotation["annotation_id"]),
+            expand=True,
+        )
+
+        assert [block["elements"] for block in blocks] == [[1, 2]]
+
+
+def test_integrity_violations_raise_usap_error(tmp_path: Path) -> None:
+    # Constraint violations must surface as USAPError, not raw sqlite3 errors.
+    with make_pkg(tmp_path) as pkg:
+        part = make_mesh_part(pkg)
+        pkg.create_semantic_class(scheme="s", class_uri="s:Roof", local_name="Roof")
+
+        annotation = pkg.annotate_elements(
+            concept="Roof",
+            annotation_uid="ann_a",
+            asset_part_id=part,
+            element_kind="face",
+            element_indices=[1],
+        )
+
+        with pytest.raises(USAPError, match="constraint"):
+            pkg.update_annotation(
+                int(annotation["annotation_id"]),
+                semantic_class_id=None,
+            )
+
+        with pytest.raises(USAPError, match="Annotation not found"):
+            pkg.attach_annotation_elements(
+                annotation_id=99999,
+                asset_part_id=part,
+                element_kind="face",
+                element_indices=[1],
+            )

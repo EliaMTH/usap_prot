@@ -23,7 +23,6 @@ def test_created_package_is_a_geopackage(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         header = read_geopackage_header(pkg.conn)
@@ -80,3 +79,55 @@ def test_created_package_is_a_geopackage(tmp_path: Path) -> None:
 
         report = pkg.validate_report()
         assert report.is_ok, [issue.format() for issue in report.issues]
+
+def test_no_explicit_index_duplicates_a_unique_autoindex(pkg: USAPPackage) -> None:
+    # Schema hygiene: an explicit index on the same columns as a UNIQUE
+    # constraint duplicates the auto-index and doubles write cost for nothing.
+    tables = [
+        row["name"]
+        for row in pkg.conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name LIKE 'usap_%'"
+        ).fetchall()
+    ]
+
+    for table in tables:
+        indexes = pkg.conn.execute(f"PRAGMA index_list({table})").fetchall()
+
+        columns_by_origin: dict[str, list[tuple[str, ...]]] = {
+            "c": [],
+            "u": [],
+        }
+
+        for index in indexes:
+            if index["origin"] not in columns_by_origin:
+                continue
+
+            columns = tuple(
+                info["name"]
+                for info in pkg.conn.execute(
+                    f"PRAGMA index_info({index['name']})"
+                ).fetchall()
+            )
+            columns_by_origin[index["origin"]].append(columns)
+
+        for explicit in columns_by_origin["c"]:
+            assert explicit not in columns_by_origin["u"], (
+                f"{table}: explicit index on {explicit} duplicates the "
+                "UNIQUE constraint's auto-index"
+            )
+
+    # The annotation-first fetches must still be served by an index (the
+    # auto-index). Asserts on EXPLAIN QUERY PLAN output, so it may need
+    # updating on SQLite upgrades.
+    for table in ("usap_membership_block", "usap_value_block"):
+        plan = " ".join(
+            row[3]
+            for row in pkg.conn.execute(
+                f"EXPLAIN QUERY PLAN SELECT payload FROM {table} "
+                "WHERE annotation_id = 1 "
+                "ORDER BY asset_part_id, element_kind, block_start"
+            ).fetchall()
+        )
+
+        assert "USING INDEX" in plan, plan

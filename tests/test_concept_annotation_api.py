@@ -25,7 +25,6 @@ def test_annotate_elements_with_citygml_concept(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         seed_default_citygml_vocabulary(pkg)
@@ -73,7 +72,6 @@ def test_annotate_elements_with_ade_concept_and_city_object(tmp_path: Path) -> N
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         citygml = seed_default_citygml_vocabulary(pkg)
@@ -135,7 +133,6 @@ def test_attach_annotation_elements_adds_second_representation(tmp_path: Path) -
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         seed_default_citygml_vocabulary(pkg)

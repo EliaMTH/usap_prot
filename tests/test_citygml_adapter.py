@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from usap import USAPPackage, import_citygml_semantics
+import pytest
+
+from conftest import make_pkg
+from usap import USAPError, USAPPackage, import_citygml_semantics
 
 
 TINY_CITYGML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -42,7 +45,6 @@ def test_import_tiny_citygml_semantics(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         result = import_citygml_semantics(pkg, citygml_path)
@@ -125,3 +127,22 @@ def test_import_tiny_citygml_semantics(tmp_path: Path) -> None:
 
         report = pkg.validate_report()
         assert report.is_ok, [issue.format() for issue in report.issues]
+
+
+def test_malformed_citygml_fails_loud(tmp_path: Path) -> None:
+    # A truncated file used to be parsed with recover=True, silently
+    # importing a partial semantic graph; ingestion must refuse it instead.
+    citygml_path = tmp_path / "broken.gml"
+    citygml_path.write_text(
+        TINY_CITYGML[: len(TINY_CITYGML) // 2], encoding="utf-8"
+    )
+
+    with make_pkg(tmp_path) as pkg:
+        with pytest.raises(USAPError, match="Malformed CityGML"):
+            import_citygml_semantics(pkg, citygml_path)
+
+        count = pkg.conn.execute(
+            "SELECT COUNT(*) FROM usap_city_object"
+        ).fetchone()[0]
+
+        assert count == 0

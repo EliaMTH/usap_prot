@@ -446,6 +446,42 @@ def test_procedure_3_update_adds_assets_and_edits(tmp_path: Path) -> None:
         assert_package_valid(pkg)
 
 
+def test_update_rerun_does_not_duplicate_relationships(tmp_path: Path) -> None:
+    # A config with a CityGML section re-imports the same edges on every
+    # update run; link_city_objects must dedup identical edges or each
+    # re-run silently doubles the relationship graph (and its usap_default
+    # mirror), bloating the file and breaking the idempotency contract.
+    config_path = _procedure_1_files(tmp_path)
+
+    def _graph_counts(db_path: Path) -> tuple[int, int]:
+        with USAPPackage.open(db_path) as pkg:
+            rel = pkg.conn.execute(
+                "SELECT COUNT(*) AS n FROM usap_city_object_relationship"
+            ).fetchone()["n"]
+            closure = pkg.conn.execute(
+                "SELECT COUNT(*) AS n FROM usap_city_object_closure"
+            ).fetchone()["n"]
+
+        return rel, closure
+
+    result = build_project_package_from_file(config_path)
+    before = _graph_counts(result.db_path)
+
+    assert before[0] > 0
+
+    again = build_project_package_from_file(config_path, update=True)
+
+    assert _graph_counts(again.db_path) == before
+
+    with USAPPackage.open(again.db_path) as pkg:
+        report = pkg.validate_report()
+
+        assert "DUPLICATE_RELATIONSHIP_EDGE" not in {
+            issue.code for issue in report.issues
+        }
+        assert_package_valid(pkg)
+
+
 def test_update_mode_requires_an_existing_package(tmp_path: Path) -> None:
     config = _write_json(
         tmp_path / "missing.json",

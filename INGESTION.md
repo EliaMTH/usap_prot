@@ -1,12 +1,13 @@
 # USAP ingestion — the three procedures
 
-These are the supported creation / data-ingestion / editing procedures
-(designed in `DATA_INGESTION_REVAMP.md`). Everything runs off two JSON files:
+These are the supported creation / data-ingestion / editing procedures. Everything runs off two JSON files plus one semantic authority:
 
 - a **project config** — what the package is made of: assets, semantic source,
   and which linking files to apply;
 - a **linking JSON** (annotation batch) — which city object owns which
-  elements of which 3D asset.
+  elements of which 3D asset;
+- the **semantic authority** — either a CityGML file (procedure 1) or a
+  minimal vocabulary JSON (procedure 2).
 
 One command executes either procedure end to end:
 
@@ -143,6 +144,9 @@ build_project_package_from_file("update.json", update=True)
 
 - **Add assets**: list them in the config; registration is idempotent, so
   already-known assets (same uri + hash) are skipped and new ones added.
+- **Add concepts**: an edit can only make claims with concepts the package
+  already accepts; to extend the accepted list, provide the new concepts in
+  the vocabulary-registry format and list the file either in the config's `"vocabularies"` key or in the linking JSON's own top-level `"vocabularies"` key (loaded in the same transaction as its annotations). Seeding is additive and idempotent:  already-registered concepts are skipped, new ones added.
 - **Edit annotations**: list batches in `annotation_batches`; in update mode
   they run with `replace_existing=True` — an entry with an existing
   `annotation_uid` (given or derived) updates the fields it carries and
@@ -181,5 +185,4 @@ no geometry file is re-read). Declare the package CRS with `"srs_id"` in the
 project config when you know it (an EPSG code found in the LAS CRS is promoted
 automatically when unambiguous); local-coordinate meshes stay in the undefined
 SRS (−1). Since assets are immutable in USAP, boxes are written once and
-removed by cascade when an asset is deleted and re-ingested. See
-"Opening a package in QGIS" in REFERENCE.md.
+removed by cascade when an asset is deleted and re-ingested.

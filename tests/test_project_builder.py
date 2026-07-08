@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from conftest import write_tiny_las as _write_tiny_las, write_tiny_mesh as _write_tiny_mesh
-from usap import build_project_package_from_file
+from usap import build_project_package, build_project_package_from_file
 
 
 TINY_CITYGML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -114,3 +114,26 @@ def test_build_project_package_from_config(tmp_path: Path) -> None:
 
     assert "building_1" in city_object_uids
     assert "building_1_roof_1" in city_object_uids
+
+def test_build_project_package_from_dict(tmp_path: Path) -> None:
+    # The dict entry point (for pipelines that assemble configs in code)
+    # must resolve relative config paths against base_dir, not the CWD.
+    _write_tiny_mesh(tmp_path / "lod2.ply")
+
+    result = build_project_package(
+        {
+            "db_path": "dict.usap.gpkg",
+            "meshes": [
+                {
+                    "path": "lod2.ply",
+                    "uri": "lod2",
+                    "representation_name": "buildings_lod2",
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    assert result.db_path == tmp_path / "dict.usap.gpkg"
+    assert result.db_path.exists()
+    assert len(result.mesh_assets) == 1

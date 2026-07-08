@@ -1,200 +1,90 @@
 # USAP — Urban Semantic Annotation Package
 
-USAP is a prototype Python package and SQLite/GeoPackage-style data model for storing **semantic annotations over external urban data assets**.
+USAP is a prototype Python package and SQLite/GeoPackage-style data model for storing **semantic annotations over urban 3D assets**.
 
-The current prototype supports annotations over:
+The current prototype bundles adapters for:
 
 - **LAS/LAZ point clouds** using stable point indices.
 - **Mesh files** using stable face indices.
 - **CityGML semantic objects** using imported `gml:id` / object identifiers.
+
+However, any asset with stable integer-indexed elements of one of the four kinds — point, face, vertex, or feature (`feature` is declared but not yet exercised) — can be declared directly via `register_asset` + `register_asset_part`, without an adapter.
+
+USAP is designed for concepts from:
+
 - **CityGML standard concepts** loaded from an external vocabulary registry.
 - **ADE-like/custom concepts** loaded from an external vocabulary registry.
+- **minimal local schemes** (names only, optional parents) for exploratory
+  work without an ontology.
 
 USAP does **not** copy geometry into the package. Instead, it stores references to external assets and compact membership blocks that identify which points, faces, or elements are annotated.
+
+The motivation and mental model are in [README.md](README.md); this file is the reference manual.
 
 ---
 
 ## Project status
 
-This repository currently contains a working MVP prototype.
+This repository contains a working MVP. The file format, schema, and API may still change, and packages created with this version should be treated as experimental.
 
-Implemented:
-
-- Core USAP SQLite schema.
-- Minimal GeoPackage metadata tables.
-- Python SDK for creating, opening, validating, and querying packages.
-- Semantic classes and city-object graph support.
-- Annotation CRUD helpers.
-- Compressed membership blocks for selected elements.
-- LAS/LAZ point-cloud adapter.
-- Generic mesh adapter for LoD1, LoD2, or arbitrary triangulated city meshes.
-- CityGML semantic importer.
-- External CityGML/ADE concept registries.
-- JSON batch annotation importer.
-- Real-project package builder.
-- End-to-end smoke-test workflow.
-- GIS-facing GeoPackage layers: attribute views + a derived per-asset
-  extent-box features layer (QGIS/GDAL browsable).
-
-Not yet implemented:
-
-- Full CityGML geometry import.
-- Full CityGML schema validation.
-- Formal ADE XML schema generation or validation.
-- Spatial indexing / RTree acceleration.
-- Viewer or GUI integration.
-- Multi-user editing workflow.
-- Migration system for evolving package versions.
-
----
-
-## Core idea
-
-USAP separates **meaning** from **geometry storage**.
-
-External files remain external:
+What the prototype can do, end to end:
 
 ```text
-area.gml
-area.las
-area_lod1.obj
-area_lod2.obj
-city_triangulation.ply
+Given:
+  a CityGML file (or a minimal vocabulary — INGESTION.md procedure 2),
+  at least one 3D asset representing (at least one of) the city objects listed in the CityGML file,
+
+USAP can:
+  create a package,
+  register all assets,
+  import CityGML semantic objects,
+  load accepted concepts,
+  apply JSON annotation batches,
+  attach annotations to 3D assets,
+  link annotations to city objects,
+  query annotations from selected elements,
+  validate package integrity.
 ```
-
-The USAP package stores:
-
-```text
-asset references
-asset parts
-semantic concepts
-city objects
-annotations
-membership blocks
-relationships
-metadata
-```
-
-A single annotation can point to multiple representations:
-
-```text
-annotation: ann_energy_roof_001
-  concept: EnergyRoof
-  primary CityGML object: building_1_roof_1
-
-  memberships:
-    LAS points: [100, 101, 102]
-    LoD2 mesh faces: [40, 41, 42]
-    generic triangulation faces: [800, 801]
-```
-
-This allows the same semantic claim to connect CityGML objects, point clouds, and meshes.
 
 ---
 
 ## Repository structure
 
-Typical layout:
-
 ```text
 usap_prot/
   pyproject.toml
-  README.md
-  .gitignore
+  README.md  INGESTION.md  REFERENCE.md  TESTS.md
 
-  sql/
-    schema.sql
-
-  src/
-    usap/
-      __init__.py
-      _util.py
-      constants.py
-      core.py
-      encoding.py
-      errors.py
-      sqlite_utils.py
-      validation.py
-      geopackage.py
-      domain_vocab.py
-      batch.py
-      project_builder.py
-      synthetic.py
-      adapters/
-        __init__.py
-        citygml_adapter.py
-        las_adapter.py
-        mesh_adapter.py
-
-  vocabularies/
-    citygml_3_0_mvp.json
-    usap_ade_prototype.json
-
-  examples/
-    build_project_package.py
-    smoke_test_project_package.py
-    apply_annotation_batch.py
-    build_integrated_prototype.py
-    build_synthetic.py
-    demo_sdk.py
-    import_citygml_demo.py
-    register_las_demo.py
-    register_mesh_demo.py
-    list_concepts_demo.py
-    validate_package.py
-    batches/
-      example_annotation_batch.json
-
-  project_configs/
-    example_project.json
-    example_project_catania.json
-
-  scripts/
-    benchmark_phase1.py
-    profile_synthetic_build.py
-
-  tests/
-    test_core.py
-    test_synthetic.py
-    test_validation.py
-    test_geopackage.py
-    test_las_adapter.py
-    test_citygml_adapter.py
-    test_mesh_adapter.py
-    test_integrated_prototype.py
-    test_annotation_crud.py
-    test_concept_annotation_api.py
-    test_concept_registry.py
-    test_external_vocabulary.py
-    test_batch_annotations.py
-    test_project_builder.py
+  sql/schema.sql        the package schema (USAP tables + GeoPackage
+                        metadata tables + GIS views)
+  src/usap/             the Python SDK: core, validation, geopackage,
+                        domain_vocab, batch, project_builder, synthetic
+    adapters/           LAS / mesh / CityGML adapters
+  vocabularies/         example concept registries (CityGML 3.0 MVP subset,
+                        ADE prototype, minimal local scheme)
+  examples/             runnable CLI scripts: build, validate, smoke test,
+                        batch apply, demos
+  project_configs/      example_project.json — template project config
+  scripts/              synthetic benchmark + profiling
+  tests/                pytest suite — every test described in TESTS.md
 ```
 
 ---
 
 ## Installation
 
-Create a virtual environment:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-```
-
-On Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-Install the package in editable mode:
+We suggest creating a virtual environment. Install the package in editable
+mode:
 
 ```bash
 python -m pip install -e .
 ```
 
-Run the test suite:
+> Note: `USAPPackage.create()` resolves its default `schema_path` to the
+> repository's `sql/schema.sql`, which a plain wheel install does not ship —
+> work from a checkout / editable install, or pass `schema_path` explicitly.
+
+Run the test suite (described in [TESTS.md](TESTS.md)):
 
 ```bash
 python -m pytest
@@ -204,92 +94,29 @@ python -m pytest
 
 ## Key concepts
 
-### Asset
+### 3D Asset
 
-An external file registered in USAP.
+An external file registered in USAP, like a LAS/LAZ point cloud, an OBJ/PLY/GLB mesh. USAP stores the path, kind, media type, optional content hash, and metadata.
 
-Examples:
+### 3D Asset part
 
-```text
-CityGML file
-LAS/LAZ point cloud
-OBJ/PLY/GLB mesh
-```
-
-USAP stores the path, kind, media type, optional content hash, and metadata.
-
-### Asset part
-
-A stable indexable part of an asset.
-
-Examples:
-
-```text
-points/all
-geometry/0:default
-geometry/1:building_mesh
-```
-
-Each asset part has:
-
-```text
-element_kind
-  point
-  face
-
-element_count
-  number of points or faces
-```
+A stable indexable part of an asset. Each part stores its `element_kind` (point or face) and its `element_count` (number of points or faces). Element indices into a part are the coordinate system annotations live in.
 
 ### Semantic class / concept
 
-A registered concept accepted by USAP.
-
-Examples:
-
-```text
-RoofSurface
-WallSurface
-Window
-Road
-EnergyRoof
-VisualFacade
-```
-
-Concepts may come from:
-
-```text
-CityGML registry
-ADE/custom registry
-```
+A registered concept accepted by USAP, e.g. `RoofSurface`, `Window`, `EnergyRoof`. Concepts come from a CityGML registry, an ADE/custom registry, or a minimal local scheme (see "Concept registries").
 
 ### City object
 
-A semantic object, usually imported from CityGML.
-
-Examples:
-
-```text
-building_1
-building_1_roof_1
-building_1_wall_1
-building_1_window_1
-```
+A semantic object, usually imported from CityGML, e.g. `building_1`, `building_1_roof_1`, `building_1_window_1`.
 
 ### Annotation
 
 A semantic claim linked to one concept and optionally to one city object.
 
-**What belongs in USAP vs the semantic source.** USAP is authoritative for the
-*claim layer*: which elements, under which concept, with what status,
-confidence, and provenance. The CityGML/ADE (or other semantic source) is
-authoritative for the *meaning layer*: which concepts and objects exist, their
-properties, and their hierarchy. Accordingly, an annotation's `attributes`
-must hold **claim-level metadata only** — how/when/by what the claim was
-produced (`method`, `source`, `assessed_at`, and for value fields `unit`,
-`validAt`) — never object properties (roof slope, use, construction era, ...).
-Those stay in the semantic source, reachable through the linked city object,
-so there is exactly one authority for them and nothing to keep synchronized.
+**What belongs in USAP vs the semantic source.** USAP is authoritative for the *claim layer*: which elements, under which concept, with what status, confidence, and provenance. The CityGML/ADE (or other semantic source) is authoritative for the *meaning layer*: which concepts and objects exist, their
+properties, and their hierarchy. Accordingly, an annotation's `attributes` must hold **claim-level metadata only** — how/when/by what the claim was produced (`method`, `source`, `assessed_at`, and for value fields `unit`, `validAt`).
+Object properties (e.g., roof slope) stay in the semantic source, reachable through the linked city object, so there is exactly one authority for them and nothing to keep synchronized.
 
 Example:
 
@@ -312,22 +139,9 @@ asset part area.las points/all
 selected point indices [100, 101, 102]
 ```
 
-### Value block
+### Value block (annotation on a whole 3D asset)
 
-A compressed dense array of per-element scalar values for one annotation and one asset
-part: element *i*'s value is `decoded[i - block_start]`. Membership stores *which*
-elements are a concept; value blocks store the *value* of a property at each element
-(e.g. shadow fraction per face). Value fields are bound to the geometry asset only —
-never to a city object — and must cover every element of the part (v1; NaN = "no
-value" in float fields). Stored little-endian, dtype per block (`f4` default; see
-`VALUE_DTYPES`), with per-block min/max for decode-free stats and query pruning.
-
-Writing is strict about the requested dtype: values that an integer dtype cannot
-represent exactly (out of range, non-integral, NaN/inf) raise `USAPError` instead of
-wrapping or truncating, and finite values that would overflow a narrow float dtype to
-inf raise too — only float precision rounding (e.g. f8 → f4) is allowed. All readers
-(`values_for_annotation`, `elements_where`, `value_field_stats`) reject partial fields:
-the blocks must tile the whole asset part.
+A compressed dense array of per-element scalar values for one annotation and one asset part: element *i*'s value is `decoded[i - block_start]`. Membership stores *which* elements are a concept; value blocks store the *value* of a property at each element (e.g. shadow fraction per face). Rule of thumb: booleans and categories are **sets** (native membership, like "shadowed at 14:00", is just a concept plus the shadowed faces); reach for a value field only for genuinely **continuous** values. Value fields are bound to the geometry asset only, never to a city object, and must cover every element of the part (v1; NaN = "no value" in float fields). Stored little-endian, dtype per block (`f4` default; see `VALUE_DTYPES`), with per-block min/max for decode-free stats and query pruning.
 
 Example:
 
@@ -341,13 +155,51 @@ values float32 [0.0, 0.73, 0.5, ...]   one per face
 
 ## Concept registries
 
-USAP uses external JSON files to define accepted concepts.
+USAP ships **no** built-in taxonomy and does not enforce one. A new package starts with **zero** concepts; it holds only whatever vocabulary you seed into it.
 
-Current registries:
+**Register a concept before you annotate with it.** Every annotation references exactly one concept so the concept must already exist in the package, carrying at least its minimal identity:
+
+- `scheme` — the vocabulary/namespace it belongs to
+- `local_name` — its label
+- `class_uri` — its globally-unique identifier (optional: derived as
+  `scheme:local_name` when omitted)
+- *(optional)* `parent_uri` (parent concept, for hierarchy), `scheme_version`, `is_ade`
+
+Annotations then **reference** the registered concept; they do not re-describe it.
+
+**The vocabulary format is the contract.** Concepts are loaded with `seed_vocabulary_file()`, which expects a JSON registry of this minimal shape (one file per scheme; list parents before children):
+
+```json
+{
+  "scheme": "citygml",
+  "scheme_version": "3.0",
+  "is_ade": false,
+  "concepts": [
+    { "local_name": "AbstractThematicSurface",
+      "class_uri": "citygml-3.0:construction:AbstractThematicSurface" },
+    { "local_name": "RoofSurface",
+      "class_uri": "citygml-3.0:building:RoofSurface",
+      "parent_uri": "citygml-3.0:construction:AbstractThematicSurface" }
+  ]
+}
+```
+
+Required: top-level `scheme`; `concepts[]` each with `local_name`. Optional: `class_uri` (derived as `scheme:local_name` when omitted — recommended explicit for ontology-backed schemes), `parent_uri` (accepts a `class_uri` **or** the local name of an already-registered concept, resolved within the same scheme first), `scheme_version`, `is_ade`. **Any other keys are ignored.** This minimal shape is intentionally a thin JSON form of a **SKOS** concept scheme (`class_uri` → concept IRI, `local_name` →
+`skos:prefLabel`, `parent_uri` → `skos:broader`, `scheme` → `skos:ConceptScheme`). Richer per-concept metadata (definitions, units, properties) is deliberately out of scope — that is the *application schema* (e.g. a CityGML ADE XSD / SHACL), not the concept scheme.
+
+If your authoritative taxonomy lives in another format (a CityGML ADE registry, an XSD, OWL/SKOS, ...), write a small adapter that emits the registry shape above, then load it. USAP intentionally does **not**
+bundle adapters for foreign formats — they are source-specific and belong in your project.
+
+WIP: ingestion of ontologies in OWL format.
+
+### Example registries
+
+The files under `vocabularies/` are **examples only**, not a built-in taxonomy:
 
 ```text
 vocabularies/citygml_3_0_mvp.json
 vocabularies/usap_ade_prototype.json
+vocabularies/local_minimal_example.json
 ```
 
 The CityGML registry is an MVP curated subset of common CityGML 3.0 concepts. It is not a complete CityGML ontology or schema extraction.
@@ -366,13 +218,13 @@ VisualBuilding
 VisualFacade
 ```
 
-List accepted concepts (each carries `annotation_count` and `in_use` — whether at least
-one annotation in the package references it; `--used` / `in_use=True` filters to those):
+To consult the list of accepted concepts in a `.usap.gpkg` (without `--db`
+the script builds a throwaway demo package instead):
 
 ```bash
-python examples/list_concepts_demo.py
-python examples/list_concepts_demo.py --search Roof
-python examples/list_concepts_demo.py --used
+python examples/list_concepts_demo.py --db my_area.usap.gpkg
+python examples/list_concepts_demo.py --db my_area.usap.gpkg --search Roof
+python examples/list_concepts_demo.py --db my_area.usap.gpkg --used
 ```
 
 In Python:
@@ -380,7 +232,7 @@ In Python:
 ```python
 from usap import USAPPackage, seed_default_citygml_vocabulary, seed_default_ade_vocabulary
 
-with USAPPackage.create("concepts.usap.gpkg", schema_path="sql/schema.sql", overwrite=True) as pkg:
+with USAPPackage.create("concepts.usap.gpkg", overwrite=True) as pkg:
     seed_default_citygml_vocabulary(pkg)
     seed_default_ade_vocabulary(pkg)
 
@@ -390,37 +242,40 @@ with USAPPackage.create("concepts.usap.gpkg", schema_path="sql/schema.sql", over
 
 ### Minimal vocabulary without an ontology
 
-When no CityGML+ADE registry or ontology is provided, a vocabulary file only needs a
-`scheme` and concept `local_name`s — `class_uri` is derived as `scheme:local_name` when
-omitted, and `parent_uri` accepts either a `class_uri` or the local name of an
-already-registered concept (same-scheme resolution first). See
-`vocabularies/local_minimal_example.json`. Re-loading an updated copy is additive and
-idempotent; changing an existing concept's parent raises. Concepts declared this way stay
-identifiable by their scheme (`list_accepted_concepts(scheme="local")`) for later
-alignment with a full ontology-backed package.
+When no CityGML registry or ontology is provided, a vocabulary file only needs a `scheme` and concept `local_name`s — `class_uri` is derived as `scheme:local_name` when omitted, and `parent_uri` accepts either a `class_uri` or the local name of an already-registered concept (same-scheme resolution first). Declare just the names you need under a temporary scheme and annotate right away:
+
+```json
+{
+  "scheme": "local",
+  "concepts": [
+    { "local_name": "TempRoof" },
+    { "local_name": "TempChimney", "parent_uri": "TempRoof" }
+  ]
+}
+```
+
+See [`vocabularies/local_minimal_example.json`](vocabularies/local_minimal_example.json).
+Re-loading an updated copy is additive and idempotent; changing an existing concept's parent raises. Concepts declared this way stay identifiable by their scheme (`list_accepted_concepts(scheme="local")`), so annotations made this way can later be aligned to a full ontology-based package (the latter is WIP).
 
 ---
 
 ## Build a real project package
 
-> The three supported ingestion/editing procedures (CityGML init, minimal-
-> vocabulary init, editing) are documented end to end in
+> The three supported ingestion/editing procedures (CityGML init,
+> minimal-vocabulary init, editing) are documented end to end in
 > [INGESTION.md](INGESTION.md). This section describes the config keys.
 
-Two project configs are provided:
-
-- `project_configs/example_project_catania.json` — ready to run against the bundled
-  Catania study-area data under `data/`. Those data files are large and are **not**
-  committed to git, so you must supply your own `data/catania.*` to run it.
-- `project_configs/example_project.json` — a generic template; edit its `area.*` paths
-  to point at your own data files.
-
-The Catania config looks like this:
+One example config is provided —
+[`project_configs/example_project.json`](project_configs/example_project.json),
+a generic template: edit its `../data/area.*` paths to point at your own data
+files (paths are resolved relative to the config file; the data files
+themselves are not committed to git). Abridged here to one of its three
+meshes:
 
 ```json
 {
-  "db_path": "../outputs/example_project_catania.usap.gpkg",
-  "manifest_path": "../outputs/example_project_catania_manifest.json",
+  "db_path": "../outputs/example_project.usap.gpkg",
+  "manifest_path": "../outputs/example_project_manifest.json",
   "schema_path": "../sql/schema.sql",
 
   "vocabularies": [
@@ -429,7 +284,7 @@ The Catania config looks like this:
   ],
 
   "citygml": {
-    "path": "../data/catania.gml",
+    "path": "../data/area.gml",
     "graph_name": "citygml_import",
     "also_usap_default": true,
     "compute_hash": true
@@ -437,7 +292,7 @@ The Catania config looks like this:
 
   "las": [
     {
-      "path": "../data/catania.las",
+      "path": "../data/area.las",
       "part_path": "points/all",
       "compute_hash": true
     }
@@ -445,23 +300,28 @@ The Catania config looks like this:
 
   "meshes": [
     {
-      "path": "../data/catania.obj",
-      "representation_name": "buildings_lod1",
+      "path": "../data/area_lod2.obj",
+      "uri": "area_lod2",
+      "representation_name": "buildings_lod2",
       "representation_kind": "building_mesh",
-      "lod": "LoD1",
+      "lod": "LoD2",
       "compute_hash": true
     }
+  ],
+
+  "annotation_batches": [
+    "../examples/batches/example_annotation_batch.json"
   ]
 }
 ```
 
-Further optional keys:
+Key notes:
 
-- `"annotation_batches": ["links.json"]` — batch files applied right after the
-  assets are registered, so one build call ingests the annotations too.
-- assets accept an explicit `"uri"` (a stable logical name); batch memberships
-  can then reference parts as `"asset_uri": "<that name>"` instead of the
-  numeric `asset_part_id` from the manifest.
+- `"annotation_batches"` — batch files applied right after the assets are
+  registered, so one build call ingests the annotations too.
+- an asset's optional `"uri"` (a stable logical name, `area_lod2` above) lets
+  batch memberships reference parts as `"asset_uri": "<that name>"` instead of
+  the numeric `asset_part_id` from the manifest.
 - `"srs_id": 25833` (+ optional `"srs_wkt"`) — declares the package CRS for the
   GIS extent layer (one CRS per package). Without it, an EPSG code found in the
   LAS files' CRS WKT is promoted automatically when they all agree; otherwise
@@ -471,14 +331,14 @@ Further optional keys:
 Run:
 
 ```bash
-python examples/build_project_package.py project_configs/example_project_catania.json
+python examples/build_project_package.py project_configs/example_project.json
 ```
 
 Expected outputs:
 
 ```text
-outputs/example_project_catania.usap.gpkg
-outputs/example_project_catania_manifest.json
+outputs/example_project.usap.gpkg
+outputs/example_project_manifest.json
 ```
 
 The manifest lists each part's `asset_part_id` (usable in batches as an
@@ -489,12 +349,21 @@ batches — pass `--update` (Python: `build_project_package_from_file(path,
 update=True)`). Registration is idempotent, and in update mode batches run
 with `replace_existing=True`.
 
+To see which concepts a built package accepts — optionally filtered — point
+the concept lister at it (each line shows local name, CityGML vs ADE/custom,
+`used:N`/`unused`, scheme, and full `class_uri`):
+
+```bash
+python examples/list_concepts_demo.py --db outputs/my_area.usap.gpkg
+python examples/list_concepts_demo.py --db outputs/my_area.usap.gpkg --search Roof
+python examples/list_concepts_demo.py --db outputs/my_area.usap.gpkg --used
+```
+
 ---
 
 ## Opening a package in QGIS
 
-A `.usap.gpkg` is a valid GeoPackage. Adding it to QGIS (or listing it with
-`ogrinfo`) shows four read-only layers:
+A `.usap.gpkg` is a valid GeoPackage. Adding it to QGIS (or listing it with `ogrinfo`) shows four read-only layers:
 
 ```text
 usap_annotations_view    attributes   annotations with concept, city object,
@@ -508,14 +377,6 @@ usap_asset_extents       features     one derived 2D bounding box per
 
 Notes:
 
-- **Add the package by dragging the `.gpkg` file** (or Layer → Add Vector
-  Layer): the dialog offers exactly these four layers. QGIS's *Browser panel*
-  additionally lists every internal `usap_*` table (a GeoPackage is a SQLite
-  file, and the browser shows all tables) — those are **not** published
-  layers, and adding one from the tree yields "layer source could not be
-  found". That is deliberate: internal tables stay unregistered so a GIS
-  session cannot edit them and bypass the SDK's invariants; the views are
-  read-only by nature.
 - The extent boxes are **derived summaries** (the union of each asset's part
   bounds, captured at registration) — never actual geometry. They are written
   automatically, kept by `ON DELETE CASCADE`, and checked by `validate_report()`
@@ -534,8 +395,8 @@ After building a project package:
 
 ```bash
 python examples/smoke_test_project_package.py \
-  outputs/example_project_catania.usap.gpkg \
-  outputs/example_project_catania_manifest.json \
+  outputs/example_project.usap.gpkg \
+  outputs/example_project_manifest.json \
   --batch-out outputs/smoke_batch.json
 ```
 
@@ -549,35 +410,30 @@ one mesh face asset part
 
 and then queries it back from both a selected LAS point and a selected mesh face.
 
-To rerun and replace the same smoke annotation:
+Useful flags:
+
+- `--replace-existing` — rerun and replace the same smoke annotation.
+- `--city-object-uid YOUR_GML_ID` — use a specific CityGML object.
+- `--mesh-representation-name buildings_lod2` — use a specific mesh
+  representation.
+
+---
+
+## Reproduce the benchmark
+
+The synthetic benchmark measures build and query performance on a generated
+city — the evidence behind the project's performance claim (no external data
+needed; run from the repo root):
 
 ```bash
-python examples/smoke_test_project_package.py \
-  outputs/example_project_catania.usap.gpkg \
-  outputs/example_project_catania_manifest.json \
-  --batch-out outputs/smoke_batch.json \
-  --replace-existing
+python scripts/benchmark_phase1.py --buildings 1000 --repeat 5 --md bench.md
 ```
 
-Use a specific CityGML object:
-
-```bash
-python examples/smoke_test_project_package.py \
-  outputs/example_project_catania.usap.gpkg \
-  outputs/example_project_catania_manifest.json \
-  --city-object-uid YOUR_GML_ID \
-  --replace-existing
-```
-
-Use a specific mesh representation:
-
-```bash
-python examples/smoke_test_project_package.py \
-  outputs/example_project_catania.usap.gpkg \
-  outputs/example_project_catania_manifest.json \
-  --mesh-representation-name buildings_lod2 \
-  --replace-existing
-```
+It generates a synthetic city (`create_synthetic_package` / `SyntheticConfig`,
+also runnable standalone via `examples/build_synthetic.py`), times the build
+and the core queries, validates the package, and writes the report to the
+`--md`/`--json` paths. `--schema` defaults to `sql/schema.sql`; sizes are
+tunable with `--buildings`, `--roof-faces`, `--wall-faces`, `--ground-faces`.
 
 ---
 
@@ -640,7 +496,7 @@ Apply a batch:
 
 ```bash
 python examples/apply_annotation_batch.py \
-  outputs/example_project_catania.usap.gpkg \
+  outputs/example_project.usap.gpkg \
   path/to/batch.json
 ```
 
@@ -648,7 +504,7 @@ Replace an existing annotation with the same `annotation_uid`:
 
 ```bash
 python examples/apply_annotation_batch.py \
-  outputs/example_project_catania.usap.gpkg \
+  outputs/example_project.usap.gpkg \
   path/to/batch.json \
   --replace-existing
 ```
@@ -702,10 +558,13 @@ from usap import (
     seed_default_ade_vocabulary,
 )
 
-with USAPPackage.create("demo.usap.gpkg", schema_path="sql/schema.sql", overwrite=True) as pkg:
+with USAPPackage.create("demo.usap.gpkg", overwrite=True) as pkg:
     seed_default_citygml_vocabulary(pkg)
     seed_default_ade_vocabulary(pkg)
 ```
+
+(`schema_path` defaults to the repository's `sql/schema.sql`; pass it explicitly
+when working outside a checkout — see Installation.)
 
 ### Register LAS and mesh assets
 
@@ -843,28 +702,10 @@ pkg.replace_value_field(annotation_id, mesh_part_id, "face", corrected_values)
 
 ## Element kinds
 
-The user-facing API accepts readable element-kind names:
-
-```text
-point
-points
-face
-faces
-triangle
-triangles
-```
-
-Internally, these are normalized to USAP constants.
-
-This means both of these are valid:
-
-```python
-pkg.annotations_for_elements(asset_part_id=1, element_kind="point", selected_indices=[1])
-```
-
-```python
-pkg.annotations_for_elements(asset_part_id=1, element_kind=ELEMENT_KIND_POINT, selected_indices=[1])
-```
+The user-facing API accepts readable element-kind names — `point`/`points`,
+`face`/`faces`, `triangle`/`triangles` — and normalizes them to USAP
+constants internally, so `element_kind="point"` and
+`element_kind=ELEMENT_KIND_POINT` are equivalent.
 
 ---
 
@@ -896,28 +737,12 @@ This is enough for the MVP because USAP uses CityGML mainly as the semantic/obje
 
 ## Mesh support
 
-The mesh adapter is generic.
-
-It is not limited to LoD1 or LoD2.
-
-Any stable triangular mesh can be registered, for example:
-
-```text
-LoD1 building mesh
-LoD2 building mesh
-generic city triangulation
-TIN terrain
-photogrammetry mesh
-simulation mesh
-```
-
-The important condition is:
-
-```text
-face indices must remain stable for the registered file version
-```
-
-If a mesh is remeshed, simplified, reordered, or re-exported in a way that changes face order, register it as a new asset.
+The mesh adapter is generic, not limited to LoD1/LoD2. Any stable triangular
+mesh can be registered: building meshes, city triangulations, TIN terrain,
+photogrammetry or simulation meshes. The one condition: **face indices must
+remain stable for the registered file version**. If a mesh is remeshed,
+simplified, reordered, or re-exported in a way that changes face order,
+register it as a new asset.
 
 ---
 
@@ -933,7 +758,7 @@ report.print()
 Or run an example validator:
 
 ```bash
-python examples/validate_package.py outputs/example_project_catania.usap.gpkg
+python examples/validate_package.py outputs/example_project.usap.gpkg
 ```
 
 The validator checks, among other things:
@@ -948,114 +773,5 @@ membership index bounds
 semantic class closure
 city object closure
 concept registry duplicates
+duplicate relationship edges (warning)
 ```
-
----
-
-## Generated files and Git
-
-Recommended `.gitignore` entries:
-
-```text
-.venv/
-__pycache__/
-.pytest_cache/
-*.usap.gpkg
-*.prof
-outputs/
-```
-
-Commit source code, tests, examples, configs, and vocabulary JSON files.
-
-Do not commit large real data files unless intentionally using Git LFS or another data-management strategy.
-
----
-
-## Development workflow
-
-Useful commands:
-
-```bash
-python -m pytest
-```
-
-Build a project package:
-
-```bash
-python examples/build_project_package.py project_configs/example_project_catania.json
-```
-
-Run smoke test:
-
-```bash
-python examples/smoke_test_project_package.py \
-  outputs/example_project_catania.usap.gpkg \
-  outputs/example_project_catania_manifest.json \
-  --batch-out outputs/smoke_batch.json \
-  --replace-existing
-```
-
-Apply annotation batch:
-
-```bash
-python examples/apply_annotation_batch.py \
-  outputs/example_project_catania.usap.gpkg \
-  path/to/batch.json \
-  --replace-existing
-```
-
----
-
-## Current MVP capability
-
-The current prototype can demonstrate the following use case:
-
-```text
-Given:
-  a CityGML file for an area,
-  a LAS/LAZ point cloud for the same area,
-  one or more mesh representations of the same area,
-  a CityGML/ADE concept registry,
-
-USAP can:
-  create a package,
-  register all assets,
-  import CityGML semantic objects,
-  load accepted concepts,
-  apply JSON annotation batches,
-  attach annotations to LAS points and mesh faces,
-  link annotations to CityGML objects,
-  query annotations from selected elements,
-  validate package integrity.
-```
-
----
-
-## Roadmap
-
-Immediate next steps:
-
-1. Build a real package for the target study area.
-2. Prepare a domain-specific batch annotation file.
-3. Create a demo script/notebook for the target use case.
-4. Add helper functions for deriving or importing domain attributes.
-5. Improve CityGML concept registry coverage.
-6. Add optional xlink handling if needed by the real CityGML file.
-7. Add simple spatial search or bounding-box filtering if real files require it.
-
-Later steps:
-
-1. Formalize the ADE registry.
-2. Add ADE schema/export support.
-3. Add richer CityGML import support.
-4. Add viewer integration.
-5. Add performance optimizations for larger cities.
-6. Add versioned migrations.
-
----
-
-## Prototype warning
-
-This repository is currently a research prototype.
-
-The file format, schema, and API may still change. Packages created with this version should be treated as experimental unless a migration strategy is added.

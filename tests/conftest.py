@@ -1,10 +1,48 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterator
 
 import laspy
 import numpy as np
+import pytest
 import trimesh
+
+from usap import ELEMENT_KIND_FACE, USAPPackage
+
+SCHEMA_PATH = Path(__file__).resolve().parents[1] / "sql" / "schema.sql"
+
+
+def make_pkg(tmp_path: Path, name: str = "pkg.usap.gpkg") -> USAPPackage:
+    """Create a fresh empty package under tmp_path."""
+    return USAPPackage.create(
+        tmp_path / name,
+        schema_path=SCHEMA_PATH,
+        overwrite=True,
+    )
+
+
+def make_mesh_part(pkg: USAPPackage, element_count: int = 100) -> int:
+    """Register a bare mesh asset with one face part; returns asset_part_id."""
+    asset_id = pkg.register_asset(uri="mesh.glb", asset_kind="mesh")
+
+    return pkg.register_asset_part(
+        asset_id=asset_id,
+        part_path="geometry/0",
+        element_kind=ELEMENT_KIND_FACE,
+        element_count=element_count,
+    )
+
+
+@pytest.fixture
+def pkg(tmp_path: Path) -> Iterator[USAPPackage]:
+    with make_pkg(tmp_path) as p:
+        yield p
+
+
+@pytest.fixture
+def mesh_part(pkg: USAPPackage) -> int:
+    return make_mesh_part(pkg)
 
 
 def assert_package_valid(pkg) -> None:

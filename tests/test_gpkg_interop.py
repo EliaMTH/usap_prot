@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 import pytest
-from conftest import assert_package_valid
+from conftest import assert_package_valid, make_pkg as _make_pkg
 from conftest import write_tiny_las as _write_tiny_las
 from conftest import write_tiny_mesh as _write_tiny_mesh
 
@@ -32,22 +32,12 @@ from usap.geopackage import (
     set_package_srs,
 )
 
-SCHEMA_PATH = Path("sql/schema.sql").resolve()
-
 WKT1_25833 = (
     'PROJCS["ETRS89 / UTM zone 33N",'
     'GEOGCS["ETRS89",AUTHORITY["EPSG","4258"]],'
     'AUTHORITY["EPSG","25833"]]'
 )
 WKT2_25833 = 'PROJCRS["ETRS89 / UTM zone 33N",ID["EPSG",25833]]'
-
-
-def _make_pkg(tmp_path: Path, name: str = "pkg.usap.gpkg") -> USAPPackage:
-    return USAPPackage.create(
-        tmp_path / name,
-        schema_path=SCHEMA_PATH,
-        overwrite=True,
-    )
 
 
 # ---------------------------------------------------------------------------

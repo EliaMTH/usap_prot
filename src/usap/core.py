@@ -294,36 +294,45 @@ class USAPPackage:
 
         pkg = cls(db_path)
 
-        with open(schema_path, "r", encoding="utf-8") as f:
-            schema_sql = f.read()
+        # If initialization fails partway, do not leave an open connection
+        # and a half-initialized file behind (the file is always ours here:
+        # any pre-existing one was removed or raised above).
+        try:
+            with open(schema_path, "r", encoding="utf-8") as f:
+                schema_sql = f.read()
 
-        pkg.conn.executescript(schema_sql)
+            pkg.conn.executescript(schema_sql)
 
-        with pkg.transaction():
-            initialize_geopackage_metadata(
-                pkg.conn,
-                profile_version=profile_version,
-            )
-
-            pkg.conn.execute(
-                """
-                INSERT INTO usap_profile (
-                    profile_id,
-                    profile_version,
-                    default_block_size,
-                    default_encoding,
-                    metadata_json
+            with pkg.transaction():
+                initialize_geopackage_metadata(
+                    pkg.conn,
+                    profile_version=profile_version,
                 )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    1,
-                    profile_version,
-                    DEFAULT_BLOCK_SIZE,
-                    DEFAULT_ENCODING,
-                    None,
-                ),
-            )
+
+                pkg.conn.execute(
+                    """
+                    INSERT INTO usap_profile (
+                        profile_id,
+                        profile_version,
+                        default_block_size,
+                        default_encoding,
+                        metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        profile_version,
+                        DEFAULT_BLOCK_SIZE,
+                        DEFAULT_ENCODING,
+                        None,
+                    ),
+                )
+        except BaseException:
+            pkg.conn.close()
+            if db_path.exists():
+                os.remove(db_path)
+            raise
 
         return pkg
     
@@ -786,7 +795,35 @@ class USAPPackage:
     ) -> int:
         """
         Add one typed edge between two city objects.
+
+        Idempotent: re-linking an identical edge (same graph, endpoints,
+        type, role, and source_relation_id) returns the existing
+        relationship_id instead of inserting a duplicate.
         """
+        existing = self.conn.execute(
+            """
+            SELECT relationship_id
+            FROM usap_city_object_relationship
+            WHERE graph_name = ?
+              AND parent_city_object_id = ?
+              AND child_city_object_id = ?
+              AND relationship_type = ?
+              AND role IS ?
+              AND source_relation_id IS ?
+            """,
+            (
+                graph_name,
+                parent_city_object_id,
+                child_city_object_id,
+                relationship_type,
+                role,
+                source_relation_id,
+            ),
+        ).fetchone()
+
+        if existing is not None:
+            return int(existing["relationship_id"])
+
         with self.transaction():
             cur = self.conn.execute(
                 """

@@ -50,7 +50,6 @@ def test_integrated_citygml_las_mesh_ade_annotation(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         citygml = import_citygml_semantics(pkg, citygml_path)

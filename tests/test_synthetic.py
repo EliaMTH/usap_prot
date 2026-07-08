@@ -15,7 +15,6 @@ def test_synthetic_selected_roof_face_returns_roof_annotation(tmp_path: Path) ->
 
     result = create_synthetic_package(
         db_path,
-        schema_path="sql/schema.sql",
         config=SyntheticConfig(
             building_count=10,
             roof_faces_per_building=20,
@@ -50,7 +49,6 @@ def test_synthetic_city_object_query_returns_building_parts(tmp_path: Path) -> N
 
     create_synthetic_package(
         db_path,
-        schema_path="sql/schema.sql",
         config=SyntheticConfig(
             building_count=10,
             roof_faces_per_building=20,
@@ -80,7 +78,6 @@ def test_synthetic_semantic_class_query_returns_roof_blocks(tmp_path: Path) -> N
 
     result = create_synthetic_package(
         db_path,
-        schema_path="sql/schema.sql",
         config=SyntheticConfig(
             building_count=10,
             roof_faces_per_building=20,
@@ -116,7 +113,6 @@ def test_selected_faces_across_multiple_blocks_return_annotations(tmp_path: Path
 
     result = create_synthetic_package(
         db_path,
-        schema_path="sql/schema.sql",
         config=SyntheticConfig(
             building_count=20,
             roof_faces_per_building=120,

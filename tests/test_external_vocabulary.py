@@ -14,7 +14,6 @@ def test_seed_default_citygml_vocabulary(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         vocab = seed_default_citygml_vocabulary(pkg)
@@ -52,7 +51,6 @@ def test_seed_default_ade_vocabulary(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         vocab = seed_default_ade_vocabulary(pkg)

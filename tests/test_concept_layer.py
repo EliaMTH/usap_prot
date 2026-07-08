@@ -15,11 +15,13 @@ from pathlib import Path
 
 import pytest
 
-from conftest import assert_package_valid
+from conftest import (
+    assert_package_valid,
+    make_mesh_part as _mesh_part,
+    make_pkg as _make_pkg,
+)
 
-from usap import ELEMENT_KIND_FACE, USAPError, USAPPackage, seed_vocabulary_file
-
-SCHEMA_PATH = Path("sql/schema.sql").resolve()
+from usap import USAPAmbiguityError, USAPError, seed_vocabulary_file
 
 MINIMAL_VOCAB = {
     "scheme": "local",
@@ -31,29 +33,10 @@ MINIMAL_VOCAB = {
 }
 
 
-def _make_pkg(tmp_path: Path) -> USAPPackage:
-    return USAPPackage.create(
-        tmp_path / "concepts.usap.gpkg",
-        schema_path=SCHEMA_PATH,
-        overwrite=True,
-    )
-
-
 def _write_vocab(tmp_path: Path, data: dict, name: str = "local.json") -> Path:
     path = tmp_path / name
     path.write_text(json.dumps(data), encoding="utf-8")
     return path
-
-
-def _mesh_part(pkg: USAPPackage, element_count: int = 100) -> int:
-    asset_id = pkg.register_asset(uri="mesh.glb", asset_kind="mesh")
-
-    return pkg.register_asset_part(
-        asset_id=asset_id,
-        part_path="geometry/0",
-        element_kind=ELEMENT_KIND_FACE,
-        element_count=element_count,
-    )
 
 
 def test_minimal_vocabulary_seeds_and_annotates(tmp_path: Path) -> None:
@@ -239,3 +222,23 @@ def test_subclass_block_query_uses_indexes(tmp_path: Path) -> None:
         plan = "\n".join(row[3] for row in plan_rows)
 
         assert "usap_scc_by_descendant" in plan, plan
+
+
+def test_ambiguous_vocabulary_parent_reports_ambiguity(tmp_path: Path) -> None:
+    # A vocabulary parent name that matches concepts in several schemes must
+    # surface as ambiguity, not as "not registered".
+    with _make_pkg(tmp_path) as pkg:
+        pkg.create_semantic_class(scheme="s1", class_uri="s1:Dup", local_name="Dup")
+        pkg.create_semantic_class(scheme="s2", class_uri="s2:Dup", local_name="Dup")
+
+        vocab_path = _write_vocab(
+            tmp_path,
+            {
+                "scheme": "s3",
+                "concepts": [{"local_name": "Child", "parent_uri": "Dup"}],
+            },
+            name="ambiguous_parent.json",
+        )
+
+        with pytest.raises(USAPAmbiguityError, match="ambiguous"):
+            seed_vocabulary_file(pkg, vocab_path)

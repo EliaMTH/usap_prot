@@ -601,6 +601,89 @@ class USAPPackage:
             ),
         )
 
+    def list_assets(
+        self,
+        *,
+        asset_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        List registered assets, each with its part and element counts.
+
+        Pass asset_kind to keep only one kind (e.g. 'mesh', 'pointcloud').
+        """
+        where = ""
+        params: list[Any] = []
+
+        if asset_kind is not None:
+            where = "WHERE a.asset_kind = ?"
+            params.append(asset_kind)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                a.asset_id,
+                a.uri,
+                a.asset_kind,
+                a.media_type,
+                a.content_hash,
+                a.srs_id,
+                (
+                    SELECT COUNT(*)
+                    FROM usap_asset_part AS ap
+                    WHERE ap.asset_id = a.asset_id
+                ) AS part_count,
+                (
+                    SELECT COALESCE(SUM(ap.element_count), 0)
+                    FROM usap_asset_part AS ap
+                    WHERE ap.asset_id = a.asset_id
+                ) AS element_count
+            FROM usap_asset AS a
+            {where}
+            ORDER BY a.asset_id
+            """,
+            params,
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def list_asset_parts(
+        self,
+        *,
+        asset_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        List asset parts (the stable index spaces annotations bind to).
+
+        Pass asset_id to keep only one asset's parts. element_kind is the
+        USAP integer constant (see ELEMENT_KIND_*).
+        """
+        where = ""
+        params: list[Any] = []
+
+        if asset_id is not None:
+            where = "WHERE asset_id = ?"
+            params.append(asset_id)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                asset_part_id,
+                asset_id,
+                part_path,
+                element_kind,
+                element_count,
+                index_origin,
+                minx, miny, minz,
+                maxx, maxy, maxz
+            FROM usap_asset_part
+            {where}
+            ORDER BY asset_id, asset_part_id
+            """,
+            params,
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
     # ---------------------------------------------------------------------
     # Semantic classes
     # ---------------------------------------------------------------------
@@ -951,6 +1034,82 @@ class USAPPackage:
                 None,
                 f'{{"graph_name": "{graph_name}"}}',
             )
+
+    def list_city_objects(
+        self,
+        *,
+        object_status: str | None = None,
+        semantic_class_id: int | None = None,
+        search: str | None = None,
+        parent_object: int | str | None = None,
+        graph_name: str = DEFAULT_GRAPH_NAME,
+    ) -> list[dict[str, Any]]:
+        """
+        List city objects (the semantic identities annotations link to).
+
+        Filters are AND-combined:
+        - object_status — e.g. 'temporary' to find carrier objects awaiting
+          alignment with a real CityGML source.
+        - semantic_class_id — objects of one class.
+        - search — substring match on object_uid.
+        - parent_object — an object id or uid; returns only its DIRECT
+          children in graph_name (walk the object tree: list all, then expand
+          a node). Root objects are those returned with no parent_object that
+          never appear as someone's child.
+        """
+        where: list[str] = []
+        params: list[Any] = []
+        join = ""
+
+        if parent_object is not None:
+            parent_id = self.resolve_city_object(parent_object)
+            join = (
+                "JOIN usap_city_object_relationship AS r "
+                "ON r.child_city_object_id = co.city_object_id "
+                "AND r.parent_city_object_id = ? "
+                "AND r.graph_name = ?"
+            )
+            params.extend([parent_id, graph_name])
+
+        if object_status is not None:
+            where.append("co.object_status = ?")
+            params.append(object_status)
+
+        if semantic_class_id is not None:
+            where.append("co.semantic_class_id = ?")
+            params.append(semantic_class_id)
+
+        if search is not None:
+            where.append("co.object_uid LIKE ?")
+            params.append(f"%{search}%")
+
+        where_sql = ""
+
+        if where:
+            where_sql = "WHERE " + " AND ".join(where)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT
+                co.city_object_id,
+                co.object_uid,
+                sc.local_name AS semantic_class,
+                co.object_status,
+                co.gml_id,
+                src.uri AS source_asset_uri
+            FROM usap_city_object AS co
+            {join}
+            LEFT JOIN usap_semantic_class AS sc
+                ON sc.semantic_class_id = co.semantic_class_id
+            LEFT JOIN usap_asset AS src
+                ON src.asset_id = co.source_asset_id
+            {where_sql}
+            ORDER BY co.object_uid
+            """,
+            params,
+        ).fetchall()
+
+        return [dict(row) for row in rows]
 
     # ---------------------------------------------------------------------
     # Annotations

@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from conftest import make_mesh_part, make_pkg
-from usap import ELEMENT_KIND_FACE, USAPPackage, seed_default_citygml_vocabulary
+from usap import (
+    ELEMENT_KIND_FACE,
+    ELEMENT_KIND_POINT,
+    USAPPackage,
+    seed_default_citygml_vocabulary,
+)
 from usap.constants import normalize_element_kind
 
 
@@ -396,3 +401,79 @@ def test_normalize_element_kind_is_strict() -> None:
 
     with pytest.raises(ValueError):
         normalize_element_kind("polygon")
+
+
+def test_list_assets_and_parts(pkg: USAPPackage) -> None:
+    # A UI must be able to enumerate what was registered, with part/element
+    # counts, and drill into one asset's parts.
+    mesh_id = pkg.register_asset(uri="mesh.glb", asset_kind="mesh")
+    pkg.register_asset_part(mesh_id, "geometry/0", ELEMENT_KIND_FACE, 10)
+    pkg.register_asset_part(mesh_id, "geometry/1", ELEMENT_KIND_FACE, 5)
+
+    cloud_id = pkg.register_asset(uri="area.las", asset_kind="pointcloud")
+    pkg.register_asset_part(cloud_id, "points/all", ELEMENT_KIND_POINT, 100)
+
+    assets = pkg.list_assets()
+
+    assert [a["uri"] for a in assets] == ["mesh.glb", "area.las"]
+    by_uri = {a["uri"]: a for a in assets}
+    assert by_uri["mesh.glb"]["part_count"] == 2
+    assert by_uri["mesh.glb"]["element_count"] == 15
+    assert by_uri["area.las"]["part_count"] == 1
+    assert by_uri["area.las"]["element_count"] == 100
+
+    # asset_kind filter
+    assert [a["uri"] for a in pkg.list_assets(asset_kind="pointcloud")] == [
+        "area.las"
+    ]
+
+    # parts of one asset only
+    mesh_parts = pkg.list_asset_parts(asset_id=mesh_id)
+    assert [p["part_path"] for p in mesh_parts] == ["geometry/0", "geometry/1"]
+    assert all(p["element_kind"] == ELEMENT_KIND_FACE for p in mesh_parts)
+    assert {p["asset_id"] for p in mesh_parts} == {mesh_id}
+
+    # unfiltered lists every part across assets
+    assert len(pkg.list_asset_parts()) == 3
+
+
+def test_list_city_objects_and_children(pkg: USAPPackage) -> None:
+    # A UI populates an object tree: list all objects, filter carriers, and
+    # expand a node to its direct children.
+    pkg.create_semantic_class(scheme="s", class_uri="s:Building", local_name="Building")
+    pkg.create_semantic_class(scheme="s", class_uri="s:Roof", local_name="Roof")
+
+    building = pkg.create_city_object(object_uid="building_1")
+    roof = pkg.create_city_object(
+        object_uid="building_1_roof_1", object_status="temporary"
+    )
+    wall = pkg.create_city_object(object_uid="building_1_wall_1")
+
+    for child in (roof, wall):
+        pkg.link_city_objects(
+            parent_city_object_id=building,
+            child_city_object_id=child,
+            relationship_type="boundedBy",
+        )
+
+    # all objects
+    assert {o["object_uid"] for o in pkg.list_city_objects()} == {
+        "building_1",
+        "building_1_roof_1",
+        "building_1_wall_1",
+    }
+
+    # carrier filter — the alignment hook
+    carriers = pkg.list_city_objects(object_status="temporary")
+    assert [o["object_uid"] for o in carriers] == ["building_1_roof_1"]
+
+    # expand a node: direct children only (by id or by uid)
+    children = pkg.list_city_objects(parent_object="building_1")
+    assert {o["object_uid"] for o in children} == {
+        "building_1_roof_1",
+        "building_1_wall_1",
+    }
+    assert pkg.list_city_objects(parent_object=building) == children
+
+    # a leaf has no children
+    assert pkg.list_city_objects(parent_object="building_1_roof_1") == []

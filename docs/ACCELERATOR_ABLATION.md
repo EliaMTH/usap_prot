@@ -10,7 +10,7 @@ This document records a design investigation (2026-07) into three questions:
    **necessary**, or could smart queries over the base tables replace them?
 
 Question 3 was answered empirically with an ablation benchmark:
-[scripts/benchmark_accelerator_ablation.py](scripts/benchmark_accelerator_ablation.py)
+[scripts/benchmark_accelerator_ablation.py](../scripts/benchmark_accelerator_ablation.py)
 (per-scale reports in `outputs/ablation_*_buildings.md`).
 
 ---

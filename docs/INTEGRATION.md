@@ -1,6 +1,6 @@
 # USAP integration
 
-(More info are in [REFERENCE.md](REFERENCE.md), ingestion workflows in [INGESTION.md](INGESTION.md), and the concept/model in [README.md](README.md).)
+(More info are in [REFERENCE.md](REFERENCE.md), ingestion workflows in [INGESTION.md](INGESTION.md), and the concept/model in [README.md](../README.md).)
 
 ## What you integrate against
 

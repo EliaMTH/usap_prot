@@ -19,7 +19,7 @@ USAP is designed for concepts from:
 
 USAP does **not** copy geometry into the package. Instead, it stores references to external assets and compact membership blocks that identify which points, faces, or elements are annotated.
 
-The motivation and mental model are in [README.md](README.md); this file is the reference manual.
+The motivation and mental model are in [README.md](../README.md); this file is the reference manual.
 
 ---
 

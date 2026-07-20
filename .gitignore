@@ -11,6 +11,7 @@ decimated_classified_output.las
 outputs/
 data/
 CLAUDE.md
+.claude/
 
 benchmark_results/
 usap_devdiary.md

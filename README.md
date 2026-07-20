@@ -104,6 +104,8 @@ If you know other tools that should be here, let us know!
 
 Explore USAP in more detail with:
 
-- [INGESTION.md](INGESTION.md) — the three supported creation/editing procedures.
-- [REFERENCE.md](REFERENCE.md) — the full manual (concepts, config keys, batch format, Python API).
-- [TESTS.md](TESTS.md) — the test suite.
+- [INGESTION.md](docs/INGESTION.md) — the three supported creation/editing procedures.
+- [REFERENCE.md](docs/REFERENCE.md) — the full manual (concepts, config keys, batch format, Python API).
+- [TESTS.md](docs/TESTS.md) — the test suite.
+
+The rest of the documentation lives in [docs/](docs/).

@@ -47,10 +47,11 @@ Method map (matches the ``# ---`` section banners below):
 
     Opening / creating ......... create, open, close, context manager
     Small internal helpers ..... get_default_block_size, log_edit
-    Assets ..................... register_asset, register_asset_part
+    Assets ..................... register_asset, register_asset_part,
+                                  list_assets, list_asset_parts
     Semantic classes ........... create_semantic_class (+ closure maintenance)
     City objects and graph ..... create_city_object, link_city_objects,
-                                  rebuild_city_object_closure
+                                  rebuild_city_object_closure, list_city_objects
     Annotations ................ get/list/update/delete_annotation,
                                   create_annotation, link_annotation_to_object
     Membership editing ......... replace_annotation_membership (+ validation)
@@ -63,9 +64,11 @@ Method map (matches the ``# ---`` section banners below):
                                   fields, asset-bound — never city-object-bound)
     Validation ................. validate_report
     Concept-level API .......... resolve_semantic_class / resolve_city_object /
-                                  resolve_asset_part, create_concept_annotation,
-                                  annotate_elements, attach_annotation_elements
-                                  (the high-level entry points most callers use)
+                                  resolve_asset_part, get_semantic_class,
+                                  list_accepted_concepts, concept_exists,
+                                  create_concept_annotation, annotate_elements,
+                                  attach_annotation_elements (the high-level
+                                  entry points most callers use)
 """
 
 from __future__ import annotations
@@ -1177,12 +1180,7 @@ class USAPPackage:
         result = dict(row)
 
         if include_membership_summary:
-            result["membership_summary"] = self._annotation_membership_summary(
-                int(result["annotation_id"])
-            )
-            result["value_field_summary"] = self._annotation_value_field_summary(
-                int(result["annotation_id"])
-            )
+            self._attach_annotation_summaries(result)
 
         return result
 
@@ -1307,12 +1305,7 @@ class USAPPackage:
 
         if include_membership_summary:
             for item in result:
-                item["membership_summary"] = self._annotation_membership_summary(
-                    int(item["annotation_id"])
-                )
-                item["value_field_summary"] = self._annotation_value_field_summary(
-                    int(item["annotation_id"])
-                )
+                self._attach_annotation_summaries(item)
 
         return result
 
@@ -1468,6 +1461,16 @@ class USAPPackage:
         ).fetchall()
 
         return [dict(row) for row in rows]
+
+
+    def _attach_annotation_summaries(self, item: dict[str, Any]) -> None:
+        annotation_id = int(item["annotation_id"])
+        item["membership_summary"] = self._annotation_membership_summary(
+            annotation_id
+        )
+        item["value_field_summary"] = self._annotation_value_field_summary(
+            annotation_id
+        )
 
 
     def create_annotation(
@@ -2652,7 +2655,7 @@ class USAPPackage:
         return validate_connection(self.conn)
 
     # ---------------------------------------------------------------------
-    # CRUD operations for integrated prototype test
+    # Concept-level API
     # --------------------------------------------------------------------- 
 
     def resolve_semantic_class(
@@ -3181,7 +3184,6 @@ class USAPPackage:
         This is a clearer prototype name for replace_annotation_membership.
         It preserves memberships on other asset parts.
         """
-        element_kind = normalize_element_kind(element_kind)
         self.replace_annotation_membership(
             annotation_id=annotation_id,
             asset_part_id=asset_part_id,

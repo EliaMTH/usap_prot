@@ -89,6 +89,14 @@ their respective hierarchies (classes, objects). `usap_profile` and `usap_edit_l
 
 `usap_profile` and `usap_edit_log` have no foreign keys.
 
+**Primary-object invariant.** An annotation's primary city object is recorded twice:
+in `usap_annotation.primary_city_object_id` and as a `represents` row in
+`usap_annotation_object`. When the column is not NULL, the matching `represents` row
+must exist. `create_annotation` and `update_annotation` maintain both together;
+`validate_report()` reports a disagreement as `ANNOTATION_PRIMARY_OBJECT_LINK_MISSING`.
+Additional `usap_annotation_object` rows (other objects, other `relation_type`s) are
+free-form and are not constrained by this invariant.
+
 ---
 
 ## 2. Which tables each view reads from

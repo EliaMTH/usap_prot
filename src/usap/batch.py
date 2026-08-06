@@ -357,12 +357,9 @@ def _apply_one_annotation(
 
         annotation_id = int(updated["annotation_id"])
 
-        # Match the create path: when a city object is supplied, link it.
-        if resolved_city_object_id is not None:
-            pkg.link_annotation_to_object(
-                annotation_id=annotation_id,
-                city_object_id=resolved_city_object_id,
-            )
+        # No explicit link call here: update_annotation moves the 'represents'
+        # link with primary_city_object_id, so linking again would only be able
+        # to re-add a stale link for a previous object.
 
     memberships = item.get("memberships")
     value_fields = item.get("value_fields")

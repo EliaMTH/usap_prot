@@ -63,6 +63,48 @@ def test_validation_catches_corrupt_membership_payload(tmp_path: Path) -> None:
         assert "CORRUPT_MEMBERSHIP_PAYLOAD" in _codes(report)
 
 
+def test_validation_catches_primary_object_without_represents_link(
+    tmp_path: Path,
+) -> None:
+    # The primary city object is stored both as a column and as a 'represents'
+    # link. A package where those disagree answers city-object queries with
+    # annotations that no longer belong to the object, so it is not valid.
+    db_path = tmp_path / "stale_link.usap.gpkg"
+
+    _create_small_valid_package(db_path)
+
+    with USAPPackage.open(db_path) as pkg:
+        annotation = pkg.conn.execute(
+            """
+            SELECT annotation_id, primary_city_object_id
+            FROM usap_annotation
+            WHERE primary_city_object_id IS NOT NULL
+            LIMIT 1
+            """
+        ).fetchone()
+
+        assert annotation is not None
+
+        with pkg.transaction():
+            pkg.conn.execute(
+                """
+                DELETE FROM usap_annotation_object
+                WHERE annotation_id = ?
+                  AND city_object_id = ?
+                  AND relation_type = 'represents'
+                """,
+                (
+                    annotation["annotation_id"],
+                    annotation["primary_city_object_id"],
+                ),
+            )
+
+        report = pkg.validate_report()
+
+        assert not report.is_ok
+        assert "ANNOTATION_PRIMARY_OBJECT_LINK_MISSING" in _codes(report)
+
+
 def test_validation_catches_membership_count_mismatch(tmp_path: Path) -> None:
     db_path = tmp_path / "bad_count.usap.gpkg"
 

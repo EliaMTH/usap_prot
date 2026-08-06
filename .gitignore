@@ -12,6 +12,9 @@ outputs/
 data/
 CLAUDE.md
 .claude/
+USAP_report.md
+BUG_Annotation-to-city-object.txt
+
 
 benchmark_results/
 usap_devdiary.md

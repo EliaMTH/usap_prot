@@ -116,6 +116,7 @@ def validate_connection(conn: sqlite3.Connection) -> ValidationReport:
         _validate_profile(conn, report)
         _validate_semantic_class_registry(conn, report)
         _validate_orphans(conn, report)
+        _validate_annotation_object_links(conn, report)
         _validate_membership_blocks(conn, report)
         _validate_value_blocks(conn, report)
         _validate_semantic_class_closure(conn, report)
@@ -223,6 +224,58 @@ def _validate_city_object_relationships(
                 "count": int(row["n"]),
             },
         )
+
+def _validate_annotation_object_links(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    """
+    Flag annotations whose primary object has no matching 'represents' link.
+
+    An annotation's primary city object is stored twice: as
+    usap_annotation.primary_city_object_id and as a 'represents' row in
+    usap_annotation_object. The write paths keep both in step; when they
+    disagree, city-object queries can return the annotation under an object it
+    no longer belongs to (or, per relationship_types, miss it entirely).
+
+    Extra 'represents' rows for *other* objects are not flagged: an annotation
+    may legitimately represent several city objects (link_annotation_to_object),
+    and only the primary one is knowable from the annotation row.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            a.annotation_id,
+            a.annotation_uid,
+            a.primary_city_object_id
+        FROM usap_annotation AS a
+        WHERE a.primary_city_object_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM usap_annotation_object AS ao
+              WHERE ao.annotation_id = a.annotation_id
+                AND ao.city_object_id = a.primary_city_object_id
+                AND ao.relation_type = 'represents'
+          )
+        """
+    ).fetchall()
+
+    for row in rows:
+        report.add(
+            severity="error",
+            code="ANNOTATION_PRIMARY_OBJECT_LINK_MISSING",
+            message=(
+                "Annotation names a primary city object but has no matching "
+                "'represents' link."
+            ),
+            table="usap_annotation",
+            details={
+                "annotation_id": int(row["annotation_id"]),
+                "annotation_uid": row["annotation_uid"],
+                "primary_city_object_id": int(row["primary_city_object_id"]),
+            },
+        )
+
 
 def _validate_orphans(conn: sqlite3.Connection, report: ValidationReport) -> None:
     checks = [

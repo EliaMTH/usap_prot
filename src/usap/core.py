@@ -77,7 +77,7 @@ import os
 import sqlite3
 from collections import defaultdict, deque
 from contextlib import contextmanager
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 import json
@@ -1327,6 +1327,14 @@ class USAPPackage:
 
         Omitted fields are preserved.
         Passing None explicitly stores NULL.
+
+        Changing primary_city_object_id also moves the annotation's
+        'represents' link in usap_annotation_object, in the same transaction,
+        so the two representations of the primary object cannot diverge (see
+        elements_for_city_object). Only the *old primary object's* link row is
+        removed, so intentional secondary links survive the move; a separately
+        added 'represents' link to the old primary object is indistinguishable
+        from the primary one and is removed with it.
         """
         updates: list[str] = []
         params: list[Any] = []
@@ -1362,6 +1370,15 @@ class USAPPackage:
         params.append(annotation_id)
 
         with self.transaction():
+            # Read before the UPDATE: afterwards the old primary object is gone
+            # and its stale link row could not be found any more.
+            previous_primary_object_id: int | None = None
+
+            if primary_city_object_id is not _UNSET:
+                previous_primary_object_id = self._primary_city_object_id(
+                    annotation_id
+                )
+
             try:
                 cur = self.conn.execute(
                     f"""
@@ -1378,6 +1395,19 @@ class USAPPackage:
 
             if cur.rowcount != 1:
                 raise USAPError(f"Annotation not found: {annotation_id}")
+
+            if primary_city_object_id is not _UNSET:
+                new_primary_object_id = (
+                    None
+                    if primary_city_object_id is None
+                    else int(primary_city_object_id)
+                )
+
+                self._move_primary_object_link(
+                    annotation_id,
+                    previous_primary_object_id,
+                    new_primary_object_id,
+                )
 
             self.log_edit("update_annotation", "usap_annotation", annotation_id)
 
@@ -1723,6 +1753,57 @@ class USAPPackage:
             (annotation_id, city_object_id, relation_type),
         )
 
+    def _primary_city_object_id(self, annotation_id: int) -> int | None:
+        row = self.conn.execute(
+            """
+            SELECT primary_city_object_id
+            FROM usap_annotation
+            WHERE annotation_id = ?
+            """,
+            (annotation_id,),
+        ).fetchone()
+
+        if row is None or row["primary_city_object_id"] is None:
+            return None
+
+        return int(row["primary_city_object_id"])
+
+    def _move_primary_object_link(
+        self,
+        annotation_id: int,
+        previous_city_object_id: int | None,
+        new_city_object_id: int | None,
+    ) -> None:
+        """
+        Keep usap_annotation_object in step with primary_city_object_id.
+
+        Caller must already be inside a transaction, so the column and the link
+        row move together or not at all.
+
+        Re-stating the same primary object is not a no-op: the insert repairs a
+        missing link row (annotations created with link_primary_object=False).
+        """
+        if (
+            previous_city_object_id is not None
+            and previous_city_object_id != new_city_object_id
+        ):
+            self.conn.execute(
+                """
+                DELETE FROM usap_annotation_object
+                WHERE annotation_id = ?
+                  AND city_object_id = ?
+                  AND relation_type = 'represents'
+                """,
+                (annotation_id, previous_city_object_id),
+            )
+
+        if new_city_object_id is not None:
+            self._link_annotation_object(
+                annotation_id,
+                new_city_object_id,
+                "represents",
+            )
+
     # ---------------------------------------------------------------------
     # Queries
     # ---------------------------------------------------------------------
@@ -1976,6 +2057,7 @@ class USAPPackage:
         include_descendants: bool = True,
         graph_name: str = DEFAULT_GRAPH_NAME,
         expand: bool = False,
+        relationship_types: Sequence[str] = ("represents",),
     ) -> list[dict[str, Any]]:
         """
         Query a city object and optionally its descendants, then return
@@ -1983,10 +2065,19 @@ class USAPPackage:
 
         An annotation counts as belonging to a city object if it is linked via
         usap_annotation_object OR names it as its primary_city_object_id. Those
-        two should always agree (create_annotation links the primary object),
-        but matching both means an annotation can never silently drop out of
-        this query if they ever diverge.
+        two are kept in agreement by the write paths (create_annotation and
+        update_annotation both maintain the 'represents' link), but matching
+        both means an annotation can never silently drop out of this query if
+        they ever diverge.
+
+        relationship_types selects which usap_annotation_object rows count as
+        "belongs to this object". It defaults to ('represents',) because other
+        link types (concerns, derivedFrom, ...) say something *about* an object
+        without claiming its elements. Pass more types to follow them too, or an
+        empty sequence to match on primary_city_object_id alone.
         """
+        relation_types = tuple(relationship_types)
+
         city_object = self.conn.execute(
             """
             SELECT city_object_id
@@ -2023,15 +2114,38 @@ class USAPPackage:
             return []
 
         # Chunked so a huge descendant set cannot exceed the SQLite variable
-        # limit; the id list is bound twice per query, hence the halved chunk.
+        # limit; the id list is bound twice per query, hence the halved chunk,
+        # and the relation types take variables of their own.
         # An annotation linked to objects in different chunks returns its
         # blocks more than once, so rows are deduplicated by block id.
         rows_by_block_id: dict[int, sqlite3.Row] = {}
-        chunk_size = _MAX_SQL_IN_VARS // 2
+        chunk_size = (_MAX_SQL_IN_VARS - len(relation_types)) // 2
+
+        if chunk_size < 1:
+            raise USAPError(
+                f"Too many relationship_types for one query: {len(relation_types)}"
+            )
+
+        relation_placeholders = ",".join("?" for _ in relation_types)
 
         for chunk_index in range(0, len(object_ids), chunk_size):
             chunk = object_ids[chunk_index : chunk_index + chunk_size]
             placeholders = ",".join("?" for _ in chunk)
+
+            link_branch = ""
+            params: list[Any] = []
+
+            if relation_types:
+                link_branch = f"""
+                    SELECT ao.annotation_id
+                    FROM usap_annotation_object AS ao
+                    WHERE ao.city_object_id IN ({placeholders})
+                      AND ao.relation_type IN ({relation_placeholders})
+                    UNION
+                """
+                params.extend([*chunk, *relation_types])
+
+            params.extend(chunk)
 
             rows = self.conn.execute(
                 f"""
@@ -2049,16 +2163,13 @@ class USAPPackage:
                     mb.payload
                 FROM usap_membership_block AS mb
                 WHERE mb.annotation_id IN (
-                    SELECT ao.annotation_id
-                    FROM usap_annotation_object AS ao
-                    WHERE ao.city_object_id IN ({placeholders})
-                    UNION
+                    {link_branch}
                     SELECT a.annotation_id
                     FROM usap_annotation AS a
                     WHERE a.primary_city_object_id IN ({placeholders})
                 )
                 """,
-                [*chunk, *chunk],
+                params,
             ).fetchall()
 
             for row in rows:

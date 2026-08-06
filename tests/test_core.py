@@ -196,10 +196,62 @@ def test_city_object_query_finds_annotation_without_object_link(tmp_path: Path) 
         annotation_ids = {block["annotation_id"] for block in blocks}
         assert unlinked_id in annotation_ids
 
-        # Validation of this fixture rides along here instead of having a
-        # dedicated (redundant) test.
+        # The query tolerates the divergence, but the package is not healthy:
+        # link_primary_object=False breaks the primary-object invariant, and
+        # validation must say so rather than let it pass silently.
         report = pkg.validate_report()
-        assert report.issues == [], [i.format() for i in report.issues]
+
+        assert [issue.code for issue in report.issues] == [
+            "ANNOTATION_PRIMARY_OBJECT_LINK_MISSING"
+        ], [i.format() for i in report.issues]
+        assert report.issues[0].details["annotation_id"] == unlinked_id
+
+    finally:
+        pkg.close()
+
+
+def test_city_object_query_follows_only_representing_links(tmp_path: Path) -> None:
+    # 'derivedFrom' says the claim was informed by an object, not that it
+    # covers that object's geometry. Following every link type would report the
+    # roof faces as elements of the survey object the roof claim came from.
+    db_path = tmp_path / "test.usap.gpkg"
+
+    pkg, _asset_part_id, _roof_class_id, annotation_id = build_tiny_package(db_path)
+
+    try:
+        survey_id = pkg.create_city_object(object_uid="survey_object_7")
+
+        pkg.link_annotation_to_object(
+            annotation_id=annotation_id,
+            city_object_id=survey_id,
+            relation_type="derivedFrom",
+        )
+
+        # include_descendants=False keeps this about relation types alone: a
+        # freshly created object has no closure rows to expand.
+        assert pkg.elements_for_city_object(
+            "survey_object_7",
+            include_descendants=False,
+        ) == []
+
+        followed = pkg.elements_for_city_object(
+            "survey_object_7",
+            include_descendants=False,
+            relationship_types=("represents", "derivedFrom"),
+        )
+
+        assert {block["annotation_id"] for block in followed} == {annotation_id}
+
+        # The object it does represent is unaffected, and still reachable with
+        # link following switched off entirely (the primary-column path).
+        for relationship_types in [("represents",), ()]:
+            roof_blocks = pkg.elements_for_city_object(
+                "building_1_roof_1",
+                include_descendants=False,
+                relationship_types=relationship_types,
+            )
+
+            assert {block["annotation_id"] for block in roof_blocks} == {annotation_id}
 
     finally:
         pkg.close()

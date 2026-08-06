@@ -349,6 +349,84 @@ def test_batch_replace_preserves_omitted_fields(tmp_path: Path) -> None:
         assert matches_new[0]["annotation_uid"] == "ann_preserve"
         assert matches_old == []
 
+def test_batch_replace_moves_primary_object_link(tmp_path: Path) -> None:
+    # Re-applying a batch entry against a different city object moves the
+    # annotation. The batch path used to add the new link without removing the
+    # old one, leaving the annotation answering queries for both objects.
+    db_path = tmp_path / "replace_move.usap.gpkg"
+    las_path = tmp_path / "tiny.las"
+
+    _write_tiny_las(las_path, point_count=10)
+
+    with USAPPackage.create(
+        db_path,
+        overwrite=True,
+    ) as pkg:
+        citygml_vocab = seed_default_citygml_vocabulary(pkg)
+
+        for uid in ("roof_a", "roof_b"):
+            pkg.create_city_object(
+                object_uid=uid,
+                semantic_class_id=citygml_vocab.by_name["RoofSurface"],
+            )
+
+        las = register_las_asset(pkg, las_path)
+
+        def batch_for(object_uid: str) -> dict:
+            return {
+                "annotations": [
+                    {
+                        "annotation_uid": "ann_moved",
+                        "concept": "RoofSurface",
+                        "city_object_uid": object_uid,
+                        "memberships": [
+                            {
+                                "asset_part_id": las.asset_part_id,
+                                "element_kind": "point",
+                                "element_indices": [1, 2],
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        apply_annotation_batch(pkg, batch_for("roof_a"))
+        apply_annotation_batch(
+            pkg,
+            batch_for("roof_b"),
+            replace_existing=True,
+        )
+
+        annotation = pkg.get_annotation(annotation_uid="ann_moved")
+
+        assert annotation is not None
+        assert annotation["primary_city_object_uid"] == "roof_b"
+
+        links = pkg.conn.execute(
+            """
+            SELECT co.object_uid
+            FROM usap_annotation_object AS ao
+            JOIN usap_city_object AS co
+                ON co.city_object_id = ao.city_object_id
+            WHERE ao.annotation_id = ?
+            """,
+            (annotation["annotation_id"],),
+        ).fetchall()
+
+        assert [row["object_uid"] for row in links] == ["roof_b"]
+
+        assert pkg.elements_for_city_object(
+            "roof_a",
+            include_descendants=False,
+        ) == []
+
+        moved = pkg.elements_for_city_object("roof_b", include_descendants=False)
+
+        assert {block["annotation_id"] for block in moved} == {
+            annotation["annotation_id"]
+        }
+
+
 def test_apply_annotation_batch_file(tmp_path: Path) -> None:
     # INGESTION.md procedure 3 relies on this file entry point for
     # standalone edits; it must behave exactly like the in-memory batch

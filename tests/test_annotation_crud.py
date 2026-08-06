@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_mesh_part, make_pkg
+from conftest import assert_package_valid, make_mesh_part, make_pkg
 from conftest import write_tiny_mesh as _write_tiny_mesh
 from usap import (
     ELEMENT_KIND_FACE,
@@ -296,3 +296,195 @@ def test_integrity_violations_raise_usap_error(tmp_path: Path) -> None:
                 element_kind="face",
                 element_indices=[1],
             )
+
+
+def _represents_links(pkg: USAPPackage, annotation_id: int) -> list[int]:
+    """City objects the annotation carries a 'represents' link to."""
+    rows = pkg.conn.execute(
+        """
+        SELECT city_object_id
+        FROM usap_annotation_object
+        WHERE annotation_id = ?
+          AND relation_type = 'represents'
+        ORDER BY city_object_id
+        """,
+        (annotation_id,),
+    ).fetchall()
+
+    return [int(row["city_object_id"]) for row in rows]
+
+
+def _moveable_annotation(pkg: USAPPackage) -> tuple[int, int, int]:
+    """An annotation on object_a, plus the ids of object_a and object_b."""
+    part = make_mesh_part(pkg)
+    pkg.create_semantic_class(scheme="s", class_uri="s:Roof", local_name="Roof")
+
+    object_a = pkg.create_city_object(object_uid="object_a")
+    object_b = pkg.create_city_object(object_uid="object_b")
+
+    annotation = pkg.annotate_elements(
+        concept="Roof",
+        annotation_uid="ann_move",
+        asset_part_id=part,
+        element_kind="face",
+        element_indices=[1, 2],
+        city_object_id=object_a,
+    )
+
+    return int(annotation["annotation_id"]), object_a, object_b
+
+
+def test_update_annotation_moves_primary_object_link(tmp_path: Path) -> None:
+    # The primary city object is recorded twice: as a column on the annotation
+    # and as a 'represents' link row. Moving it must move both, otherwise the
+    # annotation stays visible under the object it no longer belongs to.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id, object_a, object_b = _moveable_annotation(pkg)
+
+        assert _represents_links(pkg, annotation_id) == [object_a]
+
+        updated = pkg.update_annotation(
+            annotation_id,
+            primary_city_object_id=object_b,
+        )
+
+        assert updated["primary_city_object_id"] == object_b
+        assert _represents_links(pkg, annotation_id) == [object_b]
+
+        assert pkg.elements_for_city_object(
+            "object_a",
+            include_descendants=False,
+        ) == []
+
+        moved = pkg.elements_for_city_object(
+            "object_b",
+            include_descendants=False,
+        )
+
+        assert {block["annotation_id"] for block in moved} == {annotation_id}
+
+        assert_package_valid(pkg)
+
+
+def test_update_annotation_clearing_primary_object_removes_link(
+    tmp_path: Path,
+) -> None:
+    # Detaching an annotation from its city object must not leave the link row
+    # behind: the annotation would still answer queries for that object.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id, _object_a, _object_b = _moveable_annotation(pkg)
+
+        updated = pkg.update_annotation(
+            annotation_id,
+            primary_city_object_id=None,
+        )
+
+        assert updated["primary_city_object_id"] is None
+        assert _represents_links(pkg, annotation_id) == []
+
+        assert pkg.elements_for_city_object(
+            "object_a",
+            include_descendants=False,
+        ) == []
+
+        assert_package_valid(pkg)
+
+
+def test_update_annotation_keeps_other_object_links(tmp_path: Path) -> None:
+    # Only the *old primary* link is rewritten. Links of other kinds record
+    # separate facts (here: which survey the claim came from) and must survive
+    # a move of the primary object.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id, _object_a, object_b = _moveable_annotation(pkg)
+
+        survey_id = pkg.create_city_object(object_uid="survey_object_7")
+
+        pkg.link_annotation_to_object(
+            annotation_id=annotation_id,
+            city_object_id=survey_id,
+            relation_type="derivedFrom",
+        )
+
+        pkg.update_annotation(annotation_id, primary_city_object_id=object_b)
+
+        assert _represents_links(pkg, annotation_id) == [object_b]
+
+        links = pkg.conn.execute(
+            """
+            SELECT city_object_id, relation_type
+            FROM usap_annotation_object
+            WHERE annotation_id = ?
+              AND relation_type = 'derivedFrom'
+            """,
+            (annotation_id,),
+        ).fetchall()
+
+        assert [int(row["city_object_id"]) for row in links] == [survey_id]
+
+        assert_package_valid(pkg)
+
+
+def test_update_annotation_link_move_rolls_back_with_its_transaction(
+    tmp_path: Path,
+) -> None:
+    # The column and the link row must move together or not at all: a caller
+    # transaction that fails afterwards must not leave the annotation pointing
+    # at one object while the link table points at another.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id, object_a, object_b = _moveable_annotation(pkg)
+
+        with pytest.raises(RuntimeError, match="caller failed"):
+            with pkg.transaction():
+                pkg.update_annotation(
+                    annotation_id,
+                    primary_city_object_id=object_b,
+                )
+
+                raise RuntimeError("caller failed")
+
+        annotation = pkg.get_annotation(annotation_id)
+
+        assert annotation is not None
+        assert annotation["primary_city_object_id"] == object_a
+        assert _represents_links(pkg, annotation_id) == [object_a]
+
+        assert_package_valid(pkg)
+
+
+def test_update_annotation_repairs_missing_primary_object_link(
+    tmp_path: Path,
+) -> None:
+    # Re-stating the current primary object is the repair path for an
+    # annotation created with link_primary_object=False (or written by raw
+    # SQL): validation flags it, and setting the same value fixes it.
+    with make_pkg(tmp_path) as pkg:
+        part = make_mesh_part(pkg)
+        roof_class_id = pkg.create_semantic_class(
+            scheme="s",
+            class_uri="s:Roof",
+            local_name="Roof",
+        )
+
+        object_a = pkg.create_city_object(object_uid="object_a")
+
+        annotation_id = pkg.create_annotation(
+            annotation_uid="ann_unlinked",
+            semantic_class_id=roof_class_id,
+            primary_city_object_id=object_a,
+            link_primary_object=False,
+        )
+
+        pkg.replace_annotation_membership(
+            annotation_id=annotation_id,
+            asset_part_id=part,
+            element_kind=ELEMENT_KIND_FACE,
+            element_indices=[1, 2],
+        )
+
+        assert _represents_links(pkg, annotation_id) == []
+        assert not pkg.validate_report().is_ok
+
+        pkg.update_annotation(annotation_id, primary_city_object_id=object_a)
+
+        assert _represents_links(pkg, annotation_id) == [object_a]
+        assert_package_valid(pkg)

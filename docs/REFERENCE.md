@@ -114,6 +114,13 @@ A semantic object, usually imported from CityGML, e.g. `building_1`, `building_1
 
 A semantic claim linked to one concept and optionally to one city object.
 
+The primary city object is stored both as `usap_annotation.primary_city_object_id` and
+as a `represents` row in `usap_annotation_object`; the SDK keeps the two in step, and
+`validate_report()` reports any disagreement. Other rows in `usap_annotation_object`
+carry secondary links (`concerns`, `derivedFrom`, …); city-object queries follow
+`represents` links only unless asked otherwise
+(`elements_for_city_object(..., relationship_types=(...))`).
+
 **What belongs in USAP vs the semantic source.** USAP is authoritative for the *claim layer*: which elements, under which concept, with what status, confidence, and provenance. The CityGML/ADE (or other semantic source) is authoritative for the *meaning layer*: which concepts and objects exist, their
 properties, and their hierarchy. Accordingly, an annotation's `attributes` must hold **claim-level metadata only** — how/when/by what the claim was produced (`method`, `source`, `assessed_at`, and for value fields `unit`, `validAt`).
 Object properties (e.g., roof slope) stay in the semantic source, reachable through the linked city object, so there is exactly one authority for them and nothing to keep synchronized.
@@ -669,6 +676,13 @@ updated = pkg.update_annotation(
     confidence=0.9,
 )
 
+# Moving an annotation to another city object rewrites its 'represents' link
+# in the same transaction, so it stops answering queries for the old object.
+pkg.update_annotation(
+    annotation["annotation_id"],
+    primary_city_object_id=pkg.resolve_city_object("building_1_roof_2"),
+)
+
 pkg.delete_annotation(annotation["annotation_id"])
 ```
 
@@ -773,5 +787,6 @@ membership index bounds
 semantic class closure
 city object closure
 concept registry duplicates
+annotation primary object / 'represents' link agreement
 duplicate relationship edges (warning)
 ```

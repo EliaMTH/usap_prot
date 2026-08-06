@@ -15,12 +15,12 @@ class VocabularyResult:
     by_uri: dict[str, int]
 
 
-# Anchored to the repo root (src/usap/ -> repo), not the process CWD, so the
-# default vocabularies load no matter where the caller runs from.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+# Shipped inside the package (see pyproject package-data), not next to the
+# repo checkout, so the default vocabularies load from a plain wheel install too.
+_VOCABULARY_DIR = Path(__file__).resolve().parent / "data" / "vocabularies"
 
-DEFAULT_CITYGML_VOCABULARY_PATH = _REPO_ROOT / "vocabularies" / "citygml_3_0_mvp.json"
-DEFAULT_ADE_VOCABULARY_PATH = _REPO_ROOT / "vocabularies" / "usap_ade_prototype.json"
+DEFAULT_CITYGML_VOCABULARY_PATH = _VOCABULARY_DIR / "citygml_3_0_mvp.json"
+DEFAULT_ADE_VOCABULARY_PATH = _VOCABULARY_DIR / "usap_ade_prototype.json"
 
 
 def seed_vocabulary_file(

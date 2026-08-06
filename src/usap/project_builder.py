@@ -73,10 +73,16 @@ def build_project_package(
     (see INGESTION.md for the full procedures).
 
     update=True opens the existing package instead of creating it
-    (overwrite is ignored): every build step is idempotent, so re-listing
-    already-registered vocabularies/assets is harmless, new entries are
-    added, and annotation batches are applied with replace_existing=True —
-    this is the editing procedure.
+    (overwrite is ignored): every build step is idempotent for entries that
+    are unchanged — re-listing an already-registered vocabulary or asset is a
+    no-op, while re-listing one whose kind, counts, or bounds changed raises
+    (see register_asset) — new entries are added, and annotation batches are
+    applied with replace_existing=True. This is the editing procedure.
+
+    The whole build is one transaction. A failure part-way leaves no package
+    at all for a fresh build, and an untouched one for update=True; without
+    that, a build that died after seeding concepts but before registering
+    assets left a package that looked real and was not.
     """
     base_path = Path(base_dir)
 
@@ -114,90 +120,107 @@ def build_project_package(
         )
 
     config_srs_id = config.get("srs_id")
+    validation_level = config.get("validation_level", "deep")
 
-    with pkg_context as pkg:
-        # Declared package CRS wins and is set before registration so extent
-        # blobs are encoded with it from the start.
-        if config_srs_id is not None:
+    try:
+        with pkg_context as pkg:
+            # One transaction around every step: the package is only ever
+            # observable as "before this build" or "after it succeeded".
+            # transaction() is re-entrant, so the inner per-step blocks
+            # become no-ops and commit with this one.
             with pkg.transaction():
-                set_package_srs(
-                    pkg.conn,
-                    int(config_srs_id),
-                    definition_wkt=config.get("srs_wkt"),
+                # Declared package CRS wins and is set before registration so
+                # extent blobs are encoded with it from the start.
+                if config_srs_id is not None:
+                    set_package_srs(
+                        pkg.conn,
+                        int(config_srs_id),
+                        definition_wkt=config.get("srs_wkt"),
+                    )
+
+                _seed_config_vocabularies(
+                    pkg,
+                    config=config,
+                    base_path=base_path,
                 )
 
-        _seed_config_vocabularies(
-            pkg,
-            config=config,
-            base_path=base_path,
-        )
+                citygml_result = _import_config_citygml(
+                    pkg,
+                    config=config,
+                    base_path=base_path,
+                )
 
-        citygml_result = _import_config_citygml(
-            pkg,
-            config=config,
-            base_path=base_path,
-        )
+                las_results = _register_config_las(
+                    pkg,
+                    config=config,
+                    base_path=base_path,
+                )
 
-        las_results = _register_config_las(
-            pkg,
-            config=config,
-            base_path=base_path,
-        )
+                mesh_results = _register_config_meshes(
+                    pkg,
+                    config=config,
+                    base_path=base_path,
+                )
 
-        mesh_results = _register_config_meshes(
-            pkg,
-            config=config,
-            base_path=base_path,
-        )
+                # No declared CRS: when the LAS files agree on exactly one
+                # EPSG, promote it to the extents layer (single-CRS-per-
+                # package assumption). Mixed or no CRS -> undefined (-1).
+                if config_srs_id is None:
+                    sniffed = {
+                        (epsg_from_wkt(item.crs_wkt), item.crs_wkt)
+                        for item in las_results
+                        if epsg_from_wkt(item.crs_wkt) is not None
+                    }
 
-        # No declared CRS: when the LAS files agree on exactly one EPSG,
-        # promote it to the extents layer (single-CRS-per-package
-        # assumption). Mixed or no CRS -> the layer stays undefined (-1).
-        if config_srs_id is None:
-            sniffed = {
-                (epsg_from_wkt(item.crs_wkt), item.crs_wkt)
-                for item in las_results
-                if epsg_from_wkt(item.crs_wkt) is not None
-            }
+                    if len({code for code, _ in sniffed}) == 1:
+                        code, wkt = next(iter(sniffed))
+                        set_package_srs(pkg.conn, code, definition_wkt=wkt)
 
-            if len({code for code, _ in sniffed}) == 1:
-                code, wkt = next(iter(sniffed))
+                batch_results = _apply_config_batches(
+                    pkg,
+                    config=config,
+                    base_path=base_path,
+                    replace_existing=update,
+                )
 
-                with pkg.transaction():
-                    set_package_srs(pkg.conn, code, definition_wkt=wkt)
+                concept_count = len(pkg.list_accepted_concepts())
 
-        batch_results = _apply_config_batches(
-            pkg,
-            config=config,
-            base_path=base_path,
-            replace_existing=update,
-        )
+                # Inside the transaction, so a package that fails validation
+                # is rolled back rather than left on disk to be opened.
+                report = pkg.validate_report(level=validation_level)
 
-        concept_count = len(pkg.list_accepted_concepts())
+                if not report.is_ok:
+                    formatted = "\n".join(
+                        issue.format() for issue in report.issues
+                    )
 
-        report = pkg.validate_report()
+                    raise USAPError(
+                        "Built project package failed validation:\n"
+                        f"{formatted}"
+                    )
 
-        if not report.is_ok:
-            formatted = "\n".join(issue.format() for issue in report.issues)
+            if manifest_path is not None:
+                manifest = _build_manifest(
+                    pkg,
+                    db_path=db_path,
+                    citygml_result=citygml_result,
+                    las_results=las_results,
+                    mesh_results=mesh_results,
+                )
 
-            raise USAPError(
-                "Built project package failed validation:\n"
-                f"{formatted}"
-            )
+                manifest_path.write_text(
+                    json.dumps(manifest, indent=2),
+                    encoding="utf-8",
+                )
+    except BaseException:
+        # A rolled-back new package is an empty schema, not a package: the
+        # file itself is this build's output and must go with it. An
+        # update=True failure rolled back to the previous valid state, which
+        # is exactly what should stay on disk.
+        if not update and db_path.exists():
+            db_path.unlink()
 
-        if manifest_path is not None:
-            manifest = _build_manifest(
-                pkg,
-                db_path=db_path,
-                citygml_result=citygml_result,
-                las_results=las_results,
-                mesh_results=mesh_results,
-            )
-
-            manifest_path.write_text(
-                json.dumps(manifest, indent=2),
-                encoding="utf-8",
-            )
+        raise
 
     return ProjectBuildResult(
         db_path=db_path,

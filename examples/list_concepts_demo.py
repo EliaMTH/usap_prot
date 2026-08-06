@@ -47,7 +47,6 @@ def main() -> None:
 
         with USAPPackage.create(
             db_path,
-            schema_path="sql/schema.sql",
             overwrite=True,
         ) as pkg:
             seed_default_citygml_vocabulary(pkg)

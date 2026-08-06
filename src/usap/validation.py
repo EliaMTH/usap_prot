@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from .constants import DEFAULT_ENCODING, VALUE_DTYPES
-from .encoding import decode_u32_zlib, decode_value_block
+from ._util import sha256_file
+from .constants import (
+    ANNOTATION_STATUSES,
+    CITY_OBJECT_STATUSES,
+    CONFIDENCE_RANGE,
+    CONTAINMENT_RELATIONSHIP_TYPES,
+    DEFAULT_ENCODING,
+    VALUE_DTYPES,
+)
+from .encoding import decode_u32_zlib_array, decode_value_block
 from .errors import USAPError
 from .geopackage import (
     GPKG_APPLICATION_ID,
@@ -87,20 +96,49 @@ class ValidationReport:
             print(issue.format())
 
 
+VALIDATION_LEVELS = ("basic", "deep", "external")
+
+
 def _count(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> int:
     row = conn.execute(sql, params).fetchone()
     return int(row["n"])
 
 
-def validate_connection(conn: sqlite3.Connection) -> ValidationReport:
+def validate_connection(
+    conn: sqlite3.Connection,
+    level: str = "deep",
+) -> ValidationReport:
     """
-    Validate a USAP SQLite connection.
+    Validate a USAP package, at one of three levels.
 
-    This function intentionally works only from the database connection.
-    It does not require geometry files, CityGML, CityJSON, or external assets.
+    ``basic``     structure only, entirely in SQL: profile, GeoPackage
+                  metadata and layers, concept registry, orphan references,
+                  primary-object link agreement, duplicate edges, class
+                  closure. Never reads a block payload, so it stays cheap on
+                  a package with millions of membership blocks.
 
-    It validates internal USAP consistency, not external asset correctness.
+    ``deep``      (default) everything in ``basic``, plus every membership
+                  and value payload decoded and checked against its stored
+                  counts/bounds, containment acyclicity, asset-extent
+                  recomputation, and annotation domain constraints
+                  (status/confidence/attributes JSON).
+
+    ``external``  everything in ``deep``, plus each registered asset file:
+                  does it still exist, and does its SHA-256 still match the
+                  hash recorded at registration. Opt-in because hashing a
+                  10 GB point cloud costs minutes.
+
+    ``basic`` and ``deep`` work from the database connection alone — they
+    need no geometry files, CityGML, or CityJSON. Only ``external`` touches
+    the filesystem.
     """
+    if level not in VALIDATION_LEVELS:
+        raise USAPError(
+            f"Unknown validation level {level!r}. "
+            f"Use one of: {', '.join(VALIDATION_LEVELS)}."
+        )
+
+    deep = level in ("deep", "external")
 
     report = ValidationReport()
 
@@ -112,16 +150,23 @@ def validate_connection(conn: sqlite3.Connection) -> ValidationReport:
     try:
         _validate_geopackage_metadata(conn, report)
         _validate_gis_layers(conn, report)
-        _validate_asset_extents(conn, report)
         _validate_profile(conn, report)
         _validate_semantic_class_registry(conn, report)
         _validate_orphans(conn, report)
         _validate_annotation_object_links(conn, report)
-        _validate_membership_blocks(conn, report)
-        _validate_value_blocks(conn, report)
+        _validate_membership_blocks(conn, report, decode_payloads=deep)
+        _validate_value_blocks(conn, report, decode_payloads=deep)
         _validate_semantic_class_closure(conn, report)
         _validate_city_object_relationships(conn, report)
-        _validate_city_object_closure(conn, report)
+
+        if deep:
+            _validate_asset_extents(conn, report)
+            _validate_asset_crs(conn, report)
+            _validate_city_object_graph(conn, report)
+            _validate_annotation_domain(conn, report)
+
+        if level == "external":
+            _validate_external_assets(conn, report)
     finally:
         conn.row_factory = original_row_factory
 
@@ -404,9 +449,21 @@ def _validate_orphans(conn: sqlite3.Connection, report: ValidationReport) -> Non
 def _validate_membership_blocks(
     conn: sqlite3.Connection,
     report: ValidationReport,
+    *,
+    decode_payloads: bool,
 ) -> None:
+    """
+    Check membership blocks.
+
+    With decode_payloads=False the payload column is not even selected: the
+    blobs are the bulk of a large package, and reading them off disk is the
+    cost 'basic' exists to avoid. Everything checkable from the block's own
+    columns is still checked.
+    """
+    payload_column = "mb.payload," if decode_payloads else "NULL AS payload,"
+
     rows = conn.execute(
-        """
+        f"""
         SELECT
             mb.membership_block_id,
             mb.annotation_id,
@@ -418,7 +475,7 @@ def _validate_membership_blocks(
             mb.element_count,
             mb.min_element_index,
             mb.max_element_index,
-            mb.payload,
+            {payload_column}
 
             ap.element_kind AS asset_part_element_kind,
             ap.element_count AS asset_part_element_count
@@ -500,8 +557,32 @@ def _validate_membership_blocks(
                 row_id=block_id,
             )
 
+        asset_part_element_kind = row["asset_part_element_kind"]
+
+        if asset_part_element_kind is not None:
+            asset_part_element_kind = int(asset_part_element_kind)
+
+            if int(row["element_kind"]) != asset_part_element_kind:
+                report.add(
+                    severity="error",
+                    code="MEMBERSHIP_ELEMENT_KIND_MISMATCH",
+                    message=(
+                        "Membership element_kind differs from asset part "
+                        "element_kind."
+                    ),
+                    table="usap_membership_block",
+                    row_id=block_id,
+                    details={
+                        "membership_element_kind": int(row["element_kind"]),
+                        "asset_part_element_kind": asset_part_element_kind,
+                    },
+                )
+
+        if not decode_payloads:
+            continue
+
         try:
-            offsets = decode_u32_zlib(row["payload"])
+            offsets = decode_u32_zlib_array(row["payload"])
         except Exception as exc:
             report.add(
                 severity="error",
@@ -512,7 +593,7 @@ def _validate_membership_blocks(
             )
             continue
 
-        if len(offsets) != declared_element_count:
+        if offsets.size != declared_element_count:
             report.add(
                 severity="error",
                 code="MEMBERSHIP_COUNT_MISMATCH",
@@ -524,11 +605,16 @@ def _validate_membership_blocks(
                 row_id=block_id,
                 details={
                     "declared": declared_element_count,
-                    "decoded": len(offsets),
+                    "decoded": int(offsets.size),
                 },
             )
 
-        if len(offsets) != len(set(offsets)):
+        # Array comparisons throughout: validating a package that annotates
+        # a 10 GB point cloud means decoding every block, so the per-block
+        # work stays vectorized.
+        sorted_offsets = np.sort(offsets)
+
+        if np.any(np.diff(sorted_offsets) == 0):
             report.add(
                 severity="error",
                 code="DUPLICATE_MEMBERSHIP_OFFSETS",
@@ -537,7 +623,7 @@ def _validate_membership_blocks(
                 row_id=block_id,
             )
 
-        if offsets != sorted(offsets):
+        if not np.array_equal(offsets, sorted_offsets):
             report.add(
                 severity="warning",
                 code="UNSORTED_MEMBERSHIP_OFFSETS",
@@ -546,24 +632,24 @@ def _validate_membership_blocks(
                 row_id=block_id,
             )
 
-        for offset in offsets:
-            if offset < 0 or offset >= block_size:
-                report.add(
-                    severity="error",
-                    code="OFFSET_OUTSIDE_BLOCK",
-                    message="Decoded offset is outside the block range.",
-                    table="usap_membership_block",
-                    row_id=block_id,
-                    details={
-                        "offset": offset,
-                        "block_size": block_size,
-                    },
-                )
-                break
+        outside = offsets[offsets >= block_size]
 
-        if offsets:
-            actual_min = block_start + min(offsets)
-            actual_max = block_start + max(offsets)
+        if outside.size:
+            report.add(
+                severity="error",
+                code="OFFSET_OUTSIDE_BLOCK",
+                message="Decoded offset is outside the block range.",
+                table="usap_membership_block",
+                row_id=block_id,
+                details={
+                    "offset": int(outside[0]),
+                    "block_size": block_size,
+                },
+            )
+
+        if offsets.size:
+            actual_min = block_start + int(sorted_offsets[0])
+            actual_max = block_start + int(sorted_offsets[-1])
 
             if actual_min != min_element_index:
                 report.add(
@@ -613,34 +699,22 @@ def _validate_membership_blocks(
                         },
                     )
 
-        asset_part_element_kind = row["asset_part_element_kind"]
-
-        if asset_part_element_kind is not None:
-            asset_part_element_kind = int(asset_part_element_kind)
-
-            if int(row["element_kind"]) != asset_part_element_kind:
-                report.add(
-                    severity="error",
-                    code="MEMBERSHIP_ELEMENT_KIND_MISMATCH",
-                    message=(
-                        "Membership element_kind differs from asset part "
-                        "element_kind."
-                    ),
-                    table="usap_membership_block",
-                    row_id=block_id,
-                    details={
-                        "membership_element_kind": int(row["element_kind"]),
-                        "asset_part_element_kind": asset_part_element_kind,
-                    },
-                )
-
 
 def _validate_value_blocks(
     conn: sqlite3.Connection,
     report: ValidationReport,
+    *,
+    decode_payloads: bool,
 ) -> None:
+    """
+    Check value blocks. See _validate_membership_blocks on decode_payloads:
+    the stored value_min/value_max can only be confirmed against the payload,
+    so that comparison is the part 'basic' gives up.
+    """
+    payload_column = "vb.payload," if decode_payloads else "NULL AS payload,"
+
     rows = conn.execute(
-        """
+        f"""
         SELECT
             vb.value_block_id,
             vb.annotation_id,
@@ -651,7 +725,7 @@ def _validate_value_blocks(
             vb.value_dtype,
             vb.value_min,
             vb.value_max,
-            vb.payload,
+            {payload_column}
 
             ap.element_kind AS asset_part_element_kind,
             ap.element_count AS asset_part_element_count
@@ -781,6 +855,9 @@ def _validate_value_blocks(
                 expected_next_start, block_start + element_count
             )
 
+            if not decode_payloads:
+                continue
+
             try:
                 values = decode_value_block(
                     row["payload"], value_dtype, element_count
@@ -864,6 +941,195 @@ def _validate_value_blocks(
             )
 
 
+def _validate_annotation_domain(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    """
+    Check the annotation fields the SDK constrains on write.
+
+    create_annotation/update_annotation refuse these values, so a package
+    containing them was written by raw SQL or by an older build. They matter
+    because readers act on them: an unknown status drops out of every status
+    filter, a confidence outside [0, 1] cannot be compared with any other,
+    and attributes that are not JSON cannot be read back at all.
+    """
+    minimum, maximum = CONFIDENCE_RANGE
+
+    checks = [
+        (
+            "ANNOTATION_UNKNOWN_STATUS",
+            "Annotation status is not one of the recognised values.",
+            f"""
+            SELECT annotation_id, annotation_uid, status AS value
+            FROM usap_annotation
+            WHERE status NOT IN ({",".join("?" for _ in ANNOTATION_STATUSES)})
+            """,
+            ANNOTATION_STATUSES,
+        ),
+        (
+            "ANNOTATION_CONFIDENCE_OUT_OF_RANGE",
+            f"Annotation confidence is outside [{minimum}, {maximum}].",
+            """
+            SELECT annotation_id, annotation_uid, confidence AS value
+            FROM usap_annotation
+            WHERE confidence IS NOT NULL
+              AND (confidence < ? OR confidence > ?)
+            """,
+            (minimum, maximum),
+        ),
+        (
+            "ANNOTATION_ATTRIBUTES_NOT_JSON",
+            "Annotation attributes_json does not parse as JSON.",
+            """
+            SELECT annotation_id, annotation_uid, attributes_json AS value
+            FROM usap_annotation
+            WHERE attributes_json IS NOT NULL
+              AND json_valid(attributes_json) = 0
+            """,
+            (),
+        ),
+    ]
+
+    for code, message, sql, params in checks:
+        for row in conn.execute(sql, params).fetchall():
+            report.add(
+                severity="error",
+                code=code,
+                message=message,
+                table="usap_annotation",
+                row_id=int(row["annotation_id"]),
+                details={
+                    "annotation_uid": row["annotation_uid"],
+                    "value": row["value"],
+                },
+            )
+
+    unknown_object_status = conn.execute(
+        f"""
+        SELECT city_object_id, object_uid, object_status
+        FROM usap_city_object
+        WHERE object_status NOT IN (
+            {",".join("?" for _ in CITY_OBJECT_STATUSES)}
+        )
+        """,
+        CITY_OBJECT_STATUSES,
+    ).fetchall()
+
+    for row in unknown_object_status:
+        report.add(
+            severity="error",
+            code="CITY_OBJECT_UNKNOWN_STATUS",
+            message="City object status is not one of the recognised values.",
+            table="usap_city_object",
+            row_id=int(row["city_object_id"]),
+            details={
+                "object_uid": row["object_uid"],
+                "value": row["object_status"],
+            },
+        )
+
+
+def verify_assets(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """
+    Re-check every registered asset file against what was recorded for it.
+
+    Returns one dict per asset with ``status``:
+        ``ok``        the file is there and its hash still matches
+        ``missing``   the uri does not resolve to an existing file
+        ``changed``   the file exists but its SHA-256 differs
+        ``unhashed``  registered with compute_hash=False, nothing to compare
+
+    USAP annotations are bound to *one immutable version* of an external
+    file by element index; if the file changed, the indices may now point at
+    different elements, and nothing in the package can detect that on its
+    own. Hashing is a full read of the file, so this is never part of a
+    normal validate_report() — it is the 'external' level, or call it
+    directly.
+    """
+    rows = conn.execute(
+        """
+        SELECT asset_id, uri, content_hash
+        FROM usap_asset
+        ORDER BY asset_id
+        """
+    ).fetchall()
+
+    results: list[dict[str, Any]] = []
+
+    for row in rows:
+        uri = row["uri"]
+        recorded_hash = row["content_hash"]
+        path = Path(uri)
+
+        if not path.exists():
+            status = "missing"
+            actual_hash = None
+        elif recorded_hash is None:
+            status = "unhashed"
+            actual_hash = None
+        else:
+            actual_hash = sha256_file(path)
+            status = "ok" if actual_hash == recorded_hash else "changed"
+
+        results.append(
+            {
+                "asset_id": int(row["asset_id"]),
+                "uri": uri,
+                "status": status,
+                "recorded_hash": recorded_hash,
+                "actual_hash": actual_hash,
+            }
+        )
+
+    return results
+
+
+def _validate_external_assets(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    for item in verify_assets(conn):
+        if item["status"] == "missing":
+            report.add(
+                severity="error",
+                code="ASSET_FILE_MISSING",
+                message="Registered asset file does not exist.",
+                table="usap_asset",
+                row_id=item["asset_id"],
+                details={"uri": item["uri"]},
+            )
+        elif item["status"] == "changed":
+            report.add(
+                severity="error",
+                code="ASSET_FILE_CHANGED",
+                message=(
+                    "Registered asset file no longer matches the hash "
+                    "recorded at registration; element indices may no "
+                    "longer mean what they meant."
+                ),
+                table="usap_asset",
+                row_id=item["asset_id"],
+                details={
+                    "uri": item["uri"],
+                    "recorded_hash": item["recorded_hash"],
+                    "actual_hash": item["actual_hash"],
+                },
+            )
+        elif item["status"] == "unhashed":
+            report.add(
+                severity="warning",
+                code="ASSET_NOT_HASHED",
+                message=(
+                    "Asset was registered without a content hash, so a "
+                    "change to it cannot be detected."
+                ),
+                table="usap_asset",
+                row_id=item["asset_id"],
+                details={"uri": item["uri"]},
+            )
+
+
 def _validate_semantic_class_closure(
     conn: sqlite3.Connection,
     report: ValidationReport,
@@ -916,82 +1182,89 @@ def _validate_semantic_class_closure(
         )
 
 
-def _validate_city_object_closure(
+def _validate_city_object_graph(
     conn: sqlite3.Connection,
     report: ValidationReport,
 ) -> None:
-    graph_rows = conn.execute(
-        """
-        SELECT DISTINCT graph_name
+    """
+    Flag containment cycles per named graph.
+
+    "An object and its parts" is only meaningful if containment is acyclic:
+    a cycle makes each object on it its own part. Descendant queries survive
+    one (the recursive CTE deduplicates), but the package is stating something
+    it cannot mean, so it is an error rather than a silent oddity.
+
+    Only CONTAINMENT_RELATIONSHIP_TYPES edges are checked — the graph is typed,
+    and a cycle of adjacentTo edges is perfectly legitimate.
+    """
+    placeholders = ",".join("?" for _ in CONTAINMENT_RELATIONSHIP_TYPES)
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            graph_name,
+            parent_city_object_id,
+            child_city_object_id
         FROM usap_city_object_relationship
-        ORDER BY graph_name
-        """
+        WHERE relationship_type IN ({placeholders})
+        """,
+        CONTAINMENT_RELATIONSHIP_TYPES,
     ).fetchall()
 
-    graph_names = [row["graph_name"] for row in graph_rows]
+    edges_by_graph: dict[str, list[tuple[int, int]]] = {}
 
-    for graph_name in graph_names:
-        missing_self = conn.execute(
-            """
-            SELECT co.city_object_id
-            FROM usap_city_object AS co
-            LEFT JOIN usap_city_object_closure AS c
-                ON c.graph_name = ?
-               AND c.ancestor_city_object_id = co.city_object_id
-               AND c.descendant_city_object_id = co.city_object_id
-               AND c.depth = 0
-            WHERE c.ancestor_city_object_id IS NULL
-            """,
-            (graph_name,),
-        ).fetchall()
+    for row in rows:
+        edges_by_graph.setdefault(row["graph_name"], []).append(
+            (int(row["parent_city_object_id"]), int(row["child_city_object_id"]))
+        )
 
-        for row in missing_self:
+    for graph_name, edges in sorted(edges_by_graph.items()):
+        for object_id in _cycle_members(edges):
             report.add(
                 severity="error",
-                code="MISSING_CITY_OBJECT_SELF_CLOSURE",
+                code="CITY_OBJECT_GRAPH_CYCLE",
                 message=(
-                    "City object is missing depth-0 self closure row for graph."
+                    "City object takes part in a containment cycle, so it "
+                    "would be its own part."
                 ),
-                table="usap_city_object_closure",
-                row_id=int(row["city_object_id"]),
+                table="usap_city_object_relationship",
+                row_id=object_id,
                 details={"graph_name": graph_name},
             )
 
-        missing_direct_edges = conn.execute(
-            """
-            SELECT
-                r.relationship_id,
-                r.parent_city_object_id,
-                r.child_city_object_id
-            FROM usap_city_object_relationship AS r
-            LEFT JOIN usap_city_object_closure AS c
-                ON c.graph_name = r.graph_name
-               AND c.ancestor_city_object_id = r.parent_city_object_id
-               AND c.descendant_city_object_id = r.child_city_object_id
-               AND c.depth = 1
-            WHERE r.graph_name = ?
-              AND c.ancestor_city_object_id IS NULL
-            """,
-            (graph_name,),
-        ).fetchall()
 
-        for row in missing_direct_edges:
-            report.add(
-                severity="error",
-                code="MISSING_CITY_OBJECT_CLOSURE_DIRECT",
-                message=(
-                    "City-object relationship is missing corresponding "
-                    "depth-1 closure row."
-                ),
-                table="usap_city_object_relationship",
-                row_id=int(row["relationship_id"]),
-                details={
-                    "graph_name": graph_name,
-                    "parent_city_object_id": int(row["parent_city_object_id"]),
-                    "child_city_object_id": int(row["child_city_object_id"]),
-                },
-            )
-    
+def _cycle_members(edges: list[tuple[int, int]]) -> list[int]:
+    """
+    Return the object ids left over after a Kahn topological sort, i.e. the
+    ones on (or downstream of) a cycle. Sorted, so reports are stable.
+    """
+    children: dict[int, list[int]] = {}
+    in_degree: dict[int, int] = {}
+
+    for parent_id, child_id in edges:
+        children.setdefault(parent_id, []).append(child_id)
+        in_degree.setdefault(parent_id, 0)
+        in_degree[child_id] = in_degree.get(child_id, 0) + 1
+
+    queue = [node for node, degree in in_degree.items() if degree == 0]
+    settled = 0
+
+    while queue:
+        node = queue.pop()
+        settled += 1
+
+        for child_id in children.get(node, []):
+            in_degree[child_id] -= 1
+
+            if in_degree[child_id] == 0:
+                queue.append(child_id)
+
+    if settled == len(in_degree):
+        return []
+
+    return sorted(node for node, degree in in_degree.items() if degree > 0)
+
+
 def _view_exists(conn: sqlite3.Connection, view_name: str) -> bool:
     row = conn.execute(
         """
@@ -1106,6 +1379,46 @@ def _validate_gis_layers(
                 "gpkg_contents_srs_id": features_row["srs_id"],
                 "gpkg_geometry_columns_srs_id": geometry_row["srs_id"],
             },
+        )
+
+
+def _validate_asset_crs(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    """
+    Flag assets recorded in more than one CRS.
+
+    USAP assumes one CRS per package: set_package_srs declares it and rewrites
+    the extent blobs' srs_id, but it does not *transform* any coordinate. That
+    is only sound while every stored bound is already in the declared CRS, and
+    nothing in the build enforces it across meshes and point clouds. A warning
+    rather than an error — mixed CRSs are a real (if unsupported) state, and
+    such packages must keep opening.
+    """
+    rows = conn.execute(
+        """
+        SELECT DISTINCT srs_id
+        FROM usap_asset
+        WHERE srs_id IS NOT NULL
+        ORDER BY srs_id
+        """
+    ).fetchall()
+
+    srs_ids = [int(row["srs_id"]) for row in rows]
+
+    if len(srs_ids) > 1:
+        report.add(
+            severity="warning",
+            code="MIXED_ASSET_CRS",
+            message=(
+                "Assets are registered in more than one CRS. USAP assumes one "
+                "CRS per package and never transforms coordinates, so the "
+                "extent layer misplaces every asset not already in the "
+                "declared CRS."
+            ),
+            table="usap_asset",
+            details={"srs_ids": srs_ids},
         )
 
 

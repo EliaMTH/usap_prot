@@ -175,6 +175,15 @@ If your pipeline already knows the element counts, assets can also be
 declared without reading the files at all: `register_asset` +
 `register_asset_part` in the SDK.
 
+**Large assets.** Registration is the only step that opens an asset file at
+all — annotating and querying afterwards work from the stored element count,
+so asset size stops mattering once a package is built. Registration reads only
+what it stores: LAS/LAZ from the header alone, and meshes over 256 MB in a
+streaming pass rather than a full load (`stream=True`/`False` to override; see
+REFERENCE.md → Mesh support → Large meshes for the formats that support it).
+The one full read that remains is `compute_hash` — minutes on a 10 GB file,
+and what makes a later change to it detectable, so turn it off knowingly.
+
 ## GIS interoperability
 
 Every package built by these procedures opens in QGIS/GDAL: three read-only

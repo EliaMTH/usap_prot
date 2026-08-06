@@ -82,9 +82,32 @@ def _namespace_uri(tag: str) -> str | None:
     return None
 
 
+# Every CityGML module namespace, in every version, is under this host path:
+#   http://www.opengis.net/citygml/2.0
+#   http://www.opengis.net/citygml/building/3.0   (and relief/, vegetation/, ...)
+# Matching on the local name alone would import ANY XML that happens to use
+# the word "Building" as a CityGML building — plausible rows stating something
+# false, which is worse than importing nothing.
+_CITYGML_NAMESPACE_MARKER = "opengis.net/citygml"
+
+# gml:id lives in the GML namespace (3.1.1 uses .../gml, 3.2 .../gml/3.2).
+# An unqualified id= attribute belongs to some other vocabulary and must not
+# be mistaken for a stable CityGML object identity.
+_GML_NAMESPACE_MARKER = "opengis.net/gml"
+
+
+def _is_citygml_namespace(namespace: str | None) -> bool:
+    return namespace is not None and _CITYGML_NAMESPACE_MARKER in namespace
+
+
 def _get_gml_id(element: etree._Element) -> str | None:
     for key, value in element.attrib.items():
-        if _local_name(key) == "id":
+        if _local_name(key) != "id":
+            continue
+
+        namespace = _namespace_uri(key)
+
+        if namespace is not None and _GML_NAMESPACE_MARKER in namespace:
             return value
 
     return None
@@ -159,6 +182,12 @@ def import_citygml_semantics(
         - create object relationships from XML nesting/property context
         - optionally mirror those relationships into usap_default
 
+    Only elements in a CityGML namespace are imported, at any version
+    (1.0/2.0/3.0). The detected version is recorded on the asset, but the
+    concept URIs always come from the shipped CityGML 3.0 vocabulary — so a
+    2.0 Building is currently registered under a 3.0 class URI. That is a
+    known limitation, pending the vocabulary-ingestion rework.
+
     Not implemented here:
         - CityGML geometry import
         - XLink resolution
@@ -183,6 +212,23 @@ def import_citygml_semantics(
     except etree.XMLSyntaxError as exc:
         raise USAPError(f"Malformed CityGML file: {path}: {exc}") from exc
     root = tree.getroot()
+
+    # Refuse a document that declares no CityGML namespace at all rather than
+    # importing zero objects from it: silence would look like "this file has
+    # no buildings" when it actually means "this is not CityGML".
+    if not any(
+        _is_citygml_namespace(namespace)
+        for namespace in root.nsmap.values()
+    ):
+        declared = sorted(
+            namespace for namespace in root.nsmap.values() if namespace
+        )
+
+        raise USAPError(
+            f"Not a CityGML document: {path}. No CityGML namespace "
+            f"(*{_CITYGML_NAMESPACE_MARKER}*) is declared; found: "
+            f"{declared or 'no namespaces at all'}."
+        )
 
     version_hint = _citygml_version_hint(root)
     content_hash = sha256_file(path) if compute_hash else None
@@ -246,7 +292,6 @@ def import_citygml_semantics(
                     f"{child_uid}"
                 ),
                 metadata_json=json.dumps(metadata),
-                rebuild_closure=False,
             )
 
             imported_relationships.append(
@@ -270,7 +315,10 @@ def import_citygml_semantics(
 
             local_name = _local_name(element.tag)
 
-            is_city_object = local_name in citygml_object_classes
+            is_city_object = (
+                local_name in citygml_object_classes
+                and _is_citygml_namespace(_namespace_uri(element.tag))
+            )
 
             if is_city_object:
                 sequence_number += 1
@@ -362,11 +410,6 @@ def import_citygml_semantics(
             object_stack=[],
             relationship_context=None,
         )
-
-        pkg.rebuild_city_object_closure(graph_name=graph_name)
-
-        if also_usap_default:
-            pkg.rebuild_city_object_closure(graph_name="usap_default")
 
     return CityGMLImportResult(
         asset_id=source_asset_id,

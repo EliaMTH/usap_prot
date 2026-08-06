@@ -463,7 +463,7 @@ def test_value_field_stats(tmp_path: Path) -> None:
 
 
 def _field_setup(pkg, element_count: int = 10) -> int:
-    asset_id = pkg.register_asset(uri="field_mesh.glb", asset_kind="mesh")
+    asset_id = pkg.register_asset(uri="field_mesh.ply", asset_kind="mesh")
     pkg.create_semantic_class(scheme="s", class_uri="s:Frac", local_name="Frac")
 
     return pkg.register_asset_part(

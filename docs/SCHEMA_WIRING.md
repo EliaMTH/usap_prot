@@ -1,9 +1,9 @@
 # USAP schema wiring
 
-How the objects in [`sql/schema.sql`](../sql/schema.sql) connect: which foreign keys wire
+How the objects in [`src/usap/data/schema.sql`](../src/usap/data/schema.sql) connect: which foreign keys wire
 the tables together, and which tables each view reads from.
 
-**Object counts:** 14 USAP tables + 4 GeoPackage plumbing tables = 18 base tables,
+**Object counts:** 13 USAP tables + 4 GeoPackage plumbing tables = 17 base tables,
 plus 4 views and 6 indexes.
 
 In every diagram, an arrow `A ──▶ B` means **"A has a foreign key pointing to B"**
@@ -22,7 +22,6 @@ flowchart TB
     SCC[usap_semantic_class_closure]
     CO[usap_city_object]
     COR[usap_city_object_relationship]
-    COC[usap_city_object_closure]
     ANN[usap_annotation]
     ANNO[usap_annotation_object]
     MB[usap_membership_block]
@@ -38,7 +37,6 @@ flowchart TB
     CO -->|source_asset_id| ASSET
     COR -->|parent + child| CO
     COR -->|source_asset_id| ASSET
-    COC -->|ancestor + descendant| CO
     ANN -->|semantic_class_id| SCLASS
     ANN -->|primary_city_object_id| CO
     ANNO -->|annotation_id| ANN
@@ -58,9 +56,11 @@ flowchart TB
 It reaches "up" to *what* something means (`usap_semantic_class`) and *which object* it
 is about (`usap_city_object`), and everything below it (`_object`, `_membership_block`,
 `_value_block`) reaches "down" to pin the annotation onto concrete geometry
-(`usap_asset_part`). The two `_closure` tables are precomputed shortcuts hanging off
-their respective hierarchies (classes, objects). `usap_profile` and `usap_edit_log`
-(dashed) stand alone — no foreign keys in or out.
+(`usap_asset_part`). `usap_semantic_class_closure` is a precomputed shortcut hanging
+off the class hierarchy; the *object* hierarchy has no such table — "an object and its
+parts" is walked from `usap_city_object_relationship` with a recursive CTE, because
+those edges are typed and edited one at a time (see `elements_for_city_object`).
+`usap_profile` and `usap_edit_log` (dashed) stand alone — no foreign keys in or out.
 
 ### Foreign keys, table by table
 
@@ -76,8 +76,6 @@ their respective hierarchies (classes, objects). `usap_profile` and `usap_edit_l
 | `usap_city_object_relationship` | `parent_city_object_id` | `usap_city_object(city_object_id)` |
 | `usap_city_object_relationship` | `child_city_object_id` | `usap_city_object(city_object_id)` |
 | `usap_city_object_relationship` | `source_asset_id` | `usap_asset(asset_id)` |
-| `usap_city_object_closure` | `ancestor_city_object_id` | `usap_city_object(city_object_id)` |
-| `usap_city_object_closure` | `descendant_city_object_id` | `usap_city_object(city_object_id)` |
 | `usap_annotation` | `semantic_class_id` | `usap_semantic_class(semantic_class_id)` |
 | `usap_annotation` | `primary_city_object_id` | `usap_city_object(city_object_id)` |
 | `usap_annotation_object` | `annotation_id` | `usap_annotation(annotation_id)` |

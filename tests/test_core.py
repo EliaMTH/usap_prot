@@ -9,6 +9,7 @@ from conftest import make_mesh_part, make_pkg
 from usap import (
     ELEMENT_KIND_FACE,
     ELEMENT_KIND_POINT,
+    USAPError,
     USAPPackage,
     seed_default_citygml_vocabulary,
 )
@@ -22,9 +23,9 @@ def build_tiny_package(db_path: Path) -> tuple[USAPPackage, int, int, int]:
     )
 
     asset_id = pkg.register_asset(
-        uri="city_mesh.glb",
+        uri="city_mesh.ply",
         asset_kind="mesh",
-        media_type="model/gltf-binary",
+        media_type="application/ply",
         content_hash="fake_hash_for_test",
     )
 
@@ -134,6 +135,105 @@ def test_annotation_membership_is_split_into_two_blocks(tmp_path: Path) -> None:
         pkg.close()
 
 
+def test_standalone_object_answers_for_itself(tmp_path: Path) -> None:
+    # An object with no relationship edges at all is still its own only
+    # "part". Descendant expansion used to read a stored closure, so such an
+    # object was invisible under the default include_descendants=True and its
+    # annotations silently vanished from object-level retrieval — while
+    # validation reported the package as fine.
+    db_path = tmp_path / "test.usap.gpkg"
+
+    pkg, asset_part_id, roof_class_id, _annotation_id = build_tiny_package(db_path)
+
+    try:
+        loose_id = pkg.create_city_object(
+            object_uid="loose_object",
+            semantic_class_id=roof_class_id,
+        )
+
+        loose_annotation_id = pkg.create_annotation(
+            annotation_uid="ann_loose",
+            semantic_class_id=roof_class_id,
+            primary_city_object_id=loose_id,
+        )
+
+        pkg.replace_annotation_membership(
+            annotation_id=loose_annotation_id,
+            asset_part_id=asset_part_id,
+            element_kind=ELEMENT_KIND_FACE,
+            element_indices=[7, 8, 9],
+        )
+
+        with_descendants = pkg.elements_for_city_object("loose_object", expand=True)
+        without_descendants = pkg.elements_for_city_object(
+            "loose_object",
+            include_descendants=False,
+            expand=True,
+        )
+
+        assert [b["elements"] for b in with_descendants] == [[7, 8, 9]]
+        assert with_descendants == without_descendants
+
+    finally:
+        pkg.close()
+
+
+def test_descendants_follow_containment_edges_only(tmp_path: Path) -> None:
+    # The object graph is typed. 'adjacentTo' relates two objects without
+    # making one part of the other, so the neighbour's elements must not be
+    # reported as elements of building_1 — a type-blind traversal turns every
+    # edge into containment and answers "this building's roof faces" with a
+    # different building's.
+    db_path = tmp_path / "test.usap.gpkg"
+
+    pkg, asset_part_id, roof_class_id, _annotation_id = build_tiny_package(db_path)
+
+    try:
+        neighbour_id = pkg.create_city_object(
+            object_uid="building_2",
+            semantic_class_id=roof_class_id,
+        )
+
+        neighbour_annotation_id = pkg.create_annotation(
+            annotation_uid="ann_building_2",
+            semantic_class_id=roof_class_id,
+            primary_city_object_id=neighbour_id,
+        )
+
+        pkg.replace_annotation_membership(
+            annotation_id=neighbour_annotation_id,
+            asset_part_id=asset_part_id,
+            element_kind=ELEMENT_KIND_FACE,
+            element_indices=[500, 501],
+        )
+
+        pkg.link_city_objects(
+            parent_city_object_id=pkg.resolve_city_object("building_1"),
+            child_city_object_id=neighbour_id,
+            relationship_type="adjacentTo",
+        )
+
+        blocks = pkg.elements_for_city_object("building_1", expand=True)
+        returned = {index for block in blocks for index in block["elements"]}
+
+        # The roof (a boundedBy child) is in; the neighbour is not.
+        assert 100 in returned
+        assert 500 not in returned
+
+        # Opting into the edge type reaches it, which is what makes the
+        # default a policy rather than a limitation.
+        followed = pkg.elements_for_city_object(
+            "building_1",
+            expand=True,
+            containment_types=("boundedBy", "adjacentTo"),
+        )
+
+        assert 500 in {index for block in followed for index in block["elements"]}
+
+    finally:
+        pkg.close()
+
+
 def test_city_object_query_uses_usap_default_descendants(tmp_path: Path) -> None:
     db_path = tmp_path / "test.usap.gpkg"
 
@@ -227,8 +327,7 @@ def test_city_object_query_follows_only_representing_links(tmp_path: Path) -> No
             relation_type="derivedFrom",
         )
 
-        # include_descendants=False keeps this about relation types alone: a
-        # freshly created object has no closure rows to expand.
+        # include_descendants=False keeps this about link types alone.
         assert pkg.elements_for_city_object(
             "survey_object_7",
             include_descendants=False,
@@ -237,18 +336,18 @@ def test_city_object_query_follows_only_representing_links(tmp_path: Path) -> No
         followed = pkg.elements_for_city_object(
             "survey_object_7",
             include_descendants=False,
-            relationship_types=("represents", "derivedFrom"),
+            link_types=("represents", "derivedFrom"),
         )
 
         assert {block["annotation_id"] for block in followed} == {annotation_id}
 
         # The object it does represent is unaffected, and still reachable with
         # link following switched off entirely (the primary-column path).
-        for relationship_types in [("represents",), ()]:
+        for link_types in [("represents",), ()]:
             roof_blocks = pkg.elements_for_city_object(
                 "building_1_roof_1",
                 include_descendants=False,
-                relationship_types=relationship_types,
+                link_types=link_types,
             )
 
             assert {block["annotation_id"] for block in roof_blocks} == {annotation_id}
@@ -389,12 +488,9 @@ def test_elements_for_city_object_survives_many_descendants(tmp_path: Path) -> N
                     parent_city_object_id=root_id,
                     child_city_object_id=child_id,
                     relationship_type="contains",
-                    rebuild_closure=False,
                 )
 
                 child_ids.append(child_id)
-
-            pkg.rebuild_city_object_closure()
 
         annotation = pkg.annotate_elements(
             concept="Roof",
@@ -405,8 +501,8 @@ def test_elements_for_city_object_survives_many_descendants(tmp_path: Path) -> N
             city_object_uid="child_0010",
         )
 
-        # Link the same annotation to an object that lands in a different
-        # query chunk; its block must still be returned exactly once.
+        # Link the same annotation to a second descendant: it is reachable
+        # by two paths at once and its block must still be returned once.
         pkg.link_annotation_to_object(
             annotation_id=int(annotation["annotation_id"]),
             city_object_id=child_ids[990],
@@ -458,7 +554,7 @@ def test_normalize_element_kind_is_strict() -> None:
 def test_list_assets_and_parts(pkg: USAPPackage) -> None:
     # A UI must be able to enumerate what was registered, with part/element
     # counts, and drill into one asset's parts.
-    mesh_id = pkg.register_asset(uri="mesh.glb", asset_kind="mesh")
+    mesh_id = pkg.register_asset(uri="mesh.ply", asset_kind="mesh")
     pkg.register_asset_part(mesh_id, "geometry/0", ELEMENT_KIND_FACE, 10)
     pkg.register_asset_part(mesh_id, "geometry/1", ELEMENT_KIND_FACE, 5)
 
@@ -467,10 +563,10 @@ def test_list_assets_and_parts(pkg: USAPPackage) -> None:
 
     assets = pkg.list_assets()
 
-    assert [a["uri"] for a in assets] == ["mesh.glb", "area.las"]
+    assert [a["uri"] for a in assets] == ["mesh.ply", "area.las"]
     by_uri = {a["uri"]: a for a in assets}
-    assert by_uri["mesh.glb"]["part_count"] == 2
-    assert by_uri["mesh.glb"]["element_count"] == 15
+    assert by_uri["mesh.ply"]["part_count"] == 2
+    assert by_uri["mesh.ply"]["element_count"] == 15
     assert by_uri["area.las"]["part_count"] == 1
     assert by_uri["area.las"]["element_count"] == 100
 
@@ -529,3 +625,140 @@ def test_list_city_objects_and_children(pkg: USAPPackage) -> None:
 
     # a leaf has no children
     assert pkg.list_city_objects(parent_object="building_1_roof_1") == []
+
+
+def test_reregistering_an_asset_with_different_values_raises(pkg: USAPPackage) -> None:
+    # Registration is idempotent on (uri, content_hash) so re-runs are cheap.
+    # That is only sound while "already registered" means "as the same
+    # thing": returning the existing id for a conflicting record hands the
+    # caller a row describing something they did not register — the probe
+    # that registered a mesh, then the same key as a point cloud, got a mesh
+    # back and no error.
+    first = pkg.register_asset(
+        uri="area.ply",
+        asset_kind="mesh",
+        content_hash="hash-1",
+    )
+
+    assert pkg.register_asset(
+        uri="area.ply",
+        asset_kind="mesh",
+        content_hash="hash-1",
+    ) == first
+
+    with pytest.raises(USAPError, match="already registered with different"):
+        pkg.register_asset(
+            uri="area.ply",
+            asset_kind="pointcloud",
+            content_hash="hash-1",
+        )
+
+    # A genuinely new version of the file is a different content hash, and
+    # that is a separate asset rather than a conflict.
+    assert pkg.register_asset(
+        uri="area.ply",
+        asset_kind="mesh",
+        content_hash="hash-2",
+    ) != first
+
+
+def test_reregistering_a_part_with_a_different_count_raises(pkg: USAPPackage) -> None:
+    # element_count is the index space every membership on the part is
+    # validated against. Silently keeping the old count while the caller
+    # believes the new one leaves annotations mis-scoped with no error
+    # anywhere.
+    asset_id = pkg.register_asset(uri="area.ply", asset_kind="mesh")
+
+    part_id = pkg.register_asset_part(
+        asset_id=asset_id,
+        part_path="geometry/0",
+        element_kind=ELEMENT_KIND_FACE,
+        element_count=10,
+    )
+
+    assert pkg.register_asset_part(
+        asset_id=asset_id,
+        part_path="geometry/0",
+        element_kind=ELEMENT_KIND_FACE,
+        element_count=10,
+    ) == part_id
+
+    with pytest.raises(USAPError, match="already registered with different"):
+        pkg.register_asset_part(
+            asset_id=asset_id,
+            part_path="geometry/0",
+            element_kind=ELEMENT_KIND_FACE,
+            element_count=999,
+        )
+
+
+def test_annotation_domain_values_are_refused(pkg: USAPPackage, mesh_part: int) -> None:
+    # These three all used to be stored and to validate clean. Each breaks a
+    # reader: an unknown status drops out of every status filter, a
+    # confidence of 7.5 cannot be compared with any other, and attributes
+    # that are not JSON cannot be read back at all.
+    class_id = pkg.create_semantic_class(
+        scheme="s", class_uri="s:Roof", local_name="Roof"
+    )
+
+    with pytest.raises(USAPError, match="Unknown annotation status"):
+        pkg.create_annotation(
+            annotation_uid="ann_bad_status",
+            semantic_class_id=class_id,
+            status="probably",
+        )
+
+    with pytest.raises(USAPError, match="outside"):
+        pkg.create_annotation(
+            annotation_uid="ann_bad_confidence",
+            semantic_class_id=class_id,
+            confidence=7.5,
+        )
+
+    with pytest.raises(USAPError, match="not valid JSON"):
+        pkg.create_annotation(
+            annotation_uid="ann_bad_json",
+            semantic_class_id=class_id,
+            attributes_json="{not json",
+        )
+
+    # The same guards apply to edits, not just creation.
+    annotation_id = pkg.create_annotation(
+        annotation_uid="ann_ok",
+        semantic_class_id=class_id,
+    )
+
+    with pytest.raises(USAPError, match="Unknown annotation status"):
+        pkg.update_annotation(annotation_id, status="probably")
+
+    assert pkg.get_annotation(annotation_id)["status"] == "accepted"
+
+
+def test_open_refuses_a_foreign_sqlite_file(tmp_path: Path) -> None:
+    # An arbitrary SQLite file used to open cleanly and fail later with
+    # "no such table: usap_asset" from whichever call ran first — the failure
+    # named a symptom, not the cause.
+    foreign = tmp_path / "not_usap.gpkg"
+
+    connection = sqlite3.connect(foreign)
+    connection.execute("CREATE TABLE something (id INTEGER PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(USAPError, match="Not a USAP package"):
+        USAPPackage.open(foreign)
+
+
+def test_open_refuses_an_unsupported_profile_version(tmp_path: Path) -> None:
+    # There is no migration path yet, so a package written by a future
+    # profile must be refused rather than read with this build's assumptions.
+    db_path = tmp_path / "future.usap.gpkg"
+
+    with make_pkg(tmp_path, name="future.usap.gpkg") as pkg:
+        with pkg.transaction():
+            pkg.conn.execute(
+                "UPDATE usap_profile SET profile_version = '9.9.9'"
+            )
+
+    with pytest.raises(USAPError, match="Unsupported USAP profile version"):
+        USAPPackage.open(db_path)

@@ -3,14 +3,19 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from conftest import make_pkg
 from usap import (
     ELEMENT_KIND_FACE,
     SyntheticConfig,
+    USAPError,
     USAPPackage,
     create_synthetic_package,
     validate_connection,
 )
+from usap._util import sha256_file
+from usap.validation import verify_assets
 
 
 def _create_small_valid_package(db_path: Path):
@@ -126,52 +131,54 @@ def test_validation_catches_membership_count_mismatch(tmp_path: Path) -> None:
         assert "MEMBERSHIP_COUNT_MISMATCH" in _codes(report)
 
 
-def test_validation_catches_missing_city_object_closure(tmp_path: Path) -> None:
-    db_path = tmp_path / "missing_closure.usap.gpkg"
+def test_validation_catches_containment_cycle(tmp_path: Path) -> None:
+    # "An object and its parts" only means something if containment is
+    # acyclic: on a cycle every object is its own part, so a package that
+    # states one is stating something it cannot mean. Descendant queries do
+    # not hang (the recursive CTE deduplicates), which is exactly why this
+    # has to be reported rather than left to fail loudly at query time.
+    db_path = tmp_path / "cycle.usap.gpkg"
 
     _create_small_valid_package(db_path)
 
     with USAPPackage.open(db_path) as pkg:
-        with pkg.transaction():
-            pkg.conn.execute(
-                """
-                DELETE FROM usap_city_object_closure
-                WHERE graph_name = 'usap_default'
-                  AND depth = 1
-                """
-            )
+        parent = pkg.resolve_city_object("building_000000")
+        child = pkg.resolve_city_object("building_000000_roof")
+
+        pkg.link_city_objects(
+            parent_city_object_id=child,
+            child_city_object_id=parent,
+            relationship_type="contains",
+        )
 
         report = pkg.validate_report()
 
         assert not report.is_ok
-        assert "MISSING_CITY_OBJECT_CLOSURE_DIRECT" in _codes(report)
+        assert "CITY_OBJECT_GRAPH_CYCLE" in _codes(report)
 
 
-def test_validation_catches_missing_city_object_self_closure(
-    tmp_path: Path,
-) -> None:
-    # The self-row (depth 0) check is what makes an object visible to
-    # graph-scoped queries; it caught the carrier-creation bug, so it gets
-    # its own corruption test.
-    db_path = tmp_path / "missing_self_closure.usap.gpkg"
+def test_non_containment_cycle_is_not_an_error(tmp_path: Path) -> None:
+    # The graph is typed: two objects can perfectly well be adjacent to each
+    # other. Only containment edges are checked for cycles.
+    db_path = tmp_path / "adjacency_cycle.usap.gpkg"
 
     _create_small_valid_package(db_path)
 
     with USAPPackage.open(db_path) as pkg:
-        with pkg.transaction():
-            pkg.conn.execute(
-                """
-                DELETE FROM usap_city_object_closure
-                WHERE graph_name = 'usap_default'
-                  AND depth = 0
-                  AND ancestor_city_object_id = 1
-                """
+        first = pkg.resolve_city_object("building_000000")
+        second = pkg.resolve_city_object("building_000000_roof")
+
+        for parent, child in [(first, second), (second, first)]:
+            pkg.link_city_objects(
+                parent_city_object_id=parent,
+                child_city_object_id=child,
+                relationship_type="adjacentTo",
             )
 
         report = pkg.validate_report()
 
-        assert not report.is_ok
-        assert "MISSING_CITY_OBJECT_SELF_CLOSURE" in _codes(report)
+        assert "CITY_OBJECT_GRAPH_CYCLE" not in _codes(report)
+        assert report.is_ok, [issue.format() for issue in report.issues]
 
 
 def test_validation_catches_missing_semantic_class_closure(
@@ -274,3 +281,86 @@ def test_validate_connection_accepts_plain_connection(tmp_path: Path) -> None:
         assert conn.row_factory is None
     finally:
         conn.close()
+
+
+def test_basic_level_skips_payload_decoding(tmp_path: Path) -> None:
+    # 'basic' exists so a package with millions of membership blocks can be
+    # checked without reading every blob off disk. The proof that it really
+    # skips them: a corrupt payload that 'deep' reports must go unnoticed,
+    # while the structural checks still run.
+    db_path = tmp_path / "levels.usap.gpkg"
+
+    _create_small_valid_package(db_path)
+
+    with USAPPackage.open(db_path) as pkg:
+        with pkg.transaction():
+            pkg.conn.execute(
+                """
+                UPDATE usap_membership_block
+                SET payload = X'000102'
+                WHERE membership_block_id = 1
+                """
+            )
+
+        assert "CORRUPT_MEMBERSHIP_PAYLOAD" in _codes(pkg.validate_report())
+        assert pkg.validate_report(level="basic").is_ok
+
+
+def test_unknown_validation_level_is_refused(tmp_path: Path) -> None:
+    db_path = tmp_path / "level_name.usap.gpkg"
+
+    _create_small_valid_package(db_path)
+
+    with USAPPackage.open(db_path) as pkg:
+        with pytest.raises(USAPError, match="Unknown validation level"):
+            pkg.validate_report(level="thorough")
+
+
+def test_external_level_detects_changed_asset(tmp_path: Path) -> None:
+    # An annotation is bound to one immutable version of a file by element
+    # index. If the file changed, those indices may now name different
+    # elements and nothing inside the package can tell — only re-hashing can,
+    # which is why it is a level of its own rather than always-on.
+    asset_path = tmp_path / "cloud.las"
+    asset_path.write_bytes(b"original bytes")
+
+    with make_pkg(tmp_path) as pkg:
+        pkg.register_asset(
+            uri=str(asset_path),
+            asset_kind="pointcloud",
+            content_hash=sha256_file(asset_path),
+        )
+
+        assert pkg.validate_report(level="external").is_ok
+
+        asset_path.write_bytes(b"different bytes entirely")
+
+        report = pkg.validate_report(level="external")
+
+        assert not report.is_ok
+        assert "ASSET_FILE_CHANGED" in _codes(report)
+
+        # Nothing inside the database changed, so the cheaper levels cannot
+        # and must not claim to notice.
+        assert pkg.validate_report().is_ok
+
+        asset_path.unlink()
+
+        assert "ASSET_FILE_MISSING" in _codes(pkg.validate_report(level="external"))
+
+
+def test_verify_assets_reports_unhashed_assets(tmp_path: Path) -> None:
+    # compute_hash=False is a legitimate choice for a 10 GB file, but it
+    # trades away change detection; that has to be visible, not implied.
+    asset_path = tmp_path / "big.las"
+    asset_path.write_bytes(b"payload")
+
+    with make_pkg(tmp_path) as pkg:
+        pkg.register_asset(uri=str(asset_path), asset_kind="pointcloud")
+
+        assert [item["status"] for item in verify_assets(pkg.conn)] == ["unhashed"]
+
+        report = pkg.validate_report(level="external")
+
+        assert report.is_ok
+        assert "ASSET_NOT_HASHED" in _codes(report)

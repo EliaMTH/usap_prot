@@ -448,7 +448,7 @@ def test_apply_annotation_batch_file(tmp_path: Path) -> None:
                             "concept": "TempRoof",
                             "memberships": [
                                 {
-                                    "asset_uri": "mesh.glb",
+                                    "asset_uri": "mesh.ply",
                                     "element_indices": [0, 1],
                                 }
                             ],

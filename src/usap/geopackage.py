@@ -13,10 +13,16 @@ GPKG_USER_VERSION = 10300
 
 USAP_EXTENSION_NAME = "usap_core"
 USAP_EXTENSION_SCOPE = "read-write"
-USAP_EXTENSION_DEFINITION = (
-    "USAP Urban Semantic Annotation Package profile. "
-    "This extension registers USAP semantic annotation tables."
-)
+
+# The GeoPackage standard requires gpkg_extensions.definition to hold a
+# permalink, URI, or reference to the document defining the extension — not a
+# prose description, which is what used to be written here.
+#
+# TODO: replace with the real permalink once the extension document has a
+# public home; usap.invalid is RFC 2606's reserved TLD, so this can never
+# accidentally resolve to someone else's page and reads unmistakably as a
+# placeholder.
+USAP_EXTENSION_DEFINITION = "https://usap.invalid/extensions/usap_core/0.1.0"
 
 USAP_EXTENSION_TABLES = [
     "usap_profile",
@@ -27,7 +33,6 @@ USAP_EXTENSION_TABLES = [
     "usap_semantic_class_closure",
     "usap_city_object",
     "usap_city_object_relationship",
-    "usap_city_object_closure",
     "usap_annotation",
     "usap_annotation_object",
     "usap_membership_block",
@@ -137,7 +142,10 @@ def _register_usap_extension(
     conn: sqlite3.Connection,
     profile_version: str,
 ) -> None:
-    definition = f"{USAP_EXTENSION_DEFINITION} Version: {profile_version}"
+    # The definition must stay a bare URI (the standard asks for a reference
+    # to the defining document); the profile version rides in the URI path
+    # rather than as appended prose.
+    definition = USAP_EXTENSION_DEFINITION
 
     rows = [
         (
@@ -307,6 +315,25 @@ def epsg_from_wkt(wkt: str | None) -> int | None:
     return None
 
 
+def wkt_for_epsg(srs_id: int) -> str | None:
+    """
+    Look up an EPSG code's WKT definition, or None when that is not possible.
+
+    pyproj (the 'crs' extra) carries the EPSG database; without it USAP has no
+    way to turn a bare code into the definition a conformant GeoPackage needs,
+    and says so rather than inventing one.
+    """
+    try:
+        from pyproj import CRS
+    except ImportError:
+        return None
+
+    try:
+        return CRS.from_epsg(srs_id).to_wkt()
+    except Exception:
+        return None
+
+
 def ensure_srs_row(
     conn: sqlite3.Connection,
     srs_id: int,
@@ -315,7 +342,32 @@ def ensure_srs_row(
 ) -> None:
     """
     Idempotently insert a gpkg_spatial_ref_sys row for an EPSG code.
+
+    A real SRS needs a real definition: the GeoPackage standard reserves the
+    "undefined" definitions for the built-in ids -1 and 0, and requires
+    records defining every SRS the package actually uses. Writing
+    definition='undefined' under a positive EPSG code produced a row that
+    named a CRS without defining it.
+
+    A pre-existing incomplete row is repaired when a definition finally
+    arrives — INSERT OR IGNORE alone left it broken forever, so a package
+    that first saw the code without WKT could never be fixed.
     """
+    if srs_id in (-1, 0):
+        return
+
+    if not definition_wkt:
+        definition_wkt = wkt_for_epsg(srs_id)
+
+    if not definition_wkt:
+        raise USAPError(
+            f"Cannot register SRS {srs_id} without a definition: the "
+            "GeoPackage standard reserves undefined definitions for srs_id "
+            "-1 and 0, and requires a record defining every SRS the package "
+            "uses. Either supply the CRS WKT (project config 'srs_wkt'), or "
+            "install usap[crs] so it can be looked up from the EPSG code."
+        )
+
     conn.execute(
         """
         INSERT OR IGNORE INTO gpkg_spatial_ref_sys (
@@ -333,8 +385,19 @@ def ensure_srs_row(
             srs_id,
             "EPSG",
             srs_id,
-            definition_wkt or "undefined",
+            definition_wkt,
         ),
+    )
+
+    conn.execute(
+        """
+        UPDATE gpkg_spatial_ref_sys
+        SET definition = ?,
+            srs_name = ?
+        WHERE srs_id = ?
+          AND (definition IS NULL OR definition = 'undefined')
+        """,
+        (definition_wkt, name or f"EPSG:{srs_id}", srs_id),
     )
 
 

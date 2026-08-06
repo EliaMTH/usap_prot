@@ -264,10 +264,12 @@ def test_unknown_city_object_fails_without_the_flag(tmp_path: Path) -> None:
         assert pkg.elements_for_city_object("tower_A_roof", expand=True)
 
 
-def test_carriers_close_over_every_graph(tmp_path: Path) -> None:
+def test_carriers_are_queryable_in_every_graph(tmp_path: Path) -> None:
     # A CityGML import creates a second named graph (citygml_import); a
-    # carrier created afterwards must get closure self-rows in ALL graphs,
-    # or validation fails and graph-scoped object queries silently miss it.
+    # carrier created afterwards has no edges in any graph, and an edgeless
+    # object is the case that used to disappear from the default
+    # include_descendants query. It must answer for itself in EVERY graph,
+    # named or not, since nothing about it is graph-specific.
     from usap import apply_annotation_batch as apply_batch
     from usap import import_citygml_semantics
 
@@ -295,20 +297,16 @@ def test_carriers_close_over_every_graph(tmp_path: Path) -> None:
         report = pkg.validate_report()
         assert report.is_ok, [i.format() for i in report.issues]
 
-        graphs = {
-            row["graph_name"]
-            for row in pkg.conn.execute(
-                """
-                SELECT DISTINCT c.graph_name
-                FROM usap_city_object_closure AS c
-                JOIN usap_city_object AS co
-                    ON co.city_object_id = c.ancestor_city_object_id
-                WHERE co.object_uid = 'tower_A_roof'
-                """
-            ).fetchall()
-        }
+        for graph_name in ["usap_default", "citygml_import", "never_used"]:
+            blocks = pkg.elements_for_city_object(
+                "tower_A_roof",
+                graph_name=graph_name,
+                expand=True,
+            )
 
-        assert graphs == {"usap_default", "citygml_import"}
+            assert [b["elements"] for b in blocks] == [[0]], graph_name
+
+        assert pkg.list_city_objects(descendants_of="tower_A_roof") != []
 
 
 def test_new_carrier_requires_a_concept(tmp_path: Path) -> None:
@@ -453,25 +451,21 @@ def test_update_rerun_does_not_duplicate_relationships(tmp_path: Path) -> None:
     # mirror), bloating the file and breaking the idempotency contract.
     config_path = _procedure_1_files(tmp_path)
 
-    def _graph_counts(db_path: Path) -> tuple[int, int]:
+    def _relationship_count(db_path: Path) -> int:
         with USAPPackage.open(db_path) as pkg:
             rel = pkg.conn.execute(
                 "SELECT COUNT(*) AS n FROM usap_city_object_relationship"
             ).fetchone()["n"]
-            closure = pkg.conn.execute(
-                "SELECT COUNT(*) AS n FROM usap_city_object_closure"
-            ).fetchone()["n"]
-
-        return rel, closure
+        return rel
 
     result = build_project_package_from_file(config_path)
-    before = _graph_counts(result.db_path)
+    before = _relationship_count(result.db_path)
 
-    assert before[0] > 0
+    assert before > 0
 
     again = build_project_package_from_file(config_path, update=True)
 
-    assert _graph_counts(again.db_path) == before
+    assert _relationship_count(again.db_path) == before
 
     with USAPPackage.open(again.db_path) as pkg:
         report = pkg.validate_report()

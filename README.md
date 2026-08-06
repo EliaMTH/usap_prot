@@ -1,6 +1,6 @@
 # [WIP] USAP — Urban Semantic Annotation Package
 
-USAP is a small SQLite/GeoPackage-style file format (`*.usap.gpkg`) and Python package for storing **editable, element-level semantic annotations over external 3D urban data assets** without copying any geometry.
+USAP is a small SQLite/GeoPackage-style file format (`*.usap.gpkg`) and Python package for storing **editable, element-level semantic annotations over external 3D urban data assets** without copying any source 3D geometry. (It does store a derived 2D bounding box per asset, so packages open as maps — see Limitations.)
 
 ---
 
@@ -66,7 +66,7 @@ annotation: ann_energy_roof_001
 
 ## Concepts & vocabularies
 
-USAP ships **no** built-in taxonomy: a new package starts with zero concepts and accepts only vocabulary you seed into it (a thin JSON form of a SKOS concept scheme, or a minimal local scheme when no ontology is available yet). Every annotation references exactly one registered concept.
+A new package starts with **zero concepts** and enforces no taxonomy of its own: it accepts only vocabulary you seed into it (a thin JSON form of a SKOS concept scheme, or a minimal local scheme when no ontology is available yet). Every annotation references exactly one registered concept. Example registries do ship with the package — a CityGML 3.0 MVP subset, an ADE prototype, a minimal local scheme — and the CityGML importer seeds the first of them; they are starting points to seed or replace, not a built-in taxonomy.
 
 ## Per-element value fields
 
@@ -87,7 +87,7 @@ USAP overlaps with, and deliberately defers to, several existing technologies:
 | **LAS ASPRS `classification` + extra dimensions** | A semantic class stored *inside* the point cloud | The closest analog for *point* semantics. USAP differs by supporting arbitrary vocabularies, cross-asset links, and editing without rewriting a large file. |
 | **GeoPackage** | OGC SQLite container | Used as the container. Packages open in QGIS/GDAL: browsable attribute layers plus a derived per-asset extent-box features layer. |
 
-The novel combination USAP is testing is: **element-level, editable, cross-representation** semantic annotation in a single lightweight file.
+The combination USAP is testing is an uncommon one: **element-level, editable, cross-representation** semantic annotation in a single lightweight file. Every individual ingredient is known prior art (see [ACCELERATOR_ABLATION.md](docs/ACCELERATOR_ABLATION.md) §3); what is unusual is carrying them together, and this repository does not claim a systematic prior-art review.
 
 If you know other tools that should be here, let us know!
 
@@ -98,6 +98,11 @@ If you know other tools that should be here, let us know!
 - **Once processed, 3D assets are supposed to be immutable.** An annotation is bound to *one immutable version* of an external file. LAS point order and mesh face order are **not** guaranteed to survive reprojection, re-tiling, thinning, remeshing, re-export, or conversion to COPC (which re-orders points by design). USAP records a content hash to *detect* that a file changed, but it cannot
   *rebind* annotations.
 - **Membership encoding is deliberately simple** (sorted `uint32` offsets + zlib, in blocks). Adopting *roaring bitmaps* is planned as immediate future work.
+- **Trusted inputs only.** Nothing here is hardened against hostile files: a
+  CityGML document is parsed as a full tree in memory, and an arbitrary
+  SQLite file is refused only by a profile check. Compressed payloads *are*
+  bounded on decode, but treat a `.usap.gpkg` from a third party the way you
+  would treat any other file you were handed.
 - **GIS tools see a summary, not the semantics.** A `.usap.gpkg` opens in QGIS/GDAL as a real GeoPackage: three read-only attribute layers (annotations, concepts, city objects) and one features layer drawing a derived 2D bounding box per registered asset (from the bounds captured at registration — never actual geometry). Fine-grained USAP content (element memberships, value fields) still requires the SDK, and USAP is **not** a registered OGC extension. 
 
 ---

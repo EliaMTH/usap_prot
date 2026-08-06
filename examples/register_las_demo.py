@@ -27,7 +27,6 @@ def main() -> None:
 
     with USAPPackage.create(
         args.db,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         citygml_classes = seed_default_citygml_vocabulary(pkg)

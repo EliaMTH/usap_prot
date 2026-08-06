@@ -9,10 +9,16 @@ from .constants import (
     ELEMENT_KIND_VERTEX,
     VALUE_DTYPES,
 )
-from .core import USAPPackage
+from .core import DEFAULT_SCHEMA_PATH, USAPPackage
 from .errors import USAPAmbiguityError, USAPError
 from .synthetic import SyntheticConfig, SyntheticResult, create_synthetic_package
-from .validation import ValidationIssue, ValidationReport, validate_connection
+from .validation import (
+    VALIDATION_LEVELS,
+    ValidationIssue,
+    ValidationReport,
+    validate_connection,
+    verify_assets,
+)
 from .geopackage import (
     GPKG_APPLICATION_ID,
     GPKG_USER_VERSION,
@@ -52,6 +58,7 @@ from .project_builder import (
 
 __all__ = [
     "USAPPackage",
+    "DEFAULT_SCHEMA_PATH",
     "USAPError",
     "USAPAmbiguityError",
     "ELEMENT_KIND_FACE",
@@ -68,7 +75,9 @@ __all__ = [
     "create_synthetic_package",
     "ValidationIssue",
     "ValidationReport",
+    "VALIDATION_LEVELS",
     "validate_connection",
+    "verify_assets",
     "GPKG_APPLICATION_ID",
     "GPKG_USER_VERSION",
     "USAP_EXTENSION_NAME",

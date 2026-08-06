@@ -8,23 +8,24 @@ import numpy as np
 import pytest
 import trimesh
 
-from usap import ELEMENT_KIND_FACE, USAPPackage
+from usap import DEFAULT_SCHEMA_PATH, ELEMENT_KIND_FACE, USAPPackage
 
-SCHEMA_PATH = Path(__file__).resolve().parents[1] / "sql" / "schema.sql"
+# Re-exported: tests that need the schema path must get it from the package,
+# never from the checkout layout, so the suite passes against an installed wheel.
+SCHEMA_PATH = DEFAULT_SCHEMA_PATH
 
 
 def make_pkg(tmp_path: Path, name: str = "pkg.usap.gpkg") -> USAPPackage:
     """Create a fresh empty package under tmp_path."""
     return USAPPackage.create(
         tmp_path / name,
-        schema_path=SCHEMA_PATH,
         overwrite=True,
     )
 
 
 def make_mesh_part(pkg: USAPPackage, element_count: int = 100) -> int:
     """Register a bare mesh asset with one face part; returns asset_part_id."""
-    asset_id = pkg.register_asset(uri="mesh.glb", asset_kind="mesh")
+    asset_id = pkg.register_asset(uri="mesh.ply", asset_kind="mesh")
 
     return pkg.register_asset_part(
         asset_id=asset_id,

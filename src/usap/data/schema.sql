@@ -7,11 +7,10 @@
 -- 5. usap_semantic_class_closure
 -- 6. usap_city_object
 -- 7. usap_city_object_relationship
--- 8. usap_city_object_closure
--- 9. usap_annotation
--- 10. usap_annotation_object
--- 11. usap_membership_block
--- 12. usap_value_block
+-- 8. usap_annotation
+-- 9. usap_annotation_object
+-- 10. usap_membership_block
+-- 11. usap_value_block
 -- 13. optional indexes
 -- 14. optional helper tables
 -- 15. GIS-facing views (attributes + features layers for QGIS/GDAL)
@@ -234,26 +233,6 @@ ON usap_city_object_relationship(
     relationship_type
 );
 
-CREATE TABLE usap_city_object_closure (
-    graph_name                  TEXT NOT NULL,
-
-    ancestor_city_object_id     INTEGER NOT NULL
-        REFERENCES usap_city_object(city_object_id)
-        ON DELETE CASCADE,
-
-    descendant_city_object_id   INTEGER NOT NULL
-        REFERENCES usap_city_object(city_object_id)
-        ON DELETE CASCADE,
-
-    depth                       INTEGER NOT NULL,
-
-    PRIMARY KEY (
-        graph_name,
-        ancestor_city_object_id,
-        descendant_city_object_id
-    )
-) WITHOUT ROWID;
-
 CREATE TABLE usap_annotation (
     annotation_id          INTEGER PRIMARY KEY,
     annotation_uid         TEXT NOT NULL UNIQUE,
@@ -391,12 +370,17 @@ CREATE TABLE usap_edit_log (
 -- tables (blocks, closures, edit log) are deliberately not exposed.
 -- -------------------------------------------------------------------------
 
--- Every view exposes its integer key as "fid": SQLite views have no rowid,
--- and OGR/QGIS reliably map a column named fid to the feature id (older
--- GDAL versions fail to open views without it).
+-- Every view exposes its integer key as "OGC_FID": SQLite views have no
+-- rowid, and GDAL's GeoPackage driver documents OGC_FID as the alias it
+-- recognises as a view's primary-key-like column. A column merely named
+-- "fid" is carried as an ordinary attribute, so the layer opened but its
+-- feature ids were GDAL's own row numbers, not USAP ids.
+--
+-- Aggregate columns are CAST to INTEGER: without it GDAL infers them as
+-- strings, since a view expression carries no declared column type.
 CREATE VIEW usap_annotations_view AS
 SELECT
-    a.annotation_id AS fid,
+    a.annotation_id AS OGC_FID,
     a.annotation_uid,
     sc.local_name AS concept,
     sc.class_uri AS concept_uri,
@@ -405,16 +389,16 @@ SELECT
     a.label,
     a.status,
     a.confidence,
-    (
+    CAST((
         SELECT COALESCE(SUM(mb.element_count), 0)
         FROM usap_membership_block AS mb
         WHERE mb.annotation_id = a.annotation_id
-    ) AS selected_element_count,
-    (
+    ) AS INTEGER) AS selected_element_count,
+    CAST((
         SELECT COUNT(DISTINCT vb.asset_part_id)
         FROM usap_value_block AS vb
         WHERE vb.annotation_id = a.annotation_id
-    ) AS value_field_count,
+    ) AS INTEGER) AS value_field_count,
     a.attributes_json,
     a.created_at,
     a.updated_at
@@ -426,14 +410,16 @@ LEFT JOIN usap_city_object AS co
 
 CREATE VIEW usap_concepts_view AS
 SELECT
-    sc.semantic_class_id AS fid,
+    sc.semantic_class_id AS OGC_FID,
     sc.scheme,
     sc.scheme_version,
     sc.class_uri,
     sc.local_name,
     sc.is_ade,
-    COUNT(a.annotation_id) AS annotation_count,
-    CASE WHEN COUNT(a.annotation_id) > 0 THEN 1 ELSE 0 END AS in_use
+    CAST(COUNT(a.annotation_id) AS INTEGER) AS annotation_count,
+    CAST(
+        CASE WHEN COUNT(a.annotation_id) > 0 THEN 1 ELSE 0 END AS INTEGER
+    ) AS in_use
 FROM usap_semantic_class AS sc
 LEFT JOIN usap_annotation AS a
     ON a.semantic_class_id = sc.semantic_class_id
@@ -441,7 +427,7 @@ GROUP BY sc.semantic_class_id;
 
 CREATE VIEW usap_city_objects_view AS
 SELECT
-    co.city_object_id AS fid,
+    co.city_object_id AS OGC_FID,
     co.object_uid,
     sc.local_name AS semantic_class,
     co.object_status,
@@ -455,20 +441,20 @@ LEFT JOIN usap_asset AS src
 
 CREATE VIEW usap_asset_extents AS
 SELECT
-    e.asset_id AS fid,
+    e.asset_id AS OGC_FID,
     e.geom,
     a.uri,
     a.asset_kind,
-    (
+    CAST((
         SELECT COUNT(*)
         FROM usap_asset_part AS ap
         WHERE ap.asset_id = e.asset_id
-    ) AS part_count,
-    (
+    ) AS INTEGER) AS part_count,
+    CAST((
         SELECT COALESCE(SUM(ap.element_count), 0)
         FROM usap_asset_part AS ap
         WHERE ap.asset_id = e.asset_id
-    ) AS element_count
+    ) AS INTEGER) AS element_count
 FROM usap_asset_extent AS e
 JOIN usap_asset AS a
     ON a.asset_id = e.asset_id;

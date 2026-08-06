@@ -8,9 +8,13 @@ else the queries touch is an accelerator holding no independent information:
     A1  membership block_start pruning (usap_mb_by_element_block index and
         the uniform-block-size contract in usap_profile)
     A2  usap_semantic_class_closure    (derivable from parent_class_id)
-    A3  usap_city_object_closure       (derivable from relationship edges)
     A4  per-block value_min/value_max skipping in elements_where
     A5  SQL-only aggregates in value_field_stats
+
+A3 (usap_city_object_closure) used to be measured here. It was found not to
+be performance-necessary, and elements_for_city_object now walks the
+relationship edges with the recursive CTE that used to be A3's naive side —
+so there is no longer an accelerator to ablate.
 
 For each ablation this script runs the accelerated SDK query and a naive
 equivalent that uses only base tables (recursive CTEs, full decode), asserts
@@ -47,6 +51,7 @@ from statistics import mean
 import numpy as np
 
 from usap import (
+    DEFAULT_SCHEMA_PATH,
     ELEMENT_KIND_FACE,
     SyntheticConfig,
     USAPPackage,
@@ -285,68 +290,6 @@ def naive_class_descendant_blocks(
     return [dict(row) for row in rows]
 
 
-def naive_object_descendant_blocks(
-    pkg: USAPPackage,
-    object_uid: str,
-    graph_name: str,
-) -> list[dict]:
-    """
-    A3 naive: recursive CTE over usap_city_object_relationship instead of
-    reading usap_city_object_closure. UNION (not UNION ALL) so a cyclic
-    graph still terminates.
-
-    CROSS JOIN pins the join order (queue row -> its edges): with a plain
-    JOIN, SQLite picks usap_rel_by_child_graph on its graph_name prefix and
-    rescans every edge per recursive step, which is ~400x slower here.
-    """
-    root = pkg.conn.execute(
-        """
-        SELECT city_object_id
-        FROM usap_city_object
-        WHERE object_uid = ?
-        """,
-        (object_uid,),
-    ).fetchone()
-
-    if root is None:
-        return []
-
-    columns = ", ".join(f"mb.{name}" for name in MEMBERSHIP_BLOCK_COLUMNS)
-
-    rows = pkg.conn.execute(
-        f"""
-        WITH RECURSIVE descendants(object_id) AS (
-            SELECT ?
-            UNION
-            SELECT r.child_city_object_id
-            FROM descendants AS d
-            CROSS JOIN usap_city_object_relationship AS r
-                ON r.parent_city_object_id = d.object_id
-            WHERE r.graph_name = ?
-        )
-        SELECT {columns}
-        FROM usap_membership_block AS mb
-        WHERE mb.annotation_id IN (
-            SELECT ao.annotation_id
-            FROM usap_annotation_object AS ao
-            WHERE ao.city_object_id IN (SELECT object_id FROM descendants)
-            UNION
-            SELECT a.annotation_id
-            FROM usap_annotation AS a
-            WHERE a.primary_city_object_id IN (SELECT object_id FROM descendants)
-        )
-        ORDER BY
-            mb.asset_part_id,
-            mb.element_kind,
-            mb.block_start,
-            mb.annotation_id
-        """,
-        (int(root["city_object_id"]), graph_name),
-    ).fetchall()
-
-    return [dict(row) for row in rows]
-
-
 def fetch_value_blocks(pkg: USAPPackage, annotation_id: int) -> list:
     return pkg.conn.execute(
         """
@@ -525,7 +468,6 @@ def deepen_package(pkg: USAPPackage, result, config: SyntheticConfig) -> dict:
                 child_city_object_id=district_id,
                 relationship_type="contains",
                 graph_name="usap_default",
-                rebuild_closure=False,
             )
 
         buildings = pkg.conn.execute(
@@ -544,13 +486,7 @@ def deepen_package(pkg: USAPPackage, result, config: SyntheticConfig) -> dict:
                 child_city_object_id=int(row["city_object_id"]),
                 relationship_type="contains",
                 graph_name="usap_default",
-                rebuild_closure=False,
             )
-
-    # The closure rebuild is the maintenance cost of the A3 accelerator.
-    rebuild_start = time.perf_counter()
-    pkg.rebuild_city_object_closure(graph_name="usap_default")
-    rebuild_seconds = time.perf_counter() - rebuild_start
 
     # 3. Two whole-part value fields (f4): a gradient the min/max pruning
     # can exploit, and uniform noise it cannot.
@@ -592,7 +528,6 @@ def deepen_package(pkg: USAPPackage, result, config: SyntheticConfig) -> dict:
 
     return {
         "district_count": district_count,
-        "closure_rebuild_seconds": rebuild_seconds,
         "gradient_annotation_id": int(gradient_annotation["annotation_id"]),
         "noise_annotation_id": int(noise_annotation["annotation_id"]),
     }
@@ -691,41 +626,6 @@ def run_ablations(
     ablations.append(
         AblationResult(
             name="A2 semantic-class closure vs recursive CTE (Building subtree)",
-            accelerated=accel_timing,
-            naive=naive_timing,
-            detail=f"{len(accel_result)} membership blocks",
-        )
-    )
-
-    # --- A3: object descendants without usap_city_object_closure -------
-    accel_timing, accel_result = time_operation(
-        "A3 accel",
-        repeat,
-        lambda: pkg.elements_for_city_object(
-            object_uid="city_root",
-            include_descendants=True,
-            graph_name="usap_default",
-            expand=False,
-        ),
-    )
-
-    naive_timing, naive_result = time_operation(
-        "A3 naive",
-        repeat,
-        lambda: naive_object_descendant_blocks(
-            pkg, "city_root", "usap_default"
-        ),
-    )
-
-    require_equal(
-        "A3",
-        canon_block_dicts(accel_result),
-        canon_block_dicts(naive_result),
-    )
-
-    ablations.append(
-        AblationResult(
-            name="A3 city-object closure vs recursive CTE (root, depth 3)",
             accelerated=accel_timing,
             naive=naive_timing,
             detail=f"{len(accel_result)} membership blocks",
@@ -957,8 +857,8 @@ def main() -> None:
 
     parser.add_argument(
         "--schema",
-        default="sql/schema.sql",
-        help="Path to USAP schema.sql.",
+        default=str(DEFAULT_SCHEMA_PATH),
+        help="Path to USAP schema.sql (defaults to the packaged one).",
     )
 
     parser.add_argument(
@@ -1040,7 +940,6 @@ def main() -> None:
 
         db_size = os.path.getsize(db_path)
         relationship_count = count_rows(pkg, "usap_city_object_relationship")
-        object_closure_count = count_rows(pkg, "usap_city_object_closure")
         class_count = count_rows(pkg, "usap_semantic_class")
         class_closure_count = count_rows(pkg, "usap_semantic_class_closure")
         membership_block_count = count_rows(pkg, "usap_membership_block")
@@ -1060,13 +959,7 @@ def main() -> None:
         print_ablation_table(ablations)
 
         costs = {
-            "city-object closure rebuild": (
-                f"{setup['closure_rebuild_seconds']:.3f} s"
-            ),
-            "usap_city_object_closure rows": (
-                f"{object_closure_count} "
-                f"(vs {relationship_count} relationship rows)"
-            ),
+            "usap_city_object_relationship rows": f"{relationship_count}",
             "usap_semantic_class_closure rows": (
                 f"{class_closure_count} (vs {class_count} classes)"
             ),

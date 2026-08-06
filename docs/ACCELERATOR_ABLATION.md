@@ -11,7 +11,10 @@ This document records a design investigation (2026-07) into three questions:
 
 Question 3 was answered empirically with an ablation benchmark:
 [scripts/benchmark_accelerator_ablation.py](../scripts/benchmark_accelerator_ablation.py)
-(per-scale reports in `outputs/ablation_*_buildings.md`).
+(the script writes per-scale reports to whatever `--md`/`--json` paths you
+pass; `outputs/` is gitignored, so the numbers quoted below are **not**
+accompanied by their archived raw reports, exact environment, or run
+dispersion — re-run the script to reproduce them).
 
 ---
 
@@ -29,7 +32,8 @@ Four tables are irreducible; a fifth is arguable:
 
 Everything else is droppable in a storage-only view:
 
-- `usap_semantic_class_closure`, `usap_city_object_closure` — derivable
+- `usap_semantic_class_closure`, `usap_city_object_closure` (removed in
+  0.1.0 as a result of this investigation, see §4) — derivable
   accelerators (from `parent_class_id` / relationship edges).
 - `usap_city_object` + `usap_city_object_relationship` +
   `usap_annotation_object` — the identity layer; needed only for
@@ -71,7 +75,7 @@ composition, not a new concept.
 | `annotations_for_elements` (pick → claims) | `usap_membership_block`, `usap_profile` | Global block size → candidate `block_start`s; index `usap_mb_by_element_block`; only candidate payloads decoded. |
 | `elements_for_annotation` | `usap_membership_block` | `UNIQUE(annotation_id, …)` auto-index. |
 | `elements_for_semantic_class` | `usap_semantic_class_closure`, `usap_annotation`, `usap_membership_block` | Closure PK expands "class + subclasses"; `usap_annotation_by_class`. |
-| `elements_for_city_object` | `usap_city_object`, `usap_city_object_closure`, `usap_annotation_object` ∪ `primary_city_object_id`, `usap_membership_block` | Closure PK expands descendants per graph. |
+| `elements_for_city_object` | `usap_city_object`, `usap_city_object_relationship`, `usap_annotation_object` ∪ `primary_city_object_id`, `usap_membership_block` | Recursive CTE expands descendants per graph, following containment edge types only. |
 | `values_for_annotation`, `elements_where`, `value_field_stats` | `usap_value_block` (+ `usap_asset_part` coverage contract) | Per-block `value_min`/`value_max` skipping; stats never decodes a payload. |
 | `list_*` browse queries | `usap_annotation`, `usap_city_object`, `usap_semantic_class` + link tables | Tree expansion uses relationship edges directly (not closure). |
 | GIS browse (QGIS) | `usap_asset_extent`, `gpkg_*`, views | — |
@@ -138,14 +142,51 @@ Same logical query, ~400× apart on the spelling.
 
 | Structure | Verdict |
 |---|---|
-| Membership block partitioning + `usap_mb_by_element_block` | **Necessary.** 13–251× on the interactive reverse query; the win comes from the storage layout itself and cannot be recovered by smarter SQL (the cost is payload decoding, not query planning). |
+| Membership block partitioning + `usap_mb_by_element_block` | **Necessary for the tested workload.** 13–251× on the interactive reverse query; the win comes from the storage layout itself and cannot be recovered by smarter SQL (the cost is payload decoding, not query planning). |
 | `usap_semantic_class_closure` | **Not performance-necessary.** The recursive CTE over `parent_class_id` is marginally faster at every scale tested. |
-| `usap_city_object_closure` | **Not performance-necessary** — a well-written CTE matches it. Its real value is robustness and interop (below). |
+| `usap_city_object_closure` | **Removed.** Not performance-necessary — a well-written CTE matches it — and it was the source of two silent-wrong-answer bugs (§4.1). |
 | `value_min`/`value_max` skipping | Cheap, worth keeping; pays 4× on structured data, ~nothing on uniform data. |
 | SQL-only `value_field_stats` | Huge ratio (245×) but naive is only ~10ms at 1M values — convenience, not necessity. |
 | `min/max_element_index` on membership blocks | **Dead weight** — written always, read never. Drop or start using. |
 
+### 4.1 Why `usap_city_object_closure` was removed (decision, 0.1.0)
+
+The benchmark above says the closure is a performance wash. It was removed
+anyway, and **performance was not the deciding argument** — correctness was.
+A stored transitive closure is derived state that must be rebuilt to stay
+true, and two defects followed directly from that:
+
+- an object created without edges got no self-row, so it vanished from the
+  default `include_descendants=True` query while validation called the
+  package valid;
+- the rebuild selected parent/child ids only, ignoring `relationship_type`,
+  so a non-containment edge (`adjacentTo`) made its target a *part* of the
+  source and handed back the neighbour's elements.
+
+Neither is fixable by being more careful: the first is a rebuild the write
+path did not owe, the second requires the containment-type policy to be
+decided at write time, which freezes it into stored rows. Walking the edges
+puts both where they belong — the policy becomes a query argument
+(`containment_types`), and there is nothing to keep in step. The rebuild that
+`link_city_objects` triggered per edge (O(objects x depth), full table
+rewrite) also disappears, which matters at city scale.
+
+The costs in §5 below were accepted knowingly, with these mitigations:
+
+- **planner fragility** — the `CROSS JOIN` spelling now lives in exactly one
+  place (`_descendants_cte` in `core.py`) with the reason in its docstring,
+  and this benchmark still aborts on any accelerated/naive mismatch;
+- **third-party queryability** — `list_city_objects(descendants_of=...)`
+  answers "this object and its parts" from the SDK; raw-SQL consumers do
+  have to write the recursive CTE themselves, which is a genuine regression
+  for QGIS/DB-Browser users and the main price paid here;
+- **read-time cost** — accepted; USAP object graphs are shallow (building →
+  part → surface → opening).
+
 ## 5. Downsides of replacing closures with smart queries
+
+*(The analysis as written before the §4.1 decision — kept because the trade
+is real and was made with these arguments in view, not against them.)*
 
 1. **Planner fragility (demonstrated).** 10ms vs 6s on the spelling of one
    join; depends on `CROSS JOIN`'s SQLite-specific order-pinning; planner
@@ -165,9 +206,12 @@ Same logical query, ~400× apart on the spelling.
    dependency.
 
 **Overall:** at prototype scale the performance argument is a wash, so the
-closure decision rests on (1) and (2) — both favor keeping the closures.
-The genuine simplification candidate found by this investigation is not a
-table but the dead `min/max_element_index` columns.
+closure decision rests on (1) and (2) — which favored keeping the closures.
+The correctness argument in §4.1 outweighed them for the *object* closure,
+which was removed; `usap_semantic_class_closure` is not affected (class
+parentage is seeded, not edited edge by edge, and carries no type policy) and
+stays. The other simplification candidate found here is the dead
+`min/max_element_index` columns.
 
 ## Reproducing
 
@@ -176,5 +220,7 @@ python scripts/benchmark_accelerator_ablation.py --buildings 2000 --repeat 5 \
     --md outputs/ablation_2000_buildings.md
 ```
 
-Any naive/accelerated result mismatch aborts the run; a completed run is
-itself the functional-completeness proof.
+Any naive/accelerated result mismatch aborts the run, so a completed run
+establishes that the accelerators and the base tables answer the tested
+queries equivalently over the tested fixtures. That is an equivalence check,
+not a proof of functional completeness in general.

@@ -7,6 +7,7 @@ from pathlib import Path
 from .._util import sha256_file
 from ..constants import ELEMENT_KIND_POINT
 from ..core import USAPPackage
+from ..errors import USAPError
 from ..geopackage import ensure_srs_row, epsg_from_wkt
 
 
@@ -38,8 +39,22 @@ def _guess_las_media_type(path: Path) -> str:
 
 
 def _try_read_crs_wkt(header) -> str | None:
+    """
+    Read the file's CRS as WKT, or None when the file declares none.
+
+    A missing CRS backend is NOT None: laspy parses CRS through pyproj, so
+    swallowing ImportError here would make "pyproj is not installed" look
+    exactly like "this file has no CRS" — and the package would then be built
+    with an undefined SRS from a file that had one. Install the 'crs' extra.
+    """
     try:
         crs = header.parse_crs()
+    except ImportError as exc:
+        raise USAPError(
+            "Reading the LAS/LAZ CRS requires pyproj: "
+            "install usap[crs]. Pass a CRS explicitly (project config "
+            f"'srs_id'/'srs_wkt') to register without it. Original error: {exc}"
+        ) from exc
     except Exception:
         return None
 

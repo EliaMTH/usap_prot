@@ -1,8 +1,4 @@
 {
-  "vocabularies": [
-    "../../vocabularies/citygml_3_0_mvp.json",
-    "../../vocabularies/usap_ade_prototype.json"
-  ],
   "annotations": [
     {
       "annotation_uid": "ann_batch_energy_roof_001",

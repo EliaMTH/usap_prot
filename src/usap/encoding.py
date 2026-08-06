@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import struct
 import zlib
-from collections import defaultdict
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -10,31 +9,105 @@ from .constants import VALUE_DTYPES
 from .errors import USAPError
 
 
-def encode_u32_zlib(offsets: list[int]) -> bytes:
-    offsets = sorted(set(offsets))
+# Element indices are the one place USAP handles user data at asset scale: a
+# selection over a 10 GB point cloud is hundreds of millions of them. They are
+# therefore carried as numpy arrays throughout this module — a list of Python
+# ints costs ~28 bytes each, and struct.pack("<" + "I" * n) builds a format
+# string as long as the data. Public functions still accept and return plain
+# lists so callers need not change.
+IndexArray = Sequence[int] | np.ndarray
 
-    for value in offsets:
-        if value < 0:
-            raise USAPError(f"Negative offset: {value}")
-        if value > 2**32 - 1:
-            raise USAPError(f"Offset too large for uint32: {value}")
-
-    raw = struct.pack("<" + "I" * len(offsets), *offsets)
-    return zlib.compress(raw)
+# A payload is decompressed before anything has checked how big it will get,
+# so an untrusted package could otherwise hand over a few KB that expand to
+# gigabytes. A real membership block holds at most block_size offsets (16 KiB
+# at the 4096 default), so this ceiling is far above anything legitimate while
+# still bounded.
+MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024
 
 
-def decode_u32_zlib(payload: bytes) -> list[int]:
-    raw = zlib.decompress(payload)
+def _decompress_bounded(payload: bytes, max_bytes: int) -> bytes:
+    """
+    zlib.decompress with a hard ceiling on the output size.
+    """
+    decompressor = zlib.decompressobj()
+    raw = decompressor.decompress(payload, max_bytes)
+
+    if decompressor.unconsumed_tail:
+        raise USAPError(
+            f"Payload decompresses to more than {max_bytes} bytes; refusing "
+            "to continue."
+        )
+
+    return raw
+
+
+def as_index_array(indices: IndexArray) -> np.ndarray:
+    """
+    Normalize element indices to a sorted, duplicate-free uint32 array.
+
+    Sorting and de-duplication are what the storage format expects, and doing
+    them here means every writer gets them for the same cost.
+
+    Deliberately does NOT use np.unique: on numpy 2.4 it costs ~10 s for 10 M
+    int64 where np.sort costs ~0.2 s. Sort-then-mask is the same result at
+    1/45th the price. An input that is already sorted and duplicate-free
+    (which is what every internal caller passes on) skips even that — the
+    monotonicity check is a single vectorized pass.
+    """
+    values = np.asarray(indices)
+
+    if values.size == 0:
+        return np.empty(0, dtype=np.uint32)
+
+    if not np.issubdtype(values.dtype, np.integer):
+        # Reject 3.5 as an index rather than silently truncating it to 3.
+        rounded = np.asarray(values, dtype=np.int64)
+
+        if not np.array_equal(rounded, values):
+            raise USAPError("Element indices must be integers.")
+
+        values = rounded
+
+    if values.ndim != 1:
+        values = values.reshape(-1)
+
+    if not (values.size == 1 or np.all(np.diff(values) > 0)):
+        values = np.sort(values)
+        keep = np.empty(values.size, dtype=bool)
+        keep[0] = True
+        np.not_equal(values[1:], values[:-1], out=keep[1:])
+        values = values[keep]
+
+    if values[0] < 0:
+        raise USAPError(f"Negative element index: {int(values[0])}")
+
+    if values[-1] > 2**32 - 1:
+        raise USAPError(f"Element index too large for uint32: {int(values[-1])}")
+
+    return values.astype(np.uint32, copy=False)
+
+
+def encode_u32_zlib(offsets: IndexArray) -> bytes:
+    return zlib.compress(as_index_array(offsets).astype("<u4").tobytes())
+
+
+def decode_u32_zlib_array(payload: bytes) -> np.ndarray:
+    """
+    Decode a u32-zlib payload to a uint32 array (no per-element Python objects).
+    """
+    try:
+        raw = _decompress_bounded(payload, MAX_DECOMPRESSED_BYTES)
+    except zlib.error as exc:
+        raise USAPError(f"Corrupt u32-zlib payload: {exc}") from exc
 
     if len(raw) % 4 != 0:
         raise USAPError("Invalid u32-zlib payload length")
 
-    count = len(raw) // 4
+    return np.frombuffer(raw, dtype="<u4")
 
-    if count == 0:
-        return []
 
-    return list(struct.unpack("<" + "I" * count, raw))
+def decode_u32_zlib(payload: bytes) -> list[int]:
+    return decode_u32_zlib_array(payload).tolist()
 
 
 def encode_value_block(values: np.ndarray, value_dtype: str) -> bytes:
@@ -64,14 +137,19 @@ def decode_value_block(
     if value_dtype not in VALUE_DTYPES:
         raise USAPError(f"Unsupported value_dtype: {value_dtype!r}")
 
+    dtype = np.dtype("<" + value_dtype)
+
+    # The declared element_count is an exact expected size here, so the
+    # decompression ceiling can be exact too: one extra byte already means
+    # the payload disagrees with the row.
+    expected_bytes = element_count * dtype.itemsize
+
     try:
-        raw = zlib.decompress(payload)
+        raw = _decompress_bounded(payload, expected_bytes + 1)
     except zlib.error as exc:
         raise USAPError(f"Corrupt value-block payload: {exc}") from exc
 
-    dtype = np.dtype("<" + value_dtype)
-
-    if len(raw) != element_count * dtype.itemsize:
+    if len(raw) != expected_bytes:
         raise USAPError(
             f"Value-block payload holds {len(raw) // dtype.itemsize} values, "
             f"declared element_count is {element_count}."
@@ -85,17 +163,31 @@ def block_start_for_index(index: int, block_size: int) -> int:
 
 
 def split_indices_into_blocks(
-    indices: list[int],
+    indices: IndexArray,
     block_size: int,
-) -> dict[int, list[int]]:
-    blocks: dict[int, list[int]] = defaultdict(list)
+) -> dict[int, np.ndarray]:
+    """
+    Group element indices by their block, as within-block offsets.
 
-    for index in sorted(set(indices)):
-        if index < 0:
-            raise USAPError(f"Negative element index: {index}")
+    Returns {block_start: offsets}. Vectorized: the indices arrive sorted from
+    as_index_array, so each block is one contiguous slice and the split is a
+    search for the boundaries rather than a per-index Python loop.
+    """
+    values = as_index_array(indices)
 
-        bs = block_start_for_index(index, block_size)
-        offset = index - bs
-        blocks[bs].append(offset)
+    if values.size == 0:
+        return {}
 
-    return dict(blocks)
+    block_starts = (values // block_size) * block_size
+
+    # Sorted input => equal block_starts are adjacent, so the boundaries are
+    # exactly the positions where block_start changes.
+    boundaries = np.flatnonzero(np.diff(block_starts)) + 1
+    groups = np.split(values, boundaries)
+
+    return {
+        int(group[0] // block_size) * block_size: (
+            group - (group[0] // block_size) * block_size
+        )
+        for group in groups
+    }

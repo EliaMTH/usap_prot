@@ -17,6 +17,7 @@ from conftest import write_tiny_las as _write_tiny_las
 from conftest import write_tiny_mesh as _write_tiny_mesh
 
 from usap import (
+    USAPError,
     USAPPackage,
     apply_annotation_batch,
     build_project_package_from_file,
@@ -38,6 +39,11 @@ WKT1_25833 = (
     'AUTHORITY["EPSG","25833"]]'
 )
 WKT2_25833 = 'PROJCRS["ETRS89 / UTM zone 33N",ID["EPSG",25833]]'
+WKT_3857 = (
+    'PROJCS["WGS 84 / Pseudo-Mercator",'
+    'GEOGCS["WGS 84",AUTHORITY["EPSG","4326"]],'
+    'AUTHORITY["EPSG","3857"]]'
+)
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +168,7 @@ def test_asset_extent_is_union_of_part_bounds(tmp_path: Path) -> None:
         assert envelope["srs_id"] == -1  # undeclared CRS
 
         view_row = pkg.conn.execute(
-            "SELECT * FROM usap_asset_extents WHERE fid = ?",
+            "SELECT * FROM usap_asset_extents WHERE OGC_FID = ?",
             (asset_id,),
         ).fetchone()
 
@@ -325,6 +331,10 @@ def test_builder_config_srs_and_las_sniffing(tmp_path: Path, monkeypatch) -> Non
                 "db_path": "srs.usap.gpkg",
                 "las": [{"path": "tiny.las", "compute_hash": False}],
                 "srs_id": 3857,
+                # A declared SRS needs its definition: GeoPackage requires a
+                # record defining every SRS the package uses, and 'undefined'
+                # is reserved for the built-in ids -1/0.
+                "srs_wkt": WKT_3857,
             }
         ),
         encoding="utf-8",
@@ -375,3 +385,129 @@ def test_builder_config_srs_and_las_sniffing(tmp_path: Path, monkeypatch) -> Non
         assert las_asset_srs == 25833
 
         assert_package_valid(pkg)
+
+
+def test_srs_row_needs_a_definition(tmp_path: Path) -> None:
+    # GeoPackage reserves the "undefined" definitions for srs_id -1 and 0 and
+    # requires a record defining every SRS the package uses. Writing
+    # definition='undefined' under a positive EPSG code produced a row that
+    # named a CRS without defining it — and INSERT OR IGNORE meant a later
+    # call with real WKT could never repair it.
+    from usap.geopackage import ensure_srs_row
+
+    with _make_pkg(tmp_path) as pkg:
+        with pytest.raises(USAPError, match="without a definition"):
+            ensure_srs_row(pkg.conn, 25833)
+
+        ensure_srs_row(pkg.conn, 25833, definition_wkt=WKT1_25833)
+
+        row = pkg.conn.execute(
+            "SELECT definition FROM gpkg_spatial_ref_sys WHERE srs_id = 25833"
+        ).fetchone()
+
+        assert row["definition"] == WKT1_25833
+
+
+def test_incomplete_srs_row_is_repaired(tmp_path: Path) -> None:
+    # Packages written before this carry definition='undefined' rows. The
+    # first call that knows the real WKT must fix them in place.
+    from usap.geopackage import ensure_srs_row
+
+    with _make_pkg(tmp_path) as pkg:
+        with pkg.transaction():
+            pkg.conn.execute(
+                """
+                INSERT INTO gpkg_spatial_ref_sys (
+                    srs_name, srs_id, organization,
+                    organization_coordsys_id, definition
+                )
+                VALUES ('EPSG:25833', 25833, 'EPSG', 25833, 'undefined')
+                """
+            )
+
+        ensure_srs_row(pkg.conn, 25833, definition_wkt=WKT1_25833)
+
+        row = pkg.conn.execute(
+            "SELECT definition FROM gpkg_spatial_ref_sys WHERE srs_id = 25833"
+        ).fetchone()
+
+        assert row["definition"] == WKT1_25833
+
+
+def test_mixed_asset_crs_is_reported(tmp_path: Path) -> None:
+    # set_package_srs rewrites the srs_id in the extent blobs but never
+    # transforms a coordinate, so one CRS per package is an assumption the
+    # build does not enforce. Say so rather than misplacing assets silently.
+    with _make_pkg(tmp_path) as pkg:
+        for uri, srs_id in [("a.las", 25833), ("b.las", 3857)]:
+            pkg.register_asset(uri=uri, asset_kind="pointcloud", srs_id=srs_id)
+
+        report = pkg.validate_report()
+
+        assert report.is_ok  # a warning, not an error
+        assert "MIXED_ASSET_CRS" in {issue.code for issue in report.issues}
+
+
+def test_extension_definition_is_a_uri(tmp_path: Path) -> None:
+    # The standard asks gpkg_extensions.definition for a permalink/URI to the
+    # document defining the extension, not a prose description of it.
+    with _make_pkg(tmp_path) as pkg:
+        definitions = {
+            row["definition"]
+            for row in pkg.conn.execute(
+                "SELECT definition FROM gpkg_extensions WHERE extension_name = ?",
+                ("usap_core",),
+            ).fetchall()
+        }
+
+        assert len(definitions) == 1
+        assert definitions.pop().startswith("https://")
+
+
+def test_view_keys_and_aggregate_types(tmp_path: Path) -> None:
+    # GDAL recognises OGC_FID as a view's primary-key-like column; a column
+    # merely named "fid" is carried as an ordinary attribute, so the layer
+    # opened but its feature ids were GDAL row numbers rather than USAP ids.
+    # Aggregates need explicit casts or they are inferred as strings.
+    with _make_pkg(tmp_path) as pkg:
+        pkg.create_semantic_class(
+            scheme="s", class_uri="s:Roof", local_name="Roof"
+        )
+        asset_id = pkg.register_asset(uri="mesh", asset_kind="mesh")
+        part = pkg.register_asset_part(asset_id, "g/0", "face", 10)
+
+        pkg.annotate_elements(
+            concept="Roof",
+            annotation_uid="ann_types",
+            asset_part_id=part,
+            element_kind="face",
+            element_indices=[1, 2],
+        )
+
+        for view in [
+            "usap_annotations_view",
+            "usap_concepts_view",
+            "usap_city_objects_view",
+            "usap_asset_extents",
+        ]:
+            columns = [
+                row[1]
+                for row in pkg.conn.execute(f"PRAGMA table_info({view})")
+            ]
+
+            assert columns[0] == "OGC_FID", view
+
+        row = pkg.conn.execute(
+            "SELECT * FROM usap_annotations_view WHERE annotation_uid = ?",
+            ("ann_types",),
+        ).fetchone()
+
+        assert isinstance(row["selected_element_count"], int)
+        assert isinstance(row["value_field_count"], int)
+
+        concept_row = pkg.conn.execute(
+            "SELECT * FROM usap_concepts_view WHERE local_name = 'Roof'"
+        ).fetchone()
+
+        assert isinstance(concept_row["annotation_count"], int)
+        assert isinstance(concept_row["in_use"], int)

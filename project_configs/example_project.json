@@ -1,12 +1,6 @@
 {
   "db_path": "../outputs/example_project.usap.gpkg",
   "manifest_path": "../outputs/example_project_manifest.json",
-  "schema_path": "../sql/schema.sql",
-
-  "vocabularies": [
-    "../vocabularies/citygml_3_0_mvp.json",
-    "../vocabularies/usap_ade_prototype.json"
-  ],
 
   "citygml": {
     "path": "../data/area.gml",

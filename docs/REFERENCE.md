@@ -5,7 +5,7 @@ USAP is a prototype Python package and SQLite/GeoPackage-style data model for st
 The current prototype bundles adapters for:
 
 - **LAS/LAZ point clouds** using stable point indices.
-- **Mesh files** using stable face indices.
+- **Mesh files** (`.obj`/`.ply`/`.stl`) using stable face indices.
 - **CityGML semantic objects** using imported `gml:id` / object identifiers.
 
 However, any asset with stable integer-indexed elements of one of the four kinds — point, face, vertex, or feature (`feature` is declared but not yet exercised) — can be declared directly via `register_asset` + `register_asset_part`, without an adapter.
@@ -55,12 +55,12 @@ usap_prot/
   pyproject.toml
   README.md  INGESTION.md  REFERENCE.md  TESTS.md
 
-  sql/schema.sql        the package schema (USAP tables + GeoPackage
-                        metadata tables + GIS views)
   src/usap/             the Python SDK: core, validation, geopackage,
                         domain_vocab, batch, project_builder, synthetic
     adapters/           LAS / mesh / CityGML adapters
-  vocabularies/         example concept registries (CityGML 3.0 MVP subset,
+    data/schema.sql     the package schema (USAP tables + GeoPackage
+                        metadata tables + GIS views)
+    data/vocabularies/  example concept registries (CityGML 3.0 MVP subset,
                         ADE prototype, minimal local scheme)
   examples/             runnable CLI scripts: build, validate, smoke test,
                         batch apply, demos
@@ -80,9 +80,15 @@ mode:
 python -m pip install -e .
 ```
 
-> Note: `USAPPackage.create()` resolves its default `schema_path` to the
-> repository's `sql/schema.sql`, which a plain wheel install does not ship —
-> work from a checkout / editable install, or pass `schema_path` explicitly.
+LAS is supported by the base install; LAZ and CRS parsing each need a backend
+of their own, so they are optional extras:
+
+```bash
+python -m pip install -e ".[laz,crs]"
+```
+
+Without them, a `.laz` file fails to open and reading a CRS raises a
+capability error — neither degrades silently into "this file has no CRS".
 
 Run the test suite (described in [TESTS.md](TESTS.md)):
 
@@ -96,7 +102,7 @@ python -m pytest
 
 ### 3D Asset
 
-An external file registered in USAP, like a LAS/LAZ point cloud, an OBJ/PLY/GLB mesh. USAP stores the path, kind, media type, optional content hash, and metadata.
+An external file registered in USAP, like a LAS/LAZ point cloud or an OBJ/PLY/STL mesh. USAP stores the path, kind, media type, optional content hash, and metadata.
 
 ### 3D Asset part
 
@@ -110,6 +116,26 @@ A registered concept accepted by USAP, e.g. `RoofSurface`, `Window`, `EnergyRoof
 
 A semantic object, usually imported from CityGML, e.g. `building_1`, `building_1_roof_1`, `building_1_window_1`.
 
+City objects are wired to each other by **typed** edges in
+`usap_city_object_relationship` (`link_city_objects`), grouped into named graphs
+(`usap_default` is the one queries traverse). "This object **and its parts**" —
+what `elements_for_city_object` and `list_city_objects(descendants_of=...)`
+expand — follows only *containment* edge types:
+
+```text
+contains · consistsOf · boundedBy · opening      (CONTAINMENT_RELATIONSHIP_TYPES)
+```
+
+Any other type (`adjacentTo`, `connectedTo`, your own) relates two objects
+without making one a part of the other, so it is not traversed unless you pass
+`containment_types=(...)` explicitly. Containment must be acyclic — a cycle
+would make an object its own part, and `validate_report()` flags it as
+`CITY_OBJECT_GRAPH_CYCLE`.
+
+Descendants are walked from the edges on every query; USAP stores no
+precomputed object closure, so an object never has to be "rebuilt into" the
+hierarchy and one created with no edges at all still answers for itself.
+
 ### Annotation
 
 A semantic claim linked to one concept and optionally to one city object.
@@ -119,7 +145,7 @@ as a `represents` row in `usap_annotation_object`; the SDK keeps the two in step
 `validate_report()` reports any disagreement. Other rows in `usap_annotation_object`
 carry secondary links (`concerns`, `derivedFrom`, …); city-object queries follow
 `represents` links only unless asked otherwise
-(`elements_for_city_object(..., relationship_types=(...))`).
+(`elements_for_city_object(..., link_types=(...))`).
 
 **What belongs in USAP vs the semantic source.** USAP is authoritative for the *claim layer*: which elements, under which concept, with what status, confidence, and provenance. The CityGML/ADE (or other semantic source) is authoritative for the *meaning layer*: which concepts and objects exist, their
 properties, and their hierarchy. Accordingly, an annotation's `attributes` must hold **claim-level metadata only** — how/when/by what the claim was produced (`method`, `source`, `assessed_at`, and for value fields `unit`, `validAt`).
@@ -201,13 +227,19 @@ WIP: ingestion of ontologies in OWL format.
 
 ### Example registries
 
-The files under `vocabularies/` are **examples only**, not a built-in taxonomy:
+The files under `src/usap/data/vocabularies/` ship with the package but are
+**examples only**, not a built-in taxonomy — a new package starts with zero
+concepts and seeds only what you ask for:
 
 ```text
-vocabularies/citygml_3_0_mvp.json
-vocabularies/usap_ade_prototype.json
-vocabularies/local_minimal_example.json
+src/usap/data/vocabularies/citygml_3_0_mvp.json
+src/usap/data/vocabularies/usap_ade_prototype.json
+src/usap/data/vocabularies/local_minimal_example.json
 ```
+
+The first two are reachable in code as `DEFAULT_CITYGML_VOCABULARY_PATH` /
+`DEFAULT_ADE_VOCABULARY_PATH` (`usap.domain_vocab`), so config files need not
+name them by path.
 
 The CityGML registry is an MVP curated subset of common CityGML 3.0 concepts. It is not a complete CityGML ontology or schema extraction.
 
@@ -261,7 +293,7 @@ When no CityGML registry or ontology is provided, a vocabulary file only needs a
 }
 ```
 
-See [`vocabularies/local_minimal_example.json`](vocabularies/local_minimal_example.json).
+See [`src/usap/data/vocabularies/local_minimal_example.json`](../src/usap/data/vocabularies/local_minimal_example.json).
 Re-loading an updated copy is additive and idempotent; changing an existing concept's parent raises. Concepts declared this way stay identifiable by their scheme (`list_accepted_concepts(scheme="local")`), so annotations made this way can later be aligned to a full ontology-based package (the latter is WIP).
 
 ---
@@ -283,12 +315,6 @@ meshes:
 {
   "db_path": "../outputs/example_project.usap.gpkg",
   "manifest_path": "../outputs/example_project_manifest.json",
-  "schema_path": "../sql/schema.sql",
-
-  "vocabularies": [
-    "../vocabularies/citygml_3_0_mvp.json",
-    "../vocabularies/usap_ade_prototype.json"
-  ],
 
   "citygml": {
     "path": "../data/area.gml",
@@ -334,6 +360,13 @@ Key notes:
   LAS files' CRS WKT is promoted automatically when they all agree; otherwise
   the layer stays in the undefined SRS (−1), which is honest for
   local-coordinate meshes.
+- `"schema_path"` / `"vocabularies"` are optional; both default to the files
+  shipped inside the package.
+- `"validation_level"` — the level the build validates at before committing
+  (`deep` by default; see Validation).
+- the whole build is **one transaction**: on failure a fresh build leaves no
+  package behind at all, and an `update=True` run leaves the previous package
+  exactly as it was.
 
 Run:
 
@@ -391,8 +424,25 @@ Notes:
 - The layer CRS defaults to the undefined SRS (−1) until declared — see the
   `"srs_id"` config key above or `set_package_srs(pkg.conn, epsg)` from Python
   (safe before or after registration; existing boxes are re-encoded).
+- Declaring a CRS **requires its definition**: pass `"srs_wkt"` alongside
+  `"srs_id"`, or install `usap[crs]` so the WKT can be looked up from the EPSG
+  code. GeoPackage reserves "undefined" definitions for the built-in SRS ids
+  −1 and 0 and requires a record defining every SRS a package actually uses.
+- `set_package_srs` re-stamps the CRS id on the stored extent boxes but does
+  **not** transform coordinates: USAP assumes one CRS per package. Assets
+  registered in different CRSs are reported as a `MIXED_ASSET_CRS` warning
+  rather than silently misplaced.
+- Each view exposes its key as `OGC_FID`, the alias GDAL recognises as a
+  view's feature id (a column merely called `fid` is carried as an ordinary
+  attribute, so features got GDAL's own row numbers instead of USAP ids), and
+  aggregate columns are `CAST` to INTEGER so they are not inferred as strings.
 - Fine-grained content — element memberships, value fields — is not exposed as
   layers; use the Python API for those.
+- USAP registers itself in `gpkg_extensions` as an Extended GeoPackage. The
+  `definition` column currently holds a **placeholder** URI
+  (`https://usap.invalid/...`) until the extension document has a public home
+  — the file is readable everywhere, but the registration is not yet a
+  resolvable reference.
 
 ---
 
@@ -439,7 +489,7 @@ python scripts/benchmark_phase1.py --buildings 1000 --repeat 5 --md bench.md
 It generates a synthetic city (`create_synthetic_package` / `SyntheticConfig`,
 also runnable standalone via `examples/build_synthetic.py`), times the build
 and the core queries, validates the package, and writes the report to the
-`--md`/`--json` paths. `--schema` defaults to `sql/schema.sql`; sizes are
+`--md`/`--json` paths. `--schema` defaults to the packaged schema; sizes are
 tunable with `--buildings`, `--roof-faces`, `--wall-faces`, `--ground-faces`.
 
 ---
@@ -570,8 +620,8 @@ with USAPPackage.create("demo.usap.gpkg", overwrite=True) as pkg:
     seed_default_ade_vocabulary(pkg)
 ```
 
-(`schema_path` defaults to the repository's `sql/schema.sql`; pass it explicitly
-when working outside a checkout — see Installation.)
+(`schema_path` defaults to the schema shipped inside the package, so this works
+from a plain wheel install; pass it explicitly only to use a modified schema.)
 
 ### Register LAS and mesh assets
 
@@ -747,16 +797,78 @@ complete ADE XML interpretation
 
 This is enough for the MVP because USAP uses CityGML mainly as the semantic/object identity backbone and stores geometry membership against external LAS and mesh assets.
 
+**What counts as CityGML.** Elements become city objects only when their
+namespace is a CityGML one (`*opengis.net/citygml*`, any module, versions
+1.0/2.0/3.0) — an element merely *named* `Building` in some other vocabulary
+is skipped, and a document declaring no CityGML namespace at all is refused
+rather than imported as zero objects. Likewise, only a real `gml:id`
+(`*opengis.net/gml*`) is adopted as object identity; an `id` attribute from
+another namespace is ignored and a generated uid is used instead.
+
+> **Known limitation — version provenance.** The detected CityGML version is
+> recorded in the asset metadata (`citygml_version_hint`), but concepts always
+> come from the shipped CityGML **3.0** vocabulary, so a 2.0 `Building` is
+> registered under a `citygml-3.0:` class URI with `scheme_version` 3.0. This
+> is pending the vocabulary-ingestion rework; until then, treat the class URI
+> of a non-3.0 import as approximate.
+
 ---
 
 ## Mesh support
 
-The mesh adapter is generic, not limited to LoD1/LoD2. Any stable triangular
-mesh can be registered: building meshes, city triangulations, TIN terrain,
-photogrammetry or simulation meshes. The one condition: **face indices must
-remain stable for the registered file version**. If a mesh is remeshed,
-simplified, reordered, or re-exported in a way that changes face order,
-register it as a new asset.
+The mesh adapter reads **`.obj`, `.ply` and `.stl`** and is not limited to
+LoD1/LoD2: building meshes, city triangulations, TIN terrain, photogrammetry
+or simulation meshes all register the same way. Two conditions:
+
+- **Face indices must remain stable for the registered file version.** If a
+  mesh is remeshed, simplified, reordered, or re-exported in a way that
+  changes face order, register it as a new asset.
+- **Vertices must already be in their final coordinates.** The adapter reads
+  geometries, not scenes.
+
+`.glb`/`.gltf` are therefore **refused** rather than partially supported: a
+glTF scene positions its geometries with node transforms and may instance one
+geometry at several nodes, so reading the geometries alone yields bounds in
+the wrong place and one asset part where the scene has several instances —
+wrong data rather than missing data. Export with transforms baked in, or wait
+for scene-graph support (see the future-work notes).
+
+### Large meshes
+
+Registration is the **only** step that opens a mesh file. Everything after it
+— annotating, editing, querying — works from the element count stored on the
+asset part, so a 10 GB mesh is no more expensive to annotate than a 10 MB one.
+
+Registration itself needs just two facts (face count, bounding box), and
+loading a whole mesh to get them does not survive a large file. Files over
+**256 MB** are therefore read in a streaming pass instead; `stream=True` /
+`stream=False` overrides the threshold:
+
+```python
+register_mesh_asset(pkg, "city.ply", representation_name="city")               # auto
+register_mesh_asset(pkg, "city.ply", representation_name="city", stream=True)  # forced
+```
+
+Measured on a 174 MB binary PLY (6 M faces), both paths recording identical
+face counts and bounds:
+
+| | time | peak RSS |
+|---|---:|---:|
+| `stream=False` (trimesh load) | 2.40 s | 758 MB |
+| `stream=True` | 0.68 s | 121 MB |
+
+Streaming readers exist for **`.ply`** (ASCII and binary) and **`.obj`** only,
+and treat one file as one part. Two cases raise instead of guessing:
+
+- an OBJ carrying several `o`/`g` groups — a normal load would split it into
+  one part per group, and annotations bind to part names, so the same file
+  must not register differently depending on its size;
+- any other format (`.stl`) — no streaming reader, so load it in full.
+
+`compute_hash=True` (the default) re-reads the whole file to SHA-256 it, which
+is minutes on a 10 GB asset. It is what makes a later change to that file
+detectable (`validate_report(level="external")`), so skip it deliberately, not
+by accident.
 
 ---
 
@@ -765,7 +877,7 @@ register it as a new asset.
 Validate a package in Python:
 
 ```python
-report = pkg.validate_report()
+report = pkg.validate_report()          # level="deep" by default
 report.print()
 ```
 
@@ -773,20 +885,62 @@ Or run an example validator:
 
 ```bash
 python examples/validate_package.py outputs/example_project.usap.gpkg
+python examples/validate_package.py outputs/example_project.usap.gpkg --level external
 ```
 
-The validator checks, among other things:
+### Levels
+
+Validation costs scale with what it is allowed to read, so it comes in three
+levels. `report.is_ok` always means "no errors **at the level you asked
+for**" — a clean `basic` report is not a claim about payloads, and a clean
+`deep` report is not a claim about the files on disk.
+
+| Level | Reads | Use it for |
+|---|---|---|
+| `basic` | SQL columns only — never a block payload | packages with millions of membership blocks, or a fast pre-flight |
+| `deep` *(default)* | + every membership/value payload | the normal correctness check |
+| `external` | + every registered asset file (SHA-256) | before trusting a package whose sources may have moved or changed |
 
 ```text
-GeoPackage metadata presence
-USAP profile presence
-orphan references
-membership payload validity
-membership element count consistency
-membership index bounds
-semantic class closure
-city object closure
-concept registry duplicates
-annotation primary object / 'represents' link agreement
-duplicate relationship edges (warning)
+basic     GeoPackage metadata and registered layers
+          USAP profile presence
+          orphan references
+          membership/value block structure (counts, bounds, element kinds)
+          semantic class closure
+          concept registry duplicates
+          annotation primary object / 'represents' link agreement
+          duplicate relationship edges (warning)
+
+deep      + membership payload decoding, offsets, stored min/max agreement
+          + value payload decoding and stored min/max agreement
+          + asset extent recomputation
+          + city object containment cycles
+          + annotation status / confidence / attributes-JSON domain values
+
+external  + asset file exists            (ASSET_FILE_MISSING)
+          + asset file hash unchanged    (ASSET_FILE_CHANGED)
+          + asset registered unhashed    (ASSET_NOT_HASHED, warning)
+```
+
+`verify_assets(pkg.conn)` runs the external check on its own and returns one
+record per asset (`ok` / `missing` / `changed` / `unhashed`) instead of a
+report. Note what this does **not** do: USAP can detect that a file changed,
+but it cannot rebind annotations to it — element indices into the new file
+may mean something entirely different. Re-register the new version as its own
+asset.
+
+`build_project_package` validates at `deep` before committing; set
+`"validation_level"` in the project config to change that.
+
+### Domain values
+
+`status`, `object_status` and `confidence` are constrained, on write
+(`create_annotation`/`update_annotation`/`create_city_object` raise) and at
+the `deep` validation level for packages written another way:
+
+```text
+annotation status    draft | accepted | rejected | superseded
+city object status   accepted | temporary
+confidence           NULL, or a number in [0, 1]
+attributes_json      NULL, or text that parses as JSON
 ```

@@ -22,6 +22,7 @@ from conftest import (
 from usap import (
     ELEMENT_KIND_FACE,
     ELEMENT_KIND_POINT,
+    USAPError,
     USAPPackage,
     register_las_asset,
     register_mesh_asset,
@@ -119,3 +120,24 @@ def test_register_asset_and_annotate_elements(
         assert matches[0]["matched_elements"] == selected
 
         assert_package_valid(pkg)
+
+
+def test_gltf_mesh_registration_is_refused(tmp_path: Path) -> None:
+    # A glTF scene places geometries with node transforms and can instance one
+    # geometry many times. Reading its geometries alone produces bounds in the
+    # wrong place and one part where the scene has several instances — wrong
+    # data rather than missing data, and nothing downstream could tell. Until
+    # scene graphs are supported, registration must refuse the format.
+    mesh_path = tmp_path / "city.glb"
+    _write_tiny_mesh(mesh_path)
+
+    with make_pkg(tmp_path) as pkg:
+        with pytest.raises(USAPError, match="glTF-family meshes are not supported"):
+            register_mesh_asset(
+                pkg,
+                mesh_path,
+                representation_name="city_lod2",
+            )
+
+        # Nothing half-registered is left behind.
+        assert pkg.list_assets() == []

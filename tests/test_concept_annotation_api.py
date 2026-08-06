@@ -7,35 +7,15 @@ from usap import (
     ELEMENT_KIND_FACE,
     USAPPackage,
     register_mesh_asset,
-    seed_citygml_basic_classes,
-    seed_prototype_ade_classes,
+    seed_default_citygml_vocabulary,
+    seed_default_ade_vocabulary,
 )
 
 
-def test_resolve_citygml_and_ade_concepts(tmp_path: Path) -> None:
-    db_path = tmp_path / "concepts.usap.gpkg"
-
-    with USAPPackage.create(
-        db_path,
-        schema_path="sql/schema.sql",
-        overwrite=True,
-    ) as pkg:
-        citygml = seed_citygml_basic_classes(pkg)
-        ade = seed_prototype_ade_classes(pkg)
-
-        assert pkg.resolve_semantic_class("RoofSurface") == citygml.by_name["RoofSurface"]
-        assert pkg.resolve_semantic_class("EnergyRoof") == ade.by_name["EnergyRoof"]
-
-        assert (
-            pkg.resolve_semantic_class("citygml-3.0:building:RoofSurface")
-            == citygml.by_name["RoofSurface"]
-        )
-
-        assert (
-            pkg.resolve_semantic_class("usap-ade-prototype:energy:EnergyRoof")
-            == ade.by_name["EnergyRoof"]
-        )
-
+# NOTE: bare concept resolution (name + class_uri, CityGML and ADE) is
+# covered by test_external_vocabulary.py and
+# test_concept_registry.py::test_get_semantic_class_and_concept_exists;
+# this file tests resolution through the annotation API.
 
 def test_annotate_elements_with_citygml_concept(tmp_path: Path) -> None:
     mesh_path = tmp_path / "mesh.ply"
@@ -45,10 +25,9 @@ def test_annotate_elements_with_citygml_concept(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        seed_citygml_basic_classes(pkg)
+        seed_default_citygml_vocabulary(pkg)
 
         mesh = register_mesh_asset(
             pkg,
@@ -93,11 +72,10 @@ def test_annotate_elements_with_ade_concept_and_city_object(tmp_path: Path) -> N
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        citygml = seed_citygml_basic_classes(pkg)
-        seed_prototype_ade_classes(pkg)
+        citygml = seed_default_citygml_vocabulary(pkg)
+        seed_default_ade_vocabulary(pkg)
 
         roof_object_id = pkg.create_city_object(
             object_uid="building_1_roof_1",
@@ -124,9 +102,8 @@ def test_annotate_elements_with_ade_concept_and_city_object(tmp_path: Path) -> N
             status="draft",
             attributes={
                 "domain": "energy_emissions",
-                "geometric_attributes": {
-                    "roof_slope": 31.5,
-                },
+                "method": "manual_selection",
+                "assessed_at": "2026-06-30T14:00:00Z",
             },
         )
 
@@ -156,11 +133,10 @@ def test_attach_annotation_elements_adds_second_representation(tmp_path: Path) -
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        seed_citygml_basic_classes(pkg)
-        seed_prototype_ade_classes(pkg)
+        seed_default_citygml_vocabulary(pkg)
+        seed_default_ade_vocabulary(pkg)
 
         mesh_a = register_mesh_asset(
             pkg,

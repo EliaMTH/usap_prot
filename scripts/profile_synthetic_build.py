@@ -5,7 +5,7 @@ import cProfile
 import pstats
 from pathlib import Path
 
-from usap import SyntheticConfig, create_synthetic_package
+from usap import DEFAULT_SCHEMA_PATH, SyntheticConfig, create_synthetic_package
 
 
 def main() -> None:
@@ -14,7 +14,7 @@ def main() -> None:
     )
 
     parser.add_argument("--db", default="profile_synthetic.usap.gpkg")
-    parser.add_argument("--schema", default="sql/schema.sql")
+    parser.add_argument("--schema", default=str(DEFAULT_SCHEMA_PATH))
     parser.add_argument("--buildings", type=int, default=1000)
     parser.add_argument("--output", default="profile_synthetic_build.prof")
 

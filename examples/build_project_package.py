@@ -18,11 +18,21 @@ def main() -> None:
         help="Fail if the output package already exists.",
     )
 
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help=(
+            "Open the existing package and apply the config to it "
+            "(add assets, edit annotations) instead of creating it."
+        ),
+    )
+
     args = parser.parse_args()
 
     result = build_project_package_from_file(
         args.config_json,
         overwrite=not args.no_overwrite,
+        update=args.update,
     )
 
     print("Built USAP project package")
@@ -43,6 +53,18 @@ def main() -> None:
 
     print("  LAS assets:", len(result.las_assets))
     print("  mesh assets:", len(result.mesh_assets))
+
+    for batch in result.batches:
+        print(
+            "  batch: annotations=",
+            batch.annotation_count,
+            "memberships=",
+            batch.membership_count,
+            "value_fields=",
+            batch.value_field_count,
+            "created_city_objects=",
+            batch.created_city_object_count,
+        )
 
     print()
     print("LAS asset parts")

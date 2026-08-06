@@ -14,9 +14,15 @@ from .adapters import (
     register_mesh_asset,
 )
 from ._util import require_str
-from .core import USAPPackage
-from .domain_vocab import seed_vocabulary_file
+from .batch import BatchImportResult, apply_annotation_batch_file
+from .core import DEFAULT_SCHEMA_PATH, USAPPackage
+from .domain_vocab import (
+    DEFAULT_ADE_VOCABULARY_PATH,
+    DEFAULT_CITYGML_VOCABULARY_PATH,
+    seed_vocabulary_file,
+)
 from .errors import USAPError
+from .geopackage import epsg_from_wkt, set_package_srs
 
 
 @dataclass(frozen=True)
@@ -27,12 +33,14 @@ class ProjectBuildResult:
     las_assets: list[LASRegistrationResult] = field(default_factory=list)
     mesh_assets: list[MeshRegistrationResult] = field(default_factory=list)
     accepted_concept_count: int = 0
+    batches: list[BatchImportResult] = field(default_factory=list)
 
 
 def build_project_package_from_file(
     config_path: str | Path,
     *,
     overwrite: bool = True,
+    update: bool = False,
 ) -> ProjectBuildResult:
     path = Path(config_path)
 
@@ -45,6 +53,7 @@ def build_project_package_from_file(
         data,
         base_dir=path.parent,
         overwrite=overwrite,
+        update=update,
     )
 
 
@@ -53,16 +62,27 @@ def build_project_package(
     *,
     base_dir: str | Path = ".",
     overwrite: bool = True,
+    update: bool = False,
 ) -> ProjectBuildResult:
     """
-    Build a real-project USAP package from a JSON config.
+    Build (or, with update=True, extend) a USAP package from a JSON config.
 
-    The builder intentionally does not create annotations.
-    It prepares the package so batch annotation files can target known:
-      - concepts
-      - city objects
-      - LAS asset parts
-      - mesh asset parts
+    The config prepares the package so annotation files can target known
+    concepts, city objects, and LAS/mesh asset parts; the optional
+    "annotation_batches" key then applies those files in the same run
+    (see INGESTION.md for the full procedures).
+
+    update=True opens the existing package instead of creating it
+    (overwrite is ignored): every build step is idempotent for entries that
+    are unchanged — re-listing an already-registered vocabulary or asset is a
+    no-op, while re-listing one whose kind, counts, or bounds changed raises
+    (see register_asset) — new entries are added, and annotation batches are
+    applied with replace_existing=True. This is the editing procedure.
+
+    The whole build is one transaction. A failure part-way leaves no package
+    at all for a fresh build, and an untouched one for update=True; without
+    that, a build that died after seeding concepts but before registering
+    assets left a package that looked real and was not.
     """
     base_path = Path(base_dir)
 
@@ -72,7 +92,7 @@ def build_project_package(
     )
 
     schema_path = _resolve_path(
-        config.get("schema_path", "sql/schema.sql"),
+        config.get("schema_path", DEFAULT_SCHEMA_PATH),
         base_path=base_path,
         must_exist=True,
     )
@@ -90,60 +110,117 @@ def build_project_package(
     if manifest_path is not None:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with USAPPackage.create(
-        db_path,
-        schema_path=schema_path,
-        overwrite=overwrite,
-    ) as pkg:
-        _seed_config_vocabularies(
-            pkg,
-            config=config,
-            base_path=base_path,
+    if update:
+        pkg_context = USAPPackage.open(db_path)
+    else:
+        pkg_context = USAPPackage.create(
+            db_path,
+            schema_path=schema_path,
+            overwrite=overwrite,
         )
 
-        citygml_result = _import_config_citygml(
-            pkg,
-            config=config,
-            base_path=base_path,
-        )
+    config_srs_id = config.get("srs_id")
+    validation_level = config.get("validation_level", "deep")
 
-        las_results = _register_config_las(
-            pkg,
-            config=config,
-            base_path=base_path,
-        )
+    try:
+        with pkg_context as pkg:
+            # One transaction around every step: the package is only ever
+            # observable as "before this build" or "after it succeeded".
+            # transaction() is re-entrant, so the inner per-step blocks
+            # become no-ops and commit with this one.
+            with pkg.transaction():
+                # Declared package CRS wins and is set before registration so
+                # extent blobs are encoded with it from the start.
+                if config_srs_id is not None:
+                    set_package_srs(
+                        pkg.conn,
+                        int(config_srs_id),
+                        definition_wkt=config.get("srs_wkt"),
+                    )
 
-        mesh_results = _register_config_meshes(
-            pkg,
-            config=config,
-            base_path=base_path,
-        )
+                _seed_config_vocabularies(
+                    pkg,
+                    config=config,
+                    base_path=base_path,
+                )
 
-        concept_count = len(pkg.list_accepted_concepts())
+                citygml_result = _import_config_citygml(
+                    pkg,
+                    config=config,
+                    base_path=base_path,
+                )
 
-        report = pkg.validate_report()
+                las_results = _register_config_las(
+                    pkg,
+                    config=config,
+                    base_path=base_path,
+                )
 
-        if not report.is_ok:
-            formatted = "\n".join(issue.format() for issue in report.issues)
+                mesh_results = _register_config_meshes(
+                    pkg,
+                    config=config,
+                    base_path=base_path,
+                )
 
-            raise USAPError(
-                "Built project package failed validation:\n"
-                f"{formatted}"
-            )
+                # No declared CRS: when the LAS files agree on exactly one
+                # EPSG, promote it to the extents layer (single-CRS-per-
+                # package assumption). Mixed or no CRS -> undefined (-1).
+                if config_srs_id is None:
+                    sniffed = {
+                        (epsg_from_wkt(item.crs_wkt), item.crs_wkt)
+                        for item in las_results
+                        if epsg_from_wkt(item.crs_wkt) is not None
+                    }
 
-        if manifest_path is not None:
-            manifest = _build_manifest(
-                pkg,
-                db_path=db_path,
-                citygml_result=citygml_result,
-                las_results=las_results,
-                mesh_results=mesh_results,
-            )
+                    if len({code for code, _ in sniffed}) == 1:
+                        code, wkt = next(iter(sniffed))
+                        set_package_srs(pkg.conn, code, definition_wkt=wkt)
 
-            manifest_path.write_text(
-                json.dumps(manifest, indent=2),
-                encoding="utf-8",
-            )
+                batch_results = _apply_config_batches(
+                    pkg,
+                    config=config,
+                    base_path=base_path,
+                    replace_existing=update,
+                )
+
+                concept_count = len(pkg.list_accepted_concepts())
+
+                # Inside the transaction, so a package that fails validation
+                # is rolled back rather than left on disk to be opened.
+                report = pkg.validate_report(level=validation_level)
+
+                if not report.is_ok:
+                    formatted = "\n".join(
+                        issue.format() for issue in report.issues
+                    )
+
+                    raise USAPError(
+                        "Built project package failed validation:\n"
+                        f"{formatted}"
+                    )
+
+            if manifest_path is not None:
+                manifest = _build_manifest(
+                    pkg,
+                    db_path=db_path,
+                    citygml_result=citygml_result,
+                    las_results=las_results,
+                    mesh_results=mesh_results,
+                )
+
+                manifest_path.write_text(
+                    json.dumps(manifest, indent=2),
+                    encoding="utf-8",
+                )
+    except BaseException:
+        # A rolled-back new package is an empty schema, not a package: the
+        # file itself is this build's output and must go with it. An
+        # update=True failure rolled back to the previous valid state, which
+        # is exactly what should stay on disk.
+        if not update and db_path.exists():
+            db_path.unlink()
+
+        raise
 
     return ProjectBuildResult(
         db_path=db_path,
@@ -152,6 +229,7 @@ def build_project_package(
         las_assets=las_results,
         mesh_assets=mesh_results,
         accepted_concept_count=concept_count,
+        batches=batch_results,
     )
 
 
@@ -164,8 +242,8 @@ def _seed_config_vocabularies(
     vocabularies = config.get(
         "vocabularies",
         [
-            "vocabularies/citygml_3_0_mvp.json",
-            "vocabularies/usap_ade_prototype.json",
+            str(DEFAULT_CITYGML_VOCABULARY_PATH),
+            str(DEFAULT_ADE_VOCABULARY_PATH),
         ],
     )
 
@@ -180,6 +258,35 @@ def _seed_config_vocabularies(
             pkg,
             _resolve_path(item, base_path=base_path, must_exist=True),
         )
+
+
+def _apply_config_batches(
+    pkg: USAPPackage,
+    *,
+    config: dict[str, Any],
+    base_path: Path,
+    replace_existing: bool,
+) -> list[BatchImportResult]:
+    items = config.get("annotation_batches", [])
+
+    if not isinstance(items, list):
+        raise ValueError("'annotation_batches' must be a list.")
+
+    results: list[BatchImportResult] = []
+
+    for item in items:
+        if not isinstance(item, str):
+            raise ValueError(f"Invalid annotation batch path: {item!r}")
+
+        results.append(
+            apply_annotation_batch_file(
+                pkg,
+                _resolve_path(item, base_path=base_path, must_exist=True),
+                replace_existing=replace_existing,
+            )
+        )
+
+    return results
 
 
 def _import_config_citygml(
@@ -305,7 +412,7 @@ def _build_manifest(
             sc.local_name AS semantic_class,
             sc.class_uri AS semantic_class_uri
         FROM usap_city_object AS co
-        JOIN usap_semantic_class AS sc
+        LEFT JOIN usap_semantic_class AS sc
             ON sc.semantic_class_id = co.semantic_class_id
         ORDER BY co.city_object_id
         """

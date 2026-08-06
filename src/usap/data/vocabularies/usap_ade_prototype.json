@@ -58,6 +58,12 @@
     },
 
     {
+      "module": "solar",
+      "local_name": "ShadowFraction",
+      "class_uri": "usap-ade-prototype:solar:ShadowFraction"
+    },
+
+    {
       "module": "acoustic_comfort",
       "local_name": "AcousticBuilding",
       "class_uri": "usap-ade-prototype:acoustic:AcousticBuilding"

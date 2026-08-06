@@ -7,6 +7,8 @@ from pathlib import Path
 from .._util import sha256_file
 from ..constants import ELEMENT_KIND_POINT
 from ..core import USAPPackage
+from ..errors import USAPError
+from ..geopackage import ensure_srs_row, epsg_from_wkt
 
 
 @dataclass(frozen=True)
@@ -37,8 +39,22 @@ def _guess_las_media_type(path: Path) -> str:
 
 
 def _try_read_crs_wkt(header) -> str | None:
+    """
+    Read the file's CRS as WKT, or None when the file declares none.
+
+    A missing CRS backend is NOT None: laspy parses CRS through pyproj, so
+    swallowing ImportError here would make "pyproj is not installed" look
+    exactly like "this file has no CRS" — and the package would then be built
+    with an undefined SRS from a file that had one. Install the 'crs' extra.
+    """
     try:
         crs = header.parse_crs()
+    except ImportError as exc:
+        raise USAPError(
+            "Reading the LAS/LAZ CRS requires pyproj: "
+            "install usap[crs]. Pass a CRS explicitly (project config "
+            f"'srs_id'/'srs_wkt') to register without it. Original error: {exc}"
+        ) from exc
     except Exception:
         return None
 
@@ -111,12 +127,21 @@ def register_las_asset(
         ),
     }
 
+    # Best-effort EPSG from the LAS CRS WKT: registers the SRS row and
+    # records it on the asset. The package-level layer CRS is promoted by
+    # the project builder (or set_package_srs), not here.
+    srs_id = epsg_from_wkt(crs_wkt)
+
     with pkg.transaction():
+        if srs_id is not None:
+            ensure_srs_row(pkg.conn, srs_id, definition_wkt=crs_wkt)
+
         asset_id = pkg.register_asset(
             uri=uri if uri is not None else str(path),
             asset_kind="pointcloud",
             media_type=_guess_las_media_type(path),
             content_hash=content_hash,
+            srs_id=srs_id,
             metadata_json=json.dumps(asset_metadata),
         )
 

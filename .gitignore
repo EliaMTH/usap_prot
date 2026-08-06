@@ -11,7 +11,9 @@ decimated_classified_output.las
 outputs/
 data/
 CLAUDE.md
+.github/
 
 benchmark_results/
 usap_devdiary.md
 PHASE1_BASELINE.md
+USAP_report.md

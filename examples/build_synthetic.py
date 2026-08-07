@@ -11,7 +11,6 @@ from usap import (
 def main() -> None:
     result = create_synthetic_package(
         "synthetic_100.usap.gpkg",
-        schema_path="sql/schema.sql",
         config=SyntheticConfig(
             building_count=100,
             roof_faces_per_building=120,

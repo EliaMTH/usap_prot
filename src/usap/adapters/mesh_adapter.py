@@ -3,10 +3,22 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .._util import sha256_file
 from ..constants import ELEMENT_KIND_FACE
 from ..core import USAPPackage
+from ..errors import USAPError
+from .mesh_stream import StreamedMeshPart, read_streamed_parts
+
+if TYPE_CHECKING:
+    import trimesh
+
+
+# Above this size, reading the whole mesh to extract a face count and a
+# bounding box stops being reasonable (a 10 GB OBJ needs 10-20 GB of RAM);
+# the streaming readers get the same two facts in bounded memory.
+MESH_STREAM_THRESHOLD_BYTES = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -47,6 +59,14 @@ class MeshRegistrationResult:
         return self.parts[0].asset_part_id
 
 
+# glTF carries a scene graph: node transforms and repeated instances of one
+# geometry. This adapter reads geometries, not scenes, so a translated or
+# instanced glTF would be registered with the wrong bounds and with one part
+# where the scene has several instances — plausible rows stating something
+# false. Refused until scene-graph support exists (see REFERENCE.md).
+_UNSUPPORTED_MESH_SUFFIXES = {".glb", ".gltf"}
+
+
 def _guess_mesh_media_type(path: Path) -> str:
     suffix = path.suffix.lower()
 
@@ -59,16 +79,17 @@ def _guess_mesh_media_type(path: Path) -> str:
     if suffix == ".stl":
         return "model/stl"
 
-    if suffix == ".glb":
-        return "model/gltf-binary"
-
-    if suffix == ".gltf":
-        return "model/gltf+json"
-
     return "application/octet-stream"
 
 
-def _safe_bounds(mesh: trimesh.Trimesh) -> tuple[
+def _face_count(mesh: trimesh.Trimesh | StreamedMeshPart) -> int:
+    if isinstance(mesh, StreamedMeshPart):
+        return mesh.face_count
+
+    return int(len(mesh.faces))
+
+
+def _safe_bounds(mesh: trimesh.Trimesh | StreamedMeshPart) -> tuple[
     float | None,
     float | None,
     float | None,
@@ -76,6 +97,12 @@ def _safe_bounds(mesh: trimesh.Trimesh) -> tuple[
     float | None,
     float | None,
 ]:
+    if isinstance(mesh, StreamedMeshPart):
+        return (
+            mesh.minx, mesh.miny, mesh.minz,
+            mesh.maxx, mesh.maxy, mesh.maxz,
+        )
+
     if mesh.bounds is None:
         return None, None, None, None, None, None
 
@@ -126,9 +153,10 @@ def register_mesh_asset(
     lod: str | None = None,
     uri: str | None = None,
     compute_hash: bool = True,
+    stream: bool | None = None,
 ) -> MeshRegistrationResult:
     """
-    Register a mesh-like file as USAP face-indexable asset parts.
+    Register a mesh file (.obj / .ply / .stl) as USAP face-indexable parts.
 
     Prototype convention:
         one mesh file = one USAP asset
@@ -136,28 +164,61 @@ def register_mesh_asset(
         face index = zero-based face order in that geometry
 
     This works for LoD1, LoD2, generic city triangulations, terrain meshes,
-    reconstructed surfaces, or any other stable triangular mesh.
-    """
-    import trimesh
+    reconstructed surfaces — any stable triangular mesh whose vertices are
+    already in their final coordinates. Formats carrying a scene graph
+    (.glb/.gltf) are refused: their node transforms and instancing would be
+    silently dropped.
 
+    Registration is the only step that opens the mesh at all: everything
+    afterwards (annotating, editing, querying) works from the stored element
+    count. It needs just the face count and the bounding box, so files above
+    MESH_STREAM_THRESHOLD_BYTES are read in a streaming pass instead of being
+    materialized — trimesh.load on a 10 GB city mesh needs 10-20 GB of RAM to
+    produce two numbers per part. Pass stream=True/False to decide explicitly;
+    see mesh_stream for what the streaming readers do and do not accept.
+
+    compute_hash=True re-reads the whole file to SHA-256 it. That is minutes
+    on a 10 GB asset, and it is what makes a later change detectable
+    (validate_report(level="external")); pass False to skip it knowingly.
+    """
     path = Path(mesh_path)
 
     if not path.exists():
         raise FileNotFoundError(f"Mesh file not found: {path}")
 
-    loaded = trimesh.load(
-        str(path),
-        process=False,
-    )
+    if path.suffix.lower() in _UNSUPPORTED_MESH_SUFFIXES:
+        raise USAPError(
+            f"glTF-family meshes are not supported: {path.name}. The adapter "
+            "reads geometries, not scenes, so node transforms and repeated "
+            "instances of one geometry would be dropped — bounds and part "
+            "identity would be wrong rather than missing. Export to .ply or "
+            ".obj with transforms baked in."
+        )
 
-    geometries = _iter_mesh_geometries(loaded)
+    if stream is None:
+        stream = path.stat().st_size > MESH_STREAM_THRESHOLD_BYTES
+
+    if stream:
+        geometries = [
+            (part.name, part)
+            for part in read_streamed_parts(path)
+        ]
+    else:
+        import trimesh
+
+        loaded = trimesh.load(
+            str(path),
+            process=False,
+        )
+
+        geometries = _iter_mesh_geometries(loaded)
 
     if not geometries:
         raise ValueError(f"No triangular mesh geometries found in: {path}")
 
     content_hash = sha256_file(path) if compute_hash else None
 
-    total_face_count = sum(int(len(mesh.faces)) for _, mesh in geometries)
+    total_face_count = sum(_face_count(mesh) for _, mesh in geometries)
 
     asset_metadata = {
         "adapter": "mesh_adapter",
@@ -167,6 +228,7 @@ def register_mesh_asset(
         "lod": lod,
         "total_face_count": total_face_count,
         "geometry_count": len(geometries),
+        "streamed": stream,
         "indexing": (
             "zero_based_face_order_per_registered_geometry_loaded_with_"
             "trimesh_process_false"
@@ -185,7 +247,7 @@ def register_mesh_asset(
         )
 
         for index, (geometry_name, mesh) in enumerate(geometries):
-            face_count = int(len(mesh.faces))
+            face_count = _face_count(mesh)
 
             if face_count <= 0:
                 continue

@@ -21,7 +21,6 @@ def main() -> None:
 
     with USAPPackage.create(
         args.db,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         result = import_citygml_semantics(pkg, args.citygml_path)

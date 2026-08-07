@@ -1,20 +1,3 @@
--- NOTE:
--- Postponed / not-yet-implemented tables:
---
--- 1. Optional spatial acceleration:
---    usap_annotation_extent_rtree
---
--- 2. Optional external feature-ID bridge:
---    usap_feature_id_binding
---
--- 3. Future extension/schema tables:
---    usap_extension_registry
---    usap_attribute_schema
---    project-specific ADE tables
---
--- 4. Migration/versioning tables:
---    usap_schema_migration or similar
-
 -- ORDER MATTERS!
 -- Raw layout:
 -- 1. profile / metadata tables
@@ -24,12 +7,13 @@
 -- 5. usap_semantic_class_closure
 -- 6. usap_city_object
 -- 7. usap_city_object_relationship
--- 8. usap_city_object_closure
--- 9. usap_annotation
--- 10. usap_annotation_object
--- 11. usap_membership_block
--- 12. optional indexes
--- 13. optional helper tables
+-- 8. usap_annotation
+-- 9. usap_annotation_object
+-- 10. usap_membership_block
+-- 11. usap_value_block
+-- 13. optional indexes
+-- 14. optional helper tables
+-- 15. GIS-facing views (attributes + features layers for QGIS/GDAL)
 
 PRAGMA foreign_keys = ON; -- ensure key consistency between tables (i.e.: prevent operations that would break relationship between tables); need to be declare as it is off by default for backwards compatibility
 
@@ -72,6 +56,26 @@ CREATE TABLE gpkg_extensions (
     scope TEXT NOT NULL,
     CONSTRAINT ge_tce
         UNIQUE (table_name, column_name, extension_name)
+);
+
+CREATE TABLE gpkg_geometry_columns (
+    table_name          TEXT NOT NULL,
+    column_name         TEXT NOT NULL,
+    geometry_type_name  TEXT NOT NULL,
+    srs_id              INTEGER NOT NULL,
+    z                   TINYINT NOT NULL,
+    m                   TINYINT NOT NULL,
+
+    CONSTRAINT pk_geom_cols
+        PRIMARY KEY (table_name, column_name),
+
+    CONSTRAINT fk_gc_contents
+        FOREIGN KEY (table_name)
+        REFERENCES gpkg_contents(table_name),
+
+    CONSTRAINT fk_gc_srs
+        FOREIGN KEY (srs_id)
+        REFERENCES gpkg_spatial_ref_sys(srs_id)
 );
 
 CREATE TABLE usap_profile (
@@ -119,6 +123,19 @@ CREATE TABLE usap_asset_part (
     UNIQUE(asset_id, part_path, element_kind)
 );
 
+-- Derived cartographic summary: one GPKG-encoded 2D bounding-box polygon per
+-- asset, the union of its parts' stored bounds. Written by
+-- register_asset_part; regenerable at any time from usap_asset_part — never
+-- authoritative geometry. Exposed to GIS tools via the usap_asset_extents
+-- view (registered as a features layer).
+CREATE TABLE usap_asset_extent (
+    asset_id  INTEGER PRIMARY KEY
+        REFERENCES usap_asset(asset_id)
+        ON DELETE CASCADE,
+
+    geom      BLOB NOT NULL   -- GeoPackageBinary (magic 'GP') POLYGON
+);
+
 CREATE TABLE usap_semantic_class (
     semantic_class_id  INTEGER PRIMARY KEY,
     scheme             TEXT NOT NULL,
@@ -148,6 +165,13 @@ CREATE TABLE usap_semantic_class_closure (
 
     PRIMARY KEY (ancestor_class_id, descendant_class_id)
 ) WITHOUT ROWID;
+
+-- The PK serves ancestor -> descendants; this serves the reverse direction,
+-- used when a new class inherits all of its parent's ancestors.
+CREATE INDEX usap_scc_by_descendant
+ON usap_semantic_class_closure(
+    descendant_class_id
+);
 
 CREATE TABLE usap_city_object (
     city_object_id     INTEGER PRIMARY KEY,
@@ -209,26 +233,6 @@ ON usap_city_object_relationship(
     relationship_type
 );
 
-CREATE TABLE usap_city_object_closure (
-    graph_name                  TEXT NOT NULL,
-
-    ancestor_city_object_id     INTEGER NOT NULL
-        REFERENCES usap_city_object(city_object_id)
-        ON DELETE CASCADE,
-
-    descendant_city_object_id   INTEGER NOT NULL
-        REFERENCES usap_city_object(city_object_id)
-        ON DELETE CASCADE,
-
-    depth                       INTEGER NOT NULL,
-
-    PRIMARY KEY (
-        graph_name,
-        ancestor_city_object_id,
-        descendant_city_object_id
-    )
-) WITHOUT ROWID;
-
 CREATE TABLE usap_annotation (
     annotation_id          INTEGER PRIMARY KEY,
     annotation_uid         TEXT NOT NULL UNIQUE,
@@ -247,6 +251,13 @@ CREATE TABLE usap_annotation (
 
     created_at             TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at             TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Lets class-hierarchy queries start from the (small) closure and reach
+-- annotations by index instead of scanning all membership blocks.
+CREATE INDEX usap_annotation_by_class
+ON usap_annotation(
+    semantic_class_id
 );
 
 CREATE TABLE usap_annotation_object (
@@ -286,9 +297,14 @@ CREATE TABLE usap_membership_block (
 
     payload             BLOB NOT NULL,
 
+    -- The auto-index behind this constraint doubles as the annotation-first
+    -- lookup index (forward queries, annotation-delete cascade); do not add
+    -- an explicit index on the same columns.
     UNIQUE(annotation_id, asset_part_id, element_kind, block_start)
 );
 
+-- Serves the reverse element query (annotations_for_elements) and the
+-- ON DELETE CASCADE scan from usap_asset_part.
 CREATE INDEX usap_mb_by_element_block
 ON usap_membership_block(
     asset_part_id,
@@ -296,12 +312,46 @@ ON usap_membership_block(
     block_start
 );
 
-CREATE INDEX usap_mb_by_annotation
-ON usap_membership_block(
-    annotation_id,
+-- Per-element value fields: dense scalar arrays over an asset part's
+-- elements (element i's value = decoded[i - block_start]). Sibling of
+-- usap_membership_block: membership stores WHICH elements are a concept,
+-- value blocks store the VALUE of a property at each element. Bound to the
+-- asset part only — never to a city object.
+CREATE TABLE usap_value_block (
+    value_block_id      INTEGER PRIMARY KEY,
+
+    annotation_id       INTEGER NOT NULL
+        REFERENCES usap_annotation(annotation_id)
+        ON DELETE CASCADE,
+
+    asset_part_id       INTEGER NOT NULL
+        REFERENCES usap_asset_part(asset_part_id)
+        ON DELETE CASCADE,
+
+    element_kind        INTEGER NOT NULL,
+
+    block_start         INTEGER NOT NULL,
+    element_count       INTEGER NOT NULL,
+
+    value_dtype         TEXT NOT NULL,   -- 'f4', 'f2', 'u1', ... little-endian
+
+    value_min           REAL,            -- NaN-ignoring block min; NULL if all-NaN
+    value_max           REAL,
+
+    payload             BLOB NOT NULL,   -- zlib(values.tobytes())
+
+    -- The auto-index behind this constraint doubles as the annotation-first
+    -- lookup index (value readers, annotation-delete cascade); do not add
+    -- an explicit index on the same columns.
+    UNIQUE(annotation_id, asset_part_id, element_kind, block_start)
+);
+
+-- Serves the ON DELETE CASCADE scan from usap_asset_part (no part-level
+-- value query exists yet).
+CREATE INDEX usap_vb_by_part
+ON usap_value_block(
     asset_part_id,
-    element_kind,
-    block_start
+    element_kind
 );
 
 CREATE TABLE usap_edit_log (
@@ -312,3 +362,99 @@ CREATE TABLE usap_edit_log (
     details_json  TEXT,
     created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- -------------------------------------------------------------------------
+-- GIS-facing views. Registered in gpkg_contents (see geopackage.py) so
+-- QGIS/GDAL can browse USAP content: three read-only 'attributes' layers
+-- plus one 'features' layer of derived per-asset extent boxes. Internal
+-- tables (blocks, closures, edit log) are deliberately not exposed.
+-- -------------------------------------------------------------------------
+
+-- Every view exposes its integer key as "OGC_FID": SQLite views have no
+-- rowid, and GDAL's GeoPackage driver documents OGC_FID as the alias it
+-- recognises as a view's primary-key-like column. A column merely named
+-- "fid" is carried as an ordinary attribute, so the layer opened but its
+-- feature ids were GDAL's own row numbers, not USAP ids.
+--
+-- Aggregate columns are CAST to INTEGER: without it GDAL infers them as
+-- strings, since a view expression carries no declared column type.
+CREATE VIEW usap_annotations_view AS
+SELECT
+    a.annotation_id AS OGC_FID,
+    a.annotation_uid,
+    sc.local_name AS concept,
+    sc.class_uri AS concept_uri,
+    sc.scheme,
+    co.object_uid AS city_object_uid,
+    a.label,
+    a.status,
+    a.confidence,
+    CAST((
+        SELECT COALESCE(SUM(mb.element_count), 0)
+        FROM usap_membership_block AS mb
+        WHERE mb.annotation_id = a.annotation_id
+    ) AS INTEGER) AS selected_element_count,
+    CAST((
+        SELECT COUNT(DISTINCT vb.asset_part_id)
+        FROM usap_value_block AS vb
+        WHERE vb.annotation_id = a.annotation_id
+    ) AS INTEGER) AS value_field_count,
+    a.attributes_json,
+    a.created_at,
+    a.updated_at
+FROM usap_annotation AS a
+JOIN usap_semantic_class AS sc
+    ON sc.semantic_class_id = a.semantic_class_id
+LEFT JOIN usap_city_object AS co
+    ON co.city_object_id = a.primary_city_object_id;
+
+CREATE VIEW usap_concepts_view AS
+SELECT
+    sc.semantic_class_id AS OGC_FID,
+    sc.scheme,
+    sc.scheme_version,
+    sc.class_uri,
+    sc.local_name,
+    sc.is_ade,
+    CAST(COUNT(a.annotation_id) AS INTEGER) AS annotation_count,
+    CAST(
+        CASE WHEN COUNT(a.annotation_id) > 0 THEN 1 ELSE 0 END AS INTEGER
+    ) AS in_use
+FROM usap_semantic_class AS sc
+LEFT JOIN usap_annotation AS a
+    ON a.semantic_class_id = sc.semantic_class_id
+GROUP BY sc.semantic_class_id;
+
+CREATE VIEW usap_city_objects_view AS
+SELECT
+    co.city_object_id AS OGC_FID,
+    co.object_uid,
+    sc.local_name AS semantic_class,
+    co.object_status,
+    co.gml_id,
+    src.uri AS source_asset_uri
+FROM usap_city_object AS co
+LEFT JOIN usap_semantic_class AS sc
+    ON sc.semantic_class_id = co.semantic_class_id
+LEFT JOIN usap_asset AS src
+    ON src.asset_id = co.source_asset_id;
+
+CREATE VIEW usap_asset_extents AS
+SELECT
+    e.asset_id AS OGC_FID,
+    e.geom,
+    a.uri,
+    a.asset_kind,
+    CAST((
+        SELECT COUNT(*)
+        FROM usap_asset_part AS ap
+        WHERE ap.asset_id = e.asset_id
+    ) AS INTEGER) AS part_count,
+    CAST((
+        SELECT COALESCE(SUM(ap.element_count), 0)
+        FROM usap_asset_part AS ap
+        WHERE ap.asset_id = e.asset_id
+    ) AS INTEGER) AS element_count
+FROM usap_asset_extent AS e
+JOIN usap_asset AS a
+    ON a.asset_id = e.asset_id;

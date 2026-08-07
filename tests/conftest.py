@@ -1,10 +1,58 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterator
 
 import laspy
 import numpy as np
+import pytest
 import trimesh
+
+from usap import DEFAULT_SCHEMA_PATH, ELEMENT_KIND_FACE, USAPPackage
+
+# Re-exported: tests that need the schema path must get it from the package,
+# never from the checkout layout, so the suite passes against an installed wheel.
+SCHEMA_PATH = DEFAULT_SCHEMA_PATH
+
+
+def make_pkg(tmp_path: Path, name: str = "pkg.usap.gpkg") -> USAPPackage:
+    """Create a fresh empty package under tmp_path."""
+    return USAPPackage.create(
+        tmp_path / name,
+        overwrite=True,
+    )
+
+
+def make_mesh_part(pkg: USAPPackage, element_count: int = 100) -> int:
+    """Register a bare mesh asset with one face part; returns asset_part_id."""
+    asset_id = pkg.register_asset(uri="mesh.ply", asset_kind="mesh")
+
+    return pkg.register_asset_part(
+        asset_id=asset_id,
+        part_path="geometry/0",
+        element_kind=ELEMENT_KIND_FACE,
+        element_count=element_count,
+    )
+
+
+@pytest.fixture
+def pkg(tmp_path: Path) -> Iterator[USAPPackage]:
+    with make_pkg(tmp_path) as p:
+        yield p
+
+
+@pytest.fixture
+def mesh_part(pkg: USAPPackage) -> int:
+    return make_mesh_part(pkg)
+
+
+def assert_package_valid(pkg) -> None:
+    """
+    Assert validate_report() is clean, printing the issues on failure
+    (a bare `assert report.is_ok` fails without saying why).
+    """
+    report = pkg.validate_report()
+    assert report.is_ok, [issue.format() for issue in report.issues]
 
 
 def write_tiny_las(path: Path, point_count: int = 10) -> None:

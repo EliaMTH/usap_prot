@@ -14,8 +14,22 @@ dependencies = [
     "numpy>=1.26"
 ]
 
+# Plain `laspy` reads LAS but not LAZ, and parses no CRS: both need a backend
+# of their own. Kept optional so a mesh-only install stays small, but a missing
+# backend is reported as a missing capability, never as "this file has no CRS"
+# (see adapters/las_adapter.py).
+[project.optional-dependencies]
+laz = ["laspy[lazrs]>=2.5"]
+crs = ["pyproj>=3.6"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The schema and the example vocabularies are runtime data: USAPPackage.create
+# and seed_default_*_vocabulary read them by default, so they must ship in the
+# wheel, not just in a checkout.
+[tool.setuptools.package-data]
+usap = ["data/schema.sql", "data/vocabularies/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

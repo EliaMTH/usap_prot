@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ._util import require_str
 from .core import USAPPackage
+from .errors import USAPAmbiguityError, USAPError
 
 
 @dataclass(frozen=True)
@@ -14,8 +15,12 @@ class VocabularyResult:
     by_uri: dict[str, int]
 
 
-DEFAULT_CITYGML_VOCABULARY_PATH = Path("vocabularies/citygml_3_0_mvp.json")
-DEFAULT_ADE_VOCABULARY_PATH = Path("vocabularies/usap_ade_prototype.json")
+# Shipped inside the package (see pyproject package-data), not next to the
+# repo checkout, so the default vocabularies load from a plain wheel install too.
+_VOCABULARY_DIR = Path(__file__).resolve().parent / "data" / "vocabularies"
+
+DEFAULT_CITYGML_VOCABULARY_PATH = _VOCABULARY_DIR / "citygml_3_0_mvp.json"
+DEFAULT_ADE_VOCABULARY_PATH = _VOCABULARY_DIR / "usap_ade_prototype.json"
 
 
 def seed_vocabulary_file(
@@ -39,6 +44,13 @@ def seed_vocabulary_file(
     Richer per-concept metadata (definitions, units, applicable features, ...)
     is deliberately out of scope here: that is the application schema
     (e.g. the CityGML ADE XSD / SHACL), not the concept scheme.
+
+    Minimal / no-ontology vocabularies: class_uri may be omitted, in which
+    case it is derived as "{scheme}:{local_name}". parent_uri accepts either
+    a class_uri or the local name of an already-registered concept (resolved
+    within the same scheme first). Re-running this function on an updated
+    file is additive and idempotent; changing an existing concept's parent
+    raises instead of silently rewiring the hierarchy.
     """
     vocab_path = Path(path)
 
@@ -68,25 +80,22 @@ def seed_vocabulary_file(
             raise ValueError(f"Invalid concept entry in {vocab_path}: {item!r}")
 
         local_name = require_str(item, "local_name", source=str(vocab_path))
-        class_uri = require_str(item, "class_uri", source=str(vocab_path))
+
+        if item.get("class_uri") is not None:
+            class_uri = require_str(item, "class_uri", source=str(vocab_path))
+        else:
+            # Minimal-vocabulary convenience: a concept without an explicit
+            # URI gets a scheme-derived one, so local/temporary schemes only
+            # need names.
+            class_uri = f"{scheme}:{local_name}"
 
         parent_class_id = None
         parent_uri = item.get("parent_uri")
-        parent_name = item.get("parent_name")
 
         if parent_uri is not None:
             parent_class_id = _resolve_optional_parent(
                 pkg,
                 parent_uri,
-                scheme=scheme,
-                vocab_path=vocab_path,
-                child_uri=class_uri,
-            )
-
-        elif parent_name is not None:
-            parent_class_id = _resolve_optional_parent(
-                pkg,
-                parent_name,
                 scheme=scheme,
                 vocab_path=vocab_path,
                 child_uri=class_uri,
@@ -117,16 +126,6 @@ def seed_default_ade_vocabulary(pkg: USAPPackage) -> VocabularyResult:
     return seed_vocabulary_file(pkg, DEFAULT_ADE_VOCABULARY_PATH)
 
 
-# Backward-compatible names used by earlier tests/examples.
-
-def seed_citygml_basic_classes(pkg: USAPPackage) -> VocabularyResult:
-    return seed_default_citygml_vocabulary(pkg)
-
-
-def seed_prototype_ade_classes(pkg: USAPPackage) -> VocabularyResult:
-    return seed_default_ade_vocabulary(pkg)
-
-
 def _resolve_optional_parent(
     pkg: USAPPackage,
     parent_ref: str,
@@ -141,14 +140,20 @@ def _resolve_optional_parent(
             parent_ref,
             scheme=scheme,
         )
-    except Exception:
+    except USAPAmbiguityError:
+        # Ambiguity is definitive (and its message lists the options);
+        # do not mask it as "not registered".
+        raise
+    except USAPError:
         pass
 
     try:
         # Then try global resolution. This allows ADE/custom concepts
         # to inherit from CityGML class URIs.
         return pkg.resolve_semantic_class(parent_ref)
-    except Exception as exc:
+    except USAPAmbiguityError:
+        raise
+    except USAPError as exc:
         raise ValueError(
             f"{vocab_path}: parent concept {parent_ref!r} for "
             f"{child_uri!r} is not registered yet. Put parent concepts "

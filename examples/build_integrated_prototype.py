@@ -10,7 +10,7 @@ from usap import (
     import_citygml_semantics,
     register_las_asset,
     register_mesh_asset,
-    seed_prototype_ade_classes,
+    seed_default_ade_vocabulary,
 )
 
 
@@ -134,7 +134,6 @@ def main() -> None:
 
     with USAPPackage.create(
         args.db,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         citygml = import_citygml_semantics(
@@ -155,7 +154,7 @@ def main() -> None:
             lod=args.lod,
         )
 
-        ade_classes = seed_prototype_ade_classes(pkg)
+        ade_classes = seed_default_ade_vocabulary(pkg)
 
         if args.city_object_uid is not None:
             city_object = _find_city_object_by_uid(
@@ -168,31 +167,15 @@ def main() -> None:
                 "RoofSurface",
             )
 
+        # Attributes hold claim-level metadata only (how/when/by what this
+        # annotation was produced). Object properties (footprint, height,
+        # use, construction era, ...) belong to the CityGML/ADE source,
+        # reachable through the primary city object — never duplicated into
+        # USAP, so there is exactly one authority for them.
         energy_attributes = {
             "domain": "energy_emissions",
-            "source_city_object_uid": city_object["object_uid"],
-            "geometric_attributes": {
-                "footprint_area": None,
-                "height": None,
-                "floors": None,
-                "surface_volume_ratio": None,
-                "dispersion_surface": None,
-                "wall_or_slope_orientation": None,
-                "shading": None,
-                "adjacency": None,
-            },
-            "non_geometric_attributes": {
-                "id": city_object["object_uid"],
-                "construction_era": None,
-                "use": None,
-                "archetype": None,
-                "technology": None,
-                "conservation_state": None,
-            },
-            "derived_indicators": {
-                "specific_energy_kwh_m2": None,
-                "co2_emissions": None,
-            },
+            "method": "integrated_prototype_demo",
+            "assessed_at": "2026-06-30T14:00:00Z",
         }
 
         annotation_id = pkg.create_annotation(

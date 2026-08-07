@@ -18,16 +18,15 @@ from usap import ELEMENT_KIND_FACE, USAPPackage
 def main() -> None:
     with USAPPackage.create(
         "demo_sdk.usap.gpkg",
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         # ------------------------------------------------------------
         # 1. External mesh asset
         # ------------------------------------------------------------
         asset_id = pkg.register_asset(
-            uri="city_mesh.glb",
+            uri="city_mesh.ply",
             asset_kind="mesh",
-            media_type="model/gltf-binary",
+            media_type="application/ply",
             content_hash="fake_hash_for_phase_1a",
         )
 

@@ -2,20 +2,30 @@ from .constants import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_ENCODING,
     DEFAULT_GRAPH_NAME,
+    DEFAULT_VALUE_DTYPE,
     ELEMENT_KIND_FACE,
     ELEMENT_KIND_FEATURE,
     ELEMENT_KIND_POINT,
     ELEMENT_KIND_VERTEX,
+    VALUE_DTYPES,
 )
-from .core import USAPPackage
-from .errors import USAPError
+from .core import DEFAULT_SCHEMA_PATH, USAPPackage
+from .errors import USAPAmbiguityError, USAPError
 from .synthetic import SyntheticConfig, SyntheticResult, create_synthetic_package
-from .validation import ValidationIssue, ValidationReport, validate_connection
+from .validation import (
+    VALIDATION_LEVELS,
+    ValidationIssue,
+    ValidationReport,
+    validate_connection,
+    verify_assets,
+)
 from .geopackage import (
     GPKG_APPLICATION_ID,
     GPKG_USER_VERSION,
     USAP_EXTENSION_NAME,
+    epsg_from_wkt,
     read_geopackage_header,
+    set_package_srs,
 )
 from .adapters import (
     CityGMLImportResult,
@@ -30,10 +40,8 @@ from .adapters import (
 )
 from .domain_vocab import (
     VocabularyResult,
-    seed_citygml_basic_classes,
     seed_default_ade_vocabulary,
     seed_default_citygml_vocabulary,
-    seed_prototype_ade_classes,
     seed_vocabulary_file,
 )
 from .batch import (
@@ -50,7 +58,9 @@ from .project_builder import (
 
 __all__ = [
     "USAPPackage",
+    "DEFAULT_SCHEMA_PATH",
     "USAPError",
+    "USAPAmbiguityError",
     "ELEMENT_KIND_FACE",
     "ELEMENT_KIND_POINT",
     "ELEMENT_KIND_VERTEX",
@@ -58,21 +68,25 @@ __all__ = [
     "DEFAULT_BLOCK_SIZE",
     "DEFAULT_ENCODING",
     "DEFAULT_GRAPH_NAME",
+    "DEFAULT_VALUE_DTYPE",
+    "VALUE_DTYPES",
     "SyntheticConfig",
     "SyntheticResult",
     "create_synthetic_package",
     "ValidationIssue",
     "ValidationReport",
+    "VALIDATION_LEVELS",
     "validate_connection",
+    "verify_assets",
     "GPKG_APPLICATION_ID",
     "GPKG_USER_VERSION",
     "USAP_EXTENSION_NAME",
     "read_geopackage_header",
+    "set_package_srs",
+    "epsg_from_wkt",
     "LASRegistrationResult",
     "register_las_asset",
     "VocabularyResult",
-    "seed_citygml_basic_classes",
-    "seed_prototype_ade_classes",
     "CityGMLImportResult",
     "ImportedCityObject",
     "ImportedRelationship",

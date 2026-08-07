@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .constants import ELEMENT_KIND_FACE
-from .core import USAPPackage
+from .core import DEFAULT_SCHEMA_PATH, USAPPackage
 
 
 @dataclass(frozen=True)
@@ -19,7 +19,7 @@ class SyntheticConfig:
     roof_faces_per_building: int = 120
     wall_faces_per_building: int = 300
     ground_faces_per_building: int = 80
-    mesh_uri: str = "synthetic_city_mesh.glb"
+    mesh_uri: str = "synthetic_city_mesh.ply"
     mesh_part_path: str = "node=0/mesh=0/primitive=0"
 
 
@@ -39,7 +39,7 @@ class SyntheticResult:
 
 def create_synthetic_package(
     db_path: str | Path,
-    schema_path: str | Path = "sql/schema.sql",
+    schema_path: str | Path = DEFAULT_SCHEMA_PATH,
     config: SyntheticConfig | None = None,
     overwrite: bool = True,
 ) -> SyntheticResult:
@@ -93,7 +93,7 @@ def create_synthetic_package(
             asset_id = pkg.register_asset(
                 uri=config.mesh_uri,
                 asset_kind="mesh",
-                media_type="model/gltf-binary",
+                media_type="application/ply",
                 content_hash=(
                     f"synthetic_buildings_{config.building_count}_"
                     f"faces_{total_face_count}"
@@ -177,14 +177,12 @@ def create_synthetic_package(
                 )
 
                 # Avoid rebuilding closure after every edge.
-                # We rebuild once at the end.
                 pkg.link_city_objects(
                     parent_city_object_id=building_id,
                     child_city_object_id=roof_id,
                     relationship_type="boundedBy",
                     role="roof",
                     graph_name="usap_default",
-                    rebuild_closure=False,
                 )
 
                 pkg.link_city_objects(
@@ -193,7 +191,6 @@ def create_synthetic_package(
                     relationship_type="boundedBy",
                     role="wall",
                     graph_name="usap_default",
-                    rebuild_closure=False,
                 )
 
                 pkg.link_city_objects(
@@ -202,7 +199,6 @@ def create_synthetic_package(
                     relationship_type="boundedBy",
                     role="ground",
                     graph_name="usap_default",
-                    rebuild_closure=False,
                 )
 
                 base = i * faces_per_building
@@ -274,11 +270,8 @@ def create_synthetic_package(
 
                 annotation_count += 1
 
-            # One closure rebuild at the end is much faster than one per edge.
-            pkg.rebuild_city_object_closure(graph_name="usap_default")
-
             report = pkg.validate_report()
-            if report.issues:
+            if not report.is_ok:
                 joined = "\n".join(issue.format() for issue in report.issues)
                 raise RuntimeError(f"Synthetic package failed validation:\n{joined}")
 

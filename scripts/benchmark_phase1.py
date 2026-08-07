@@ -13,6 +13,7 @@ import sys
 from datetime import datetime, timezone
 
 from usap import (
+    DEFAULT_SCHEMA_PATH,
     ELEMENT_KIND_FACE,
     SyntheticConfig,
     USAPPackage,
@@ -161,7 +162,6 @@ def build_benchmark_report(
     annotation_count: int,
     city_object_count: int,
     relationship_count: int,
-    closure_count: int,
     membership_block_count: int,
     q1_indices: list[int],
     q2_indices: list[int],
@@ -196,7 +196,6 @@ def build_benchmark_report(
             "annotations": annotation_count,
             "city_objects": city_object_count,
             "relationships": relationship_count,
-            "closure_rows": closure_count,
             "membership_blocks": membership_block_count,
             "default_block_size": block_size,
         },
@@ -259,7 +258,6 @@ def write_markdown_report(path: str | Path, report: dict) -> None:
     lines.append(f"- Annotations: `{counts['annotations']}`")
     lines.append(f"- City objects: `{counts['city_objects']}`")
     lines.append(f"- Relationships: `{counts['relationships']}`")
-    lines.append(f"- Closure rows: `{counts['closure_rows']}`")
     lines.append(f"- Membership blocks: `{counts['membership_blocks']}`")
     lines.append(f"- Default block size: `{counts['default_block_size']}`")
     lines.append("")
@@ -325,8 +323,8 @@ def main() -> None:
 
     parser.add_argument(
         "--schema",
-        default="sql/schema.sql",
-        help="Path to USAP schema.sql.",
+        default=str(DEFAULT_SCHEMA_PATH),
+        help="Path to USAP schema.sql (defaults to the packaged one).",
     )
 
     parser.add_argument(
@@ -417,7 +415,6 @@ def main() -> None:
         annotation_count = count_rows(pkg, "usap_annotation")
         city_object_count = count_rows(pkg, "usap_city_object")
         relationship_count = count_rows(pkg, "usap_city_object_relationship")
-        closure_count = count_rows(pkg, "usap_city_object_closure")
         membership_block_count = count_rows(pkg, "usap_membership_block")
 
         print("Synthetic package created.")
@@ -427,7 +424,6 @@ def main() -> None:
         print(f"Annotations: {annotation_count}")
         print(f"City objects: {city_object_count}")
         print(f"Relationships: {relationship_count}")
-        print(f"Closure rows: {closure_count}")
         print(f"Membership blocks: {membership_block_count}")
         print(f"Default block size: {block_size}")
         print()
@@ -538,11 +534,12 @@ def main() -> None:
         print_result_table(timings)
 
         report = pkg.validate_report()
+        problems = [issue.format() for issue in report.issues]
 
-        if report.issues:
+        if problems:
             print("Validation problems:")
-            for issue in report.issues:
-                print("-", issue.format())
+            for problem in problems:
+                print("-", problem)
         else:
             print("Validation: OK")
 
@@ -556,7 +553,6 @@ def main() -> None:
             annotation_count=annotation_count,
             city_object_count=city_object_count,
             relationship_count=relationship_count,
-            closure_count=closure_count,
             membership_block_count=membership_block_count,
             q1_indices=q1_indices,
             q2_indices=q2_indices,

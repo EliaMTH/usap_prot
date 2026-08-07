@@ -19,12 +19,15 @@ Data model (each level references — never copies — the one above it)::
               semantic_class  what kind of thing it is (RoofSurface) → usap_semantic_class
               city_object     which object it is (building_1_roof_1) → usap_city_object
 
-Two independent hierarchies are kept as transitive-closure tables so
-"this class and its subclasses" / "this object and its descendants" are single
-indexed lookups instead of recursive walks:
+"This class and its subclasses" is a single indexed lookup into a stored
+transitive closure, maintained as vocabularies are seeded:
 
     usap_semantic_class_closure   class → subclass (parentage from vocabularies)
-    usap_city_object_closure      object → descendant, per named graph
+
+"This object and its descendants" is instead walked from the edges themselves
+with a recursive CTE (elements_for_city_object): the object graph is edited
+one edge at a time and is typed, so a stored closure would owe a rebuild after
+every edit and would have to encode the containment-type policy on write.
 
 One annotation can carry membership in several asset parts at once (LAS points
 *and* mesh faces *and* a triangulation), which is what makes a claim
@@ -47,18 +50,25 @@ Method map (matches the ``# ---`` section banners below):
 
     Opening / creating ......... create, open, close, context manager
     Small internal helpers ..... get_default_block_size, log_edit
-    Assets ..................... register_asset, register_asset_part
+    Assets ..................... register_asset, register_asset_part,
+                                  list_assets, list_asset_parts
     Semantic classes ........... create_semantic_class (+ closure maintenance)
     City objects and graph ..... create_city_object, link_city_objects,
-                                  rebuild_city_object_closure
+                                  list_city_objects
     Annotations ................ get/list/update/delete_annotation,
                                   create_annotation, link_annotation_to_object
     Membership editing ......... replace_annotation_membership (+ validation)
     Queries .................... annotations_for_elements (reverse: elements →
                                   annotations), elements_for_annotation /
                                   _semantic_class / _city_object (forward)
+    Value fields ............... annotate_value_field, replace_value_field,
+                                  values_for_annotation, elements_where,
+                                  value_field_stats (dense per-element scalar
+                                  fields, asset-bound — never city-object-bound)
     Validation ................. validate_report
-    Concept-level API .......... resolve_semantic_class / resolve_city_object,
+    Concept-level API .......... resolve_semantic_class / resolve_city_object /
+                                  resolve_asset_part, get_semantic_class,
+                                  list_accepted_concepts, concept_exists,
                                   create_concept_annotation, annotate_elements,
                                   attach_annotation_elements (the high-level
                                   entry points most callers use)
@@ -68,27 +78,270 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections import defaultdict, deque
+from collections import defaultdict
 from contextlib import contextmanager
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 import json
 import uuid
 
-from .errors import USAPError
+import numpy as np
+
+from .errors import USAPAmbiguityError, USAPError
 from .constants import (
+    ANNOTATION_STATUSES,
+    CITY_OBJECT_STATUSES,
+    CONFIDENCE_RANGE,
+    CONTAINMENT_RELATIONSHIP_TYPES,
     DEFAULT_BLOCK_SIZE,
     DEFAULT_ENCODING,
     DEFAULT_GRAPH_NAME,
+    DEFAULT_VALUE_DTYPE,
+    SUPPORTED_PROFILE_VERSIONS,
+    VALUE_CHUNK_SIZE,
+    VALUE_DTYPES,
     normalize_element_kind,
+    normalize_value_dtype,
 )
-from .encoding import encode_u32_zlib, decode_u32_zlib, block_start_for_index, split_indices_into_blocks
+from .encoding import (
+    IndexArray,
+    as_index_array,
+    block_start_for_index,
+    decode_u32_zlib,
+    decode_u32_zlib_array,
+    decode_value_block,
+    encode_u32_zlib,
+    encode_value_block,
+    split_indices_into_blocks,
+)
 from .sqlite_utils import require_lastrowid
 from .validation import validate_connection
-from .geopackage import initialize_geopackage_metadata
+from .geopackage import (
+    DEFAULT_EXTENT_SRS_ID,
+    USAP_FEATURES_LAYER,
+    encode_gpkg_bbox_polygon,
+    initialize_geopackage_metadata,
+)
 
 _UNSET = object()
+
+# Shipped inside the package (see pyproject package-data), not next to the
+# repo checkout, so the default schema loads from a plain wheel install too.
+DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parent / "data" / "schema.sql"
+
+# SQLite binds one variable per IN-list member and its variable limit can be
+# as low as 999, so large id lists are queried in chunks of this size.
+_MAX_SQL_IN_VARS = 900
+
+_COMPARISON_OPS = {
+    ">": np.greater,
+    ">=": np.greater_equal,
+    "<": np.less,
+    "<=": np.less_equal,
+    "==": np.equal,
+    "!=": np.not_equal,
+}
+
+
+def _same_value(stored: Any, requested: Any) -> bool:
+    """
+    Compare a stored column against what a re-registration asks for.
+
+    JSON columns are compared as parsed data, not text: the same metadata
+    re-serialized with different key order or spacing is the same metadata,
+    and reporting it as a conflict would make idempotent re-runs fail.
+    """
+    if stored == requested:
+        return True
+
+    if isinstance(stored, str) and isinstance(requested, str):
+        try:
+            return json.loads(stored) == json.loads(requested)
+        except ValueError:
+            return False
+
+    return False
+
+
+def _conflicting_fields(
+    stored: sqlite3.Row,
+    requested: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """
+    Fields where an existing row and a re-registration disagree.
+
+    Registration is idempotent on a natural key, which is only safe while
+    "already registered" means "registered as the same thing". Returning the
+    existing id despite a differing kind, count, or bounds hands the caller a
+    row that does not describe what they asked to register.
+    """
+    return {
+        column: {"stored": stored[column], "requested": value}
+        for column, value in requested.items()
+        if not _same_value(stored[column], value)
+    }
+
+
+def _check_annotation_fields(
+    status: Any = _UNSET,
+    confidence: Any = _UNSET,
+    attributes_json: Any = _UNSET,
+) -> None:
+    """
+    Refuse annotation field values no reader could act on.
+
+    Enforced on the way in rather than only reported afterwards: a rejected
+    status silently drops out of every status filter, a confidence outside
+    [0, 1] cannot be compared with any other, and attributes that are not
+    JSON cannot be read back at all. _UNSET means "not being written".
+    """
+    if status is not _UNSET and status not in ANNOTATION_STATUSES:
+        raise USAPError(
+            f"Unknown annotation status {status!r}. "
+            f"Use one of: {', '.join(ANNOTATION_STATUSES)}."
+        )
+
+    if confidence is not _UNSET and confidence is not None:
+        minimum, maximum = CONFIDENCE_RANGE
+
+        if not minimum <= float(confidence) <= maximum:
+            raise USAPError(
+                f"Confidence {confidence!r} is outside [{minimum}, {maximum}]."
+            )
+
+    if attributes_json is not _UNSET and attributes_json is not None:
+        try:
+            json.loads(attributes_json)
+        except (TypeError, ValueError) as exc:
+            raise USAPError(
+                f"attributes_json is not valid JSON: {exc}"
+            ) from exc
+
+
+def _descendants_cte(edge_type_count: int) -> str:
+    """
+    SQL prefix naming an object and everything contained in it as
+    ``objects(object_id)``.
+
+    Bind (root_city_object_id, graph_name, *containment_types) in that order,
+    before any other parameter of the statement it prefixes. With
+    edge_type_count == 0 the set is the root alone.
+
+    Descendants are walked from the edges themselves rather than read from a
+    stored transitive closure: no derived table to keep in step with the
+    edges, so an object created on its own is still its own descendant, and no
+    rebuild is owed after every link_city_objects.
+
+    UNION (not UNION ALL) both deduplicates and terminates on a cycle.
+    CROSS JOIN pins the join order (queue row -> its edges); with a plain JOIN,
+    SQLite picks usap_rel_by_child_graph on its graph_name prefix and rescans
+    every edge per recursive step (~400x slower).
+    """
+    if edge_type_count < 1:
+        return """
+            WITH objects(object_id) AS (
+                SELECT ?
+            )
+        """
+
+    placeholders = ",".join("?" for _ in range(edge_type_count))
+
+    return f"""
+        WITH RECURSIVE objects(object_id) AS (
+            SELECT ?
+            UNION
+            SELECT r.child_city_object_id
+            FROM objects AS o
+            CROSS JOIN usap_city_object_relationship AS r
+                ON r.parent_city_object_id = o.object_id
+            WHERE r.graph_name = ?
+              AND r.relationship_type IN ({placeholders})
+        )
+    """
+
+
+def _block_cannot_match(
+    op: str,
+    threshold: float,
+    value_min: float | None,
+    value_max: float | None,
+) -> bool:
+    """
+    True when a value block's stored NaN-ignoring [min, max] range proves the
+    comparison cannot match any element (NaN never matches any predicate).
+    """
+    if value_min is None or value_max is None:
+        return True  # all-NaN block
+
+    if op == ">":
+        return value_max <= threshold
+    if op == ">=":
+        return value_max < threshold
+    if op == "<":
+        return value_min >= threshold
+    if op == "<=":
+        return value_min > threshold
+    if op == "==":
+        return threshold < value_min or threshold > value_max
+    # "!=": every real value equals the threshold -> nothing can differ.
+    return value_min == value_max == threshold
+
+
+def _check_value_cast(
+    array: np.ndarray,
+    target_dtype: np.dtype,
+    value_dtype: str,
+) -> None:
+    """
+    Reject casts that would silently corrupt values: wraparound/truncation
+    into integer dtypes, or finite values overflowing to inf in a narrower
+    float dtype. Plain precision rounding (f8 -> f4) is inherent to the
+    requested dtype and stays allowed.
+    """
+    if array.size == 0 or array.dtype.kind not in "buif":
+        return
+
+    if target_dtype.kind in "ui":
+        if array.dtype.kind == "f" and not bool(np.isfinite(array).all()):
+            raise USAPError(
+                f"Non-finite values are not representable in integer "
+                f"value_dtype {value_dtype!r}. Use a float dtype."
+            )
+
+        info = np.iinfo(target_dtype)
+        lo = array.min()
+        hi = array.max()
+
+        if lo < info.min or hi > info.max:
+            raise USAPError(
+                f"Value field has values outside the {value_dtype!r} range "
+                f"[{info.min}, {info.max}]: min {lo}, max {hi}. "
+                "They would wrap around silently."
+            )
+
+        if array.dtype.kind == "f" and bool((np.floor(array) != array).any()):
+            raise USAPError(
+                f"Value field has non-integral values; integer value_dtype "
+                f"{value_dtype!r} would truncate them. Use a float dtype."
+            )
+    elif array.dtype != target_dtype:
+        finite = array
+
+        if array.dtype.kind == "f":
+            finite = array[np.isfinite(array)]
+
+        if finite.size:
+            magnitude = max(abs(float(finite.min())), abs(float(finite.max())))
+
+            if magnitude > float(np.finfo(target_dtype).max):
+                raise USAPError(
+                    f"Value field has finite values beyond the "
+                    f"{value_dtype!r} range "
+                    f"(max magnitude {np.finfo(target_dtype).max}); "
+                    "the cast would produce inf."
+                )
+
 
 class USAPPackage:
     """
@@ -111,6 +364,12 @@ class USAPPackage:
         transaction. This lets SDK methods be safe when called individually,
         but also fast when many edits are grouped together.
 
+        If a transaction is already open on the connection from raw writes on
+        ``pkg.conn`` (sqlite3 starts one implicitly), the outermost block
+        adopts it: no ``BEGIN`` is issued, but the block still commits or
+        rolls back at exit, raw writes included. Otherwise those writes would
+        silently be rolled back when the package is closed.
+
         Example:
 
             with pkg.transaction():
@@ -118,7 +377,7 @@ class USAPPackage:
                 pkg.create_annotation(...)
                 pkg.replace_annotation_membership(...)
         """
-        if self._transaction_depth > 0 or self.conn.in_transaction:
+        if self._transaction_depth > 0:
             self._transaction_depth += 1
             try:
                 yield
@@ -129,7 +388,8 @@ class USAPPackage:
         self._transaction_depth = 1
 
         try:
-            self.conn.execute("BEGIN")
+            if not self.conn.in_transaction:
+                self.conn.execute("BEGIN")
             yield
         except Exception:
             self.conn.rollback()
@@ -147,7 +407,7 @@ class USAPPackage:
     def create(
         cls,
         db_path: str | Path,
-        schema_path: str | Path = "schema.sql",
+        schema_path: str | Path = DEFAULT_SCHEMA_PATH,
         overwrite: bool = False,
         profile_version: str = "0.1.0",
     ) -> "USAPPackage":
@@ -165,47 +425,103 @@ class USAPPackage:
 
         pkg = cls(db_path)
 
-        with open(schema_path, "r", encoding="utf-8") as f:
-            schema_sql = f.read()
+        # If initialization fails partway, do not leave an open connection
+        # and a half-initialized file behind (the file is always ours here:
+        # any pre-existing one was removed or raised above).
+        try:
+            with open(schema_path, "r", encoding="utf-8") as f:
+                schema_sql = f.read()
 
-        pkg.conn.executescript(schema_sql)
+            pkg.conn.executescript(schema_sql)
 
-        with pkg.transaction():
-            initialize_geopackage_metadata(
-                pkg.conn,
-                profile_version=profile_version,
-            )
-
-            pkg.conn.execute(
-                """
-                INSERT INTO usap_profile (
-                    profile_id,
-                    profile_version,
-                    default_block_size,
-                    default_encoding,
-                    metadata_json
+            with pkg.transaction():
+                initialize_geopackage_metadata(
+                    pkg.conn,
+                    profile_version=profile_version,
                 )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    1,
-                    profile_version,
-                    DEFAULT_BLOCK_SIZE,
-                    DEFAULT_ENCODING,
-                    None,
-                ),
-            )
+
+                pkg.conn.execute(
+                    """
+                    INSERT INTO usap_profile (
+                        profile_id,
+                        profile_version,
+                        default_block_size,
+                        default_encoding,
+                        metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        profile_version,
+                        DEFAULT_BLOCK_SIZE,
+                        DEFAULT_ENCODING,
+                        None,
+                    ),
+                )
+        except BaseException:
+            pkg.conn.close()
+            if db_path.exists():
+                os.remove(db_path)
+            raise
 
         return pkg
     
     @classmethod
     def open(cls, db_path: str | Path) -> "USAPPackage":
+        """
+        Open an existing package.
+
+        The file is gated on being a USAP package this build understands:
+        without the check, any SQLite file opens here and fails much later
+        with 'no such table: usap_asset' from whatever API call happens to
+        run first.
+        """
         db_path = Path(db_path)
 
         if not db_path.exists():
             raise USAPError(f"Database does not exist: {db_path}")
 
-        return cls(db_path)
+        pkg = cls(db_path)
+
+        try:
+            pkg._check_profile_compatibility()
+        except BaseException:
+            pkg.conn.close()
+            raise
+
+        return pkg
+
+    def _check_profile_compatibility(self) -> None:
+        try:
+            row = self.conn.execute(
+                """
+                SELECT profile_version
+                FROM usap_profile
+                WHERE profile_id = 1
+                """
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise USAPError(
+                f"Not a USAP package: {self.db_path} ({exc})."
+            ) from exc
+
+        if row is None:
+            raise USAPError(
+                f"Not a USAP package: {self.db_path} (no usap_profile row)."
+            )
+
+        profile_version = row["profile_version"]
+
+        # No migration path exists yet, so an unknown version must stop here:
+        # reading it with this build's assumptions would misinterpret it
+        # rather than fail.
+        if profile_version not in SUPPORTED_PROFILE_VERSIONS:
+            raise USAPError(
+                f"Unsupported USAP profile version {profile_version!r} in "
+                f"{self.db_path}. This build supports: "
+                f"{', '.join(SUPPORTED_PROFILE_VERSIONS)}."
+            )
 
     def close(self) -> None:
         self.conn.close()
@@ -271,10 +587,16 @@ class USAPPackage:
         Register an external asset.
 
         Returns asset_id.
+
+        Idempotent on (uri, content_hash): re-registering the same file
+        returns the existing asset_id. That is only sound while the rest of
+        the record agrees, so a re-registration that changes the kind, media
+        type, SRS, or metadata raises instead of quietly returning a row that
+        describes something else.
         """
         existing = self.conn.execute(
             """
-            SELECT asset_id
+            SELECT asset_id, asset_kind, media_type, srs_id, metadata_json
             FROM usap_asset
             WHERE uri = ?
               AND content_hash IS ?
@@ -283,6 +605,24 @@ class USAPPackage:
         ).fetchone()
 
         if existing is not None:
+            conflicts = _conflicting_fields(
+                existing,
+                {
+                    "asset_kind": asset_kind,
+                    "media_type": media_type,
+                    "srs_id": srs_id,
+                    "metadata_json": metadata_json,
+                },
+            )
+
+            if conflicts:
+                raise USAPError(
+                    f"Asset {uri!r} is already registered with different "
+                    f"values: {conflicts}. Re-registering cannot change an "
+                    "existing asset; register the new version under its own "
+                    "content hash, or fix the caller."
+                )
+
             return int(existing["asset_id"])
 
         with self.transaction():
@@ -331,6 +671,12 @@ class USAPPackage:
         Register a stable sub-location inside an asset.
 
         Returns asset_part_id.
+
+        Idempotent on (asset_id, part_path, element_kind), with the same
+        caveat as register_asset: element_count is the index space every
+        annotation on this part is validated against, so a re-registration
+        that changes it (or the bounds, origin, or metadata) raises rather
+        than leaving existing memberships silently mis-scoped.
         """
         element_kind = normalize_element_kind(element_kind)
         if element_count < 0:
@@ -338,7 +684,13 @@ class USAPPackage:
 
         existing = self.conn.execute(
             """
-            SELECT asset_part_id
+            SELECT
+                asset_part_id,
+                element_count,
+                index_origin,
+                minx, miny, minz,
+                maxx, maxy, maxz,
+                metadata_json
             FROM usap_asset_part
             WHERE asset_id = ?
               AND part_path = ?
@@ -348,6 +700,30 @@ class USAPPackage:
         ).fetchone()
 
         if existing is not None:
+            conflicts = _conflicting_fields(
+                existing,
+                {
+                    "element_count": element_count,
+                    "index_origin": index_origin,
+                    "minx": minx,
+                    "miny": miny,
+                    "minz": minz,
+                    "maxx": maxx,
+                    "maxy": maxy,
+                    "maxz": maxz,
+                    "metadata_json": metadata_json,
+                },
+            )
+
+            if conflicts:
+                raise USAPError(
+                    f"Asset part {part_path!r} of asset {asset_id} is already "
+                    f"registered with different values: {conflicts}. Existing "
+                    "annotations are indexed against the stored element "
+                    "count; register the changed asset as a new version "
+                    "instead."
+                )
+
             return int(existing["asset_part_id"])
 
         with self.transaction():
@@ -385,6 +761,7 @@ class USAPPackage:
                 ),
             )
             asset_part_id = require_lastrowid(cur)
+            self._refresh_asset_extent(asset_id)
             self.log_edit(
                 "register_asset_part",
                 "usap_asset_part",
@@ -392,6 +769,158 @@ class USAPPackage:
             )
 
         return asset_part_id
+
+    def _refresh_asset_extent(self, asset_id: int) -> None:
+        """
+        Upsert the asset's derived 2D extent box (the union of its parts'
+        stored bounds) for the GIS features layer. Parts without full 2D
+        bounds are ignored; an asset with none keeps no extent row.
+        """
+        has_extent_table = self.conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'usap_asset_extent'
+            """
+        ).fetchone()
+
+        if has_extent_table is None:
+            return  # package predates the extents layer
+
+        box = self.conn.execute(
+            """
+            SELECT
+                MIN(minx) AS minx,
+                MIN(miny) AS miny,
+                MAX(maxx) AS maxx,
+                MAX(maxy) AS maxy
+            FROM usap_asset_part
+            WHERE asset_id = ?
+              AND minx IS NOT NULL
+              AND miny IS NOT NULL
+              AND maxx IS NOT NULL
+              AND maxy IS NOT NULL
+            """,
+            (asset_id,),
+        ).fetchone()
+
+        if box is None or box["minx"] is None:
+            return
+
+        srs_row = self.conn.execute(
+            """
+            SELECT srs_id
+            FROM gpkg_geometry_columns
+            WHERE table_name = ?
+            """,
+            (USAP_FEATURES_LAYER,),
+        ).fetchone()
+
+        srs_id = (
+            int(srs_row["srs_id"]) if srs_row is not None
+            else DEFAULT_EXTENT_SRS_ID
+        )
+
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO usap_asset_extent (asset_id, geom)
+            VALUES (?, ?)
+            """,
+            (
+                asset_id,
+                encode_gpkg_bbox_polygon(
+                    float(box["minx"]),
+                    float(box["miny"]),
+                    float(box["maxx"]),
+                    float(box["maxy"]),
+                    srs_id,
+                ),
+            ),
+        )
+
+    def list_assets(
+        self,
+        *,
+        asset_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        List registered assets, each with its part and element counts.
+
+        Pass asset_kind to keep only one kind (e.g. 'mesh', 'pointcloud').
+        """
+        where = ""
+        params: list[Any] = []
+
+        if asset_kind is not None:
+            where = "WHERE a.asset_kind = ?"
+            params.append(asset_kind)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                a.asset_id,
+                a.uri,
+                a.asset_kind,
+                a.media_type,
+                a.content_hash,
+                a.srs_id,
+                (
+                    SELECT COUNT(*)
+                    FROM usap_asset_part AS ap
+                    WHERE ap.asset_id = a.asset_id
+                ) AS part_count,
+                (
+                    SELECT COALESCE(SUM(ap.element_count), 0)
+                    FROM usap_asset_part AS ap
+                    WHERE ap.asset_id = a.asset_id
+                ) AS element_count
+            FROM usap_asset AS a
+            {where}
+            ORDER BY a.asset_id
+            """,
+            params,
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def list_asset_parts(
+        self,
+        *,
+        asset_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        List asset parts (the stable index spaces annotations bind to).
+
+        Pass asset_id to keep only one asset's parts. element_kind is the
+        USAP integer constant (see ELEMENT_KIND_*).
+        """
+        where = ""
+        params: list[Any] = []
+
+        if asset_id is not None:
+            where = "WHERE asset_id = ?"
+            params.append(asset_id)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                asset_part_id,
+                asset_id,
+                part_path,
+                element_kind,
+                element_count,
+                index_origin,
+                minx, miny, minz,
+                maxx, maxy, maxz
+            FROM usap_asset_part
+            {where}
+            ORDER BY asset_id, asset_part_id
+            """,
+            params,
+        ).fetchall()
+
+        return [dict(row) for row in rows]
 
     # ---------------------------------------------------------------------
     # Semantic classes
@@ -414,7 +943,7 @@ class USAPPackage:
         """
         existing = self.conn.execute(
             """
-            SELECT semantic_class_id
+            SELECT semantic_class_id, parent_class_id
             FROM usap_semantic_class
             WHERE class_uri = ?
             """,
@@ -422,6 +951,21 @@ class USAPPackage:
         ).fetchone()
 
         if existing is not None:
+            existing_parent_id = existing["parent_class_id"]
+
+            # A requested None parent makes no claim, so plain re-creates and
+            # re-seeding stay idempotent; only a contradicting parent raises.
+            if (
+                parent_class_id is not None
+                and existing_parent_id != parent_class_id
+            ):
+                raise USAPError(
+                    f"Semantic class already exists with a different parent: "
+                    f"{class_uri!r} has parent_class_id {existing_parent_id}, "
+                    f"requested {parent_class_id}. "
+                    "Changing a concept's parent is not supported yet."
+                )
+
             return int(existing["semantic_class_id"])
 
         with self.transaction():
@@ -513,6 +1057,12 @@ class USAPPackage:
         object_status: str = "accepted",
         attributes_json: str | None = None,
     ) -> int:
+        if object_status not in CITY_OBJECT_STATUSES:
+            raise USAPError(
+                f"Unknown city object status {object_status!r}. "
+                f"Use one of: {', '.join(CITY_OBJECT_STATUSES)}."
+            )
+
         existing = self.conn.execute(
             """
             SELECT city_object_id
@@ -568,11 +1118,43 @@ class USAPPackage:
         source_asset_id: int | None = None,
         source_relation_id: str | None = None,
         metadata_json: str | None = None,
-        rebuild_closure: bool = True,
     ) -> int:
         """
         Add one typed edge between two city objects.
+
+        Idempotent: re-linking an identical edge (same graph, endpoints,
+        type, role, and source_relation_id) returns the existing
+        relationship_id instead of inserting a duplicate.
+
+        The edge is the only representation: descendant queries walk these
+        rows directly (see elements_for_city_object), so nothing derived has
+        to be rebuilt afterwards. Only CONTAINMENT_RELATIONSHIP_TYPES edges
+        make the child part of the parent for those queries.
         """
+        existing = self.conn.execute(
+            """
+            SELECT relationship_id
+            FROM usap_city_object_relationship
+            WHERE graph_name = ?
+              AND parent_city_object_id = ?
+              AND child_city_object_id = ?
+              AND relationship_type = ?
+              AND role IS ?
+              AND source_relation_id IS ?
+            """,
+            (
+                graph_name,
+                parent_city_object_id,
+                child_city_object_id,
+                relationship_type,
+                role,
+                source_relation_id,
+            ),
+        ).fetchone()
+
+        if existing is not None:
+            return int(existing["relationship_id"])
+
         with self.transaction():
             cur = self.conn.execute(
                 """
@@ -607,99 +1189,100 @@ class USAPPackage:
                 relationship_id,
             )
 
-        if rebuild_closure:
-            self.rebuild_city_object_closure(graph_name=graph_name)
-
         return relationship_id
 
-    def rebuild_city_object_closure(
+    def list_city_objects(
         self,
+        *,
+        object_status: str | None = None,
+        semantic_class_id: int | None = None,
+        search: str | None = None,
+        parent_object: int | str | None = None,
+        descendants_of: int | str | None = None,
         graph_name: str = DEFAULT_GRAPH_NAME,
-    ) -> None:
+        containment_types: Sequence[str] = CONTAINMENT_RELATIONSHIP_TYPES,
+    ) -> list[dict[str, Any]]:
         """
-        Rebuild the ancestor/descendant closure for one named graph.
+        List city objects (the semantic identities annotations link to).
 
-        The closure exists to accelerate annotation retrieval: it lets
-        elements_for_city_object answer "annotations for this object and its
-        parts" with a single indexed lookup instead of walking the relationship
-        edges. usap_default is the graph those queries traverse; the several
-        named graphs are mainly plumbing for mirroring CityGML structure, not a
-        general-purpose graph database.
+        Filters are AND-combined:
+        - object_status — e.g. 'temporary' to find carrier objects awaiting
+          alignment with a real CityGML source.
+        - semantic_class_id — objects of one class.
+        - search — substring match on object_uid.
+        - parent_object — an object id or uid; returns only its DIRECT
+          children in graph_name (walk the object tree: list all, then expand
+          a node). Root objects are those returned with no parent_object that
+          never appear as someone's child.
+        - descendants_of — an object id or uid; returns that object AND every
+          object contained in it at any depth, which is the set
+          elements_for_city_object gathers annotations over. Only
+          containment_types edges are followed (see
+          CONTAINMENT_RELATIONSHIP_TYPES).
         """
-        objects = self.conn.execute(
-            """
-            SELECT city_object_id
-            FROM usap_city_object
-            """
-        ).fetchall()
+        where: list[str] = []
+        params: list[Any] = []
+        join = ""
+        with_sql = ""
 
-        object_ids = [int(row["city_object_id"]) for row in objects]
+        if descendants_of is not None:
+            root_id = self.resolve_city_object(descendants_of)
+            edge_types = tuple(containment_types)
 
-        edges = self.conn.execute(
-            """
-            SELECT parent_city_object_id, child_city_object_id
-            FROM usap_city_object_relationship
-            WHERE graph_name = ?
+            with_sql = _descendants_cte(len(edge_types))
+            params.extend([root_id, graph_name, *edge_types])
+            where.append("co.city_object_id IN (SELECT object_id FROM objects)")
+
+        if parent_object is not None:
+            parent_id = self.resolve_city_object(parent_object)
+            join = (
+                "JOIN usap_city_object_relationship AS r "
+                "ON r.child_city_object_id = co.city_object_id "
+                "AND r.parent_city_object_id = ? "
+                "AND r.graph_name = ?"
+            )
+            params.extend([parent_id, graph_name])
+
+        if object_status is not None:
+            where.append("co.object_status = ?")
+            params.append(object_status)
+
+        if semantic_class_id is not None:
+            where.append("co.semantic_class_id = ?")
+            params.append(semantic_class_id)
+
+        if search is not None:
+            where.append("co.object_uid LIKE ?")
+            params.append(f"%{search}%")
+
+        where_sql = ""
+
+        if where:
+            where_sql = "WHERE " + " AND ".join(where)
+
+        rows = self.conn.execute(
+            f"""
+            {with_sql}
+            SELECT DISTINCT
+                co.city_object_id,
+                co.object_uid,
+                sc.local_name AS semantic_class,
+                co.object_status,
+                co.gml_id,
+                src.uri AS source_asset_uri
+            FROM usap_city_object AS co
+            {join}
+            LEFT JOIN usap_semantic_class AS sc
+                ON sc.semantic_class_id = co.semantic_class_id
+            LEFT JOIN usap_asset AS src
+                ON src.asset_id = co.source_asset_id
+            {where_sql}
+            ORDER BY co.object_uid
             """,
-            (graph_name,),
+            params,
         ).fetchall()
 
-        children_by_parent: dict[int, list[int]] = defaultdict(list)
-
-        for row in edges:
-            parent_id = int(row["parent_city_object_id"])
-            child_id = int(row["child_city_object_id"])
-            children_by_parent[parent_id].append(child_id)
-
-        closure_rows: list[tuple[str, int, int, int]] = []
-
-        for start_id in object_ids:
-            closure_rows.append((graph_name, start_id, start_id, 0))
-
-            queue = deque([(start_id, 0)])
-            visited = {start_id}
-
-            while queue:
-                current_id, current_depth = queue.popleft()
-
-                for child_id in children_by_parent.get(current_id, []):
-                    if child_id in visited:
-                        continue
-
-                    visited.add(child_id)
-
-                    depth = current_depth + 1
-                    closure_rows.append((graph_name, start_id, child_id, depth))
-                    queue.append((child_id, depth))
-
-        with self.transaction():
-            self.conn.execute(
-                """
-                DELETE FROM usap_city_object_closure
-                WHERE graph_name = ?
-                """,
-                (graph_name,),
-            )
-
-            self.conn.executemany(
-                """
-                INSERT INTO usap_city_object_closure (
-                    graph_name,
-                    ancestor_city_object_id,
-                    descendant_city_object_id,
-                    depth
-                )
-                VALUES (?, ?, ?, ?)
-                """,
-                closure_rows,
-            )
-
-            self.log_edit(
-                "rebuild_city_object_closure",
-                "usap_city_object_closure",
-                None,
-                f'{{"graph_name": "{graph_name}"}}',
-            )
+        return [dict(row) for row in rows]
 
     # ---------------------------------------------------------------------
     # Annotations
@@ -716,6 +1299,9 @@ class USAPPackage:
         Read one annotation by id or uid.
 
         Returns None if no annotation is found.
+
+        include_membership_summary=True also attaches value_field_summary
+        (both are per-asset-part payload rollups).
         """
         if annotation_id is None and annotation_uid is None:
             raise USAPError("Provide annotation_id or annotation_uid.")
@@ -764,9 +1350,7 @@ class USAPPackage:
         result = dict(row)
 
         if include_membership_summary:
-            result["membership_summary"] = self._annotation_membership_summary(
-                int(result["annotation_id"])
-            )
+            self._attach_annotation_summaries(result)
 
         return result
 
@@ -790,6 +1374,9 @@ class USAPPackage:
         city_object_id / city_object_uid matches either:
         - annotation.primary_city_object_id
         - usap_annotation_object links
+
+        include_membership_summary=True also attaches value_field_summary
+        (both are per-asset-part payload rollups).
         """
         where: list[str] = []
         params: list[Any] = []
@@ -888,9 +1475,7 @@ class USAPPackage:
 
         if include_membership_summary:
             for item in result:
-                item["membership_summary"] = self._annotation_membership_summary(
-                    int(item["annotation_id"])
-                )
+                self._attach_annotation_summaries(item)
 
         return result
 
@@ -912,7 +1497,21 @@ class USAPPackage:
 
         Omitted fields are preserved.
         Passing None explicitly stores NULL.
+
+        Changing primary_city_object_id also moves the annotation's
+        'represents' link in usap_annotation_object, in the same transaction,
+        so the two representations of the primary object cannot diverge (see
+        elements_for_city_object). Only the *old primary object's* link row is
+        removed, so intentional secondary links survive the move; a separately
+        added 'represents' link to the old primary object is indistinguishable
+        from the primary one and is removed with it.
         """
+        _check_annotation_fields(
+            status=status,
+            confidence=confidence,
+            attributes_json=attributes_json,
+        )
+
         updates: list[str] = []
         params: list[Any] = []
 
@@ -947,17 +1546,44 @@ class USAPPackage:
         params.append(annotation_id)
 
         with self.transaction():
-            cur = self.conn.execute(
-                f"""
-                UPDATE usap_annotation
-                SET {", ".join(updates)}
-                WHERE annotation_id = ?
-                """,
-                params,
-            )
+            # Read before the UPDATE: afterwards the old primary object is gone
+            # and its stale link row could not be found any more.
+            previous_primary_object_id: int | None = None
+
+            if primary_city_object_id is not _UNSET:
+                previous_primary_object_id = self._primary_city_object_id(
+                    annotation_id
+                )
+
+            try:
+                cur = self.conn.execute(
+                    f"""
+                    UPDATE usap_annotation
+                    SET {", ".join(updates)}
+                    WHERE annotation_id = ?
+                    """,
+                    params,
+                )
+            except sqlite3.IntegrityError as exc:
+                raise USAPError(
+                    f"Annotation update violates a constraint: {exc}"
+                ) from exc
 
             if cur.rowcount != 1:
                 raise USAPError(f"Annotation not found: {annotation_id}")
+
+            if primary_city_object_id is not _UNSET:
+                new_primary_object_id = (
+                    None
+                    if primary_city_object_id is None
+                    else int(primary_city_object_id)
+                )
+
+                self._move_primary_object_link(
+                    annotation_id,
+                    previous_primary_object_id,
+                    new_primary_object_id,
+                )
 
             self.log_edit("update_annotation", "usap_annotation", annotation_id)
 
@@ -1043,6 +1669,16 @@ class USAPPackage:
         return [dict(row) for row in rows]
 
 
+    def _attach_annotation_summaries(self, item: dict[str, Any]) -> None:
+        annotation_id = int(item["annotation_id"])
+        item["membership_summary"] = self._annotation_membership_summary(
+            annotation_id
+        )
+        item["value_field_summary"] = self._annotation_value_field_summary(
+            annotation_id
+        )
+
+
     def create_annotation(
         self,
         annotation_uid: str,
@@ -1054,9 +1690,15 @@ class USAPPackage:
         attributes_json: str | None = None,
         link_primary_object: bool = True,
     ) -> int:
+        _check_annotation_fields(
+            status=status,
+            confidence=confidence,
+            attributes_json=attributes_json,
+        )
+
         existing = self.conn.execute(
             """
-            SELECT annotation_id
+            SELECT annotation_id, semantic_class_id
             FROM usap_annotation
             WHERE annotation_uid = ?
             """,
@@ -1064,6 +1706,16 @@ class USAPPackage:
         ).fetchone()
 
         if existing is not None:
+            existing_class_id = int(existing["semantic_class_id"])
+
+            if existing_class_id != semantic_class_id:
+                raise USAPError(
+                    f"Annotation already exists with a different semantic class: "
+                    f"{annotation_uid!r} has semantic_class_id {existing_class_id}, "
+                    f"requested {semantic_class_id}. "
+                    "Use update_annotation to change its class."
+                )
+
             return int(existing["annotation_id"])
 
         with self.transaction():
@@ -1126,8 +1778,15 @@ class USAPPackage:
         self,
         asset_part_id: int,
         element_kind: int,
-        element_indices: list[int],
-    ) -> list[int]:
+        element_indices: IndexArray,
+    ) -> np.ndarray:
+        """
+        Normalize a selection and check it against the part's index space.
+
+        Returns a sorted, duplicate-free uint32 array: a selection over a
+        10 GB point cloud can be hundreds of millions of indices, which is
+        the one place where holding them as Python ints does not fit.
+        """
         asset_part = self.conn.execute(
             """
             SELECT element_kind, element_count
@@ -1149,16 +1808,15 @@ class USAPPackage:
                 f"{expected_kind}, got {element_kind}"
             )
 
-        unique_indices = sorted(set(element_indices))
+        # as_index_array sorts, de-duplicates, and rejects negatives; sorted
+        # means the upper bound is the last element.
+        unique_indices = as_index_array(element_indices)
 
-        for index in unique_indices:
-            if index < 0:
-                raise USAPError(f"Negative element index: {index}")
-            if index >= element_count:
-                raise USAPError(
-                    f"Element index {index} is out of range. "
-                    f"Asset part has {element_count} elements."
-                )
+        if unique_indices.size and int(unique_indices[-1]) >= element_count:
+            raise USAPError(
+                f"Element index {int(unique_indices[-1])} is out of range. "
+                f"Asset part has {element_count} elements."
+            )
 
         return unique_indices
 
@@ -1167,7 +1825,7 @@ class USAPPackage:
         annotation_id: int,
         asset_part_id: int,
         element_kind: int,
-        element_indices: list[int],
+        element_indices: IndexArray,
         encoding: str = DEFAULT_ENCODING,
     ) -> None:
         """
@@ -1184,6 +1842,18 @@ class USAPPackage:
         element_kind = normalize_element_kind(element_kind)
         if encoding != "u32-zlib":
             raise USAPError(f"Unsupported encoding in phase 1: {encoding}")
+
+        annotation = self.conn.execute(
+            """
+            SELECT annotation_id
+            FROM usap_annotation
+            WHERE annotation_id = ?
+            """,
+            (annotation_id,),
+        ).fetchone()
+
+        if annotation is None:
+            raise USAPError(f"Annotation not found: {annotation_id}")
 
         block_size = self.get_default_block_size()
 
@@ -1210,8 +1880,11 @@ class USAPPackage:
 
             for block_start, offsets in blocks.items():
                 payload = encode_u32_zlib(offsets)
-                min_element_index = block_start + min(offsets)
-                max_element_index = block_start + max(offsets)
+
+                # int(): sqlite3 has no adapter for numpy scalars and would
+                # store them as BLOBs.
+                min_element_index = block_start + int(offsets[0])
+                max_element_index = block_start + int(offsets[-1])
 
                 self.conn.execute(
                     """
@@ -1270,6 +1943,57 @@ class USAPPackage:
             (annotation_id, city_object_id, relation_type),
         )
 
+    def _primary_city_object_id(self, annotation_id: int) -> int | None:
+        row = self.conn.execute(
+            """
+            SELECT primary_city_object_id
+            FROM usap_annotation
+            WHERE annotation_id = ?
+            """,
+            (annotation_id,),
+        ).fetchone()
+
+        if row is None or row["primary_city_object_id"] is None:
+            return None
+
+        return int(row["primary_city_object_id"])
+
+    def _move_primary_object_link(
+        self,
+        annotation_id: int,
+        previous_city_object_id: int | None,
+        new_city_object_id: int | None,
+    ) -> None:
+        """
+        Keep usap_annotation_object in step with primary_city_object_id.
+
+        Caller must already be inside a transaction, so the column and the link
+        row move together or not at all.
+
+        Re-stating the same primary object is not a no-op: the insert repairs a
+        missing link row (annotations created with link_primary_object=False).
+        """
+        if (
+            previous_city_object_id is not None
+            and previous_city_object_id != new_city_object_id
+        ):
+            self.conn.execute(
+                """
+                DELETE FROM usap_annotation_object
+                WHERE annotation_id = ?
+                  AND city_object_id = ?
+                  AND relation_type = 'represents'
+                """,
+                (annotation_id, previous_city_object_id),
+            )
+
+        if new_city_object_id is not None:
+            self._link_annotation_object(
+                annotation_id,
+                new_city_object_id,
+                "represents",
+            )
+
     # ---------------------------------------------------------------------
     # Queries
     # ---------------------------------------------------------------------
@@ -1292,11 +2016,12 @@ class USAPPackage:
         }
 
         if expand:
-            offsets = decode_u32_zlib(row["payload"])
-            item["elements"] = [
-                int(row["block_start"]) + offset
-                for offset in offsets
-            ]
+            offsets = decode_u32_zlib_array(row["payload"])
+            # Vectorized add, then one conversion: the per-element Python
+            # loop was the expensive half of expanding a large selection.
+            item["elements"] = (
+                offsets.astype(np.int64) + int(row["block_start"])
+            ).tolist()
 
         return item
 
@@ -1318,60 +2043,71 @@ class USAPPackage:
         - decodes only candidate membership blocks
         """
         element_kind = normalize_element_kind(element_kind)
-        if not selected_indices:
+
+        selected = as_index_array(selected_indices)
+
+        if selected.size == 0:
             return []
 
         block_size = self.get_default_block_size()
 
-        selected_by_block: dict[int, set[int]] = defaultdict(set)
-
-        for index in selected_indices:
-            if index < 0:
-                raise USAPError(f"Negative selected index: {index}")
-
-            block_start = block_start_for_index(index, block_size)
-            offset = index - block_start
-            selected_by_block[block_start].add(offset)
+        # Same block split as the write path, so a selection the size of the
+        # asset costs one pass over an array rather than a Python loop.
+        selected_by_block = {
+            block_start: offsets.astype(np.int64)
+            for block_start, offsets in split_indices_into_blocks(
+                selected, block_size
+            ).items()
+        }
 
         block_starts = sorted(selected_by_block)
 
-        placeholders = ",".join("?" for _ in block_starts)
+        # Chunked so a huge selection cannot exceed the SQLite variable limit.
+        # Chunks partition block_starts, so each candidate block row appears
+        # exactly once and the merge below is unaffected.
+        rows: list[sqlite3.Row] = []
 
-        rows = self.conn.execute(
-            f"""
-            SELECT
-                mb.annotation_id,
-                mb.block_start,
-                mb.payload,
+        for chunk_index in range(0, len(block_starts), _MAX_SQL_IN_VARS):
+            chunk = block_starts[chunk_index : chunk_index + _MAX_SQL_IN_VARS]
+            placeholders = ",".join("?" for _ in chunk)
 
-                a.annotation_uid,
-                a.label,
-                a.status,
+            rows.extend(
+                self.conn.execute(
+                    f"""
+                    SELECT
+                        mb.annotation_id,
+                        mb.block_start,
+                        mb.payload,
 
-                sc.local_name AS semantic_class,
-                sc.class_uri AS semantic_class_uri,
+                        a.annotation_uid,
+                        a.label,
+                        a.status,
 
-                co.object_uid AS primary_city_object_uid
-            FROM usap_membership_block AS mb
-            JOIN usap_annotation AS a
-                ON a.annotation_id = mb.annotation_id
-            JOIN usap_semantic_class AS sc
-                ON sc.semantic_class_id = a.semantic_class_id
-            LEFT JOIN usap_city_object AS co
-                ON co.city_object_id = a.primary_city_object_id
-            WHERE mb.asset_part_id = ?
-            AND mb.element_kind = ?
-            AND mb.block_start IN ({placeholders})
-            ORDER BY
-                mb.block_start,
-                mb.annotation_id
-            """,
-            (
-                asset_part_id,
-                element_kind,
-                *block_starts,
-            ),
-        ).fetchall()
+                        sc.local_name AS semantic_class,
+                        sc.class_uri AS semantic_class_uri,
+
+                        co.object_uid AS primary_city_object_uid
+                    FROM usap_membership_block AS mb
+                    JOIN usap_annotation AS a
+                        ON a.annotation_id = mb.annotation_id
+                    JOIN usap_semantic_class AS sc
+                        ON sc.semantic_class_id = a.semantic_class_id
+                    LEFT JOIN usap_city_object AS co
+                        ON co.city_object_id = a.primary_city_object_id
+                    WHERE mb.asset_part_id = ?
+                    AND mb.element_kind = ?
+                    AND mb.block_start IN ({placeholders})
+                    ORDER BY
+                        mb.block_start,
+                        mb.annotation_id
+                    """,
+                    (
+                        asset_part_id,
+                        element_kind,
+                        *chunk,
+                    ),
+                ).fetchall()
+            )
 
         matches_by_annotation: dict[int, dict[str, Any]] = {}
 
@@ -1379,10 +2115,17 @@ class USAPPackage:
             block_start = int(row["block_start"])
             selected_offsets = selected_by_block[block_start]
 
-            encoded_offsets = set(decode_u32_zlib(row["payload"]))
-            hit_offsets = selected_offsets.intersection(encoded_offsets)
+            encoded_offsets = decode_u32_zlib_array(row["payload"])
 
-            if not hit_offsets:
+            # Both sides are sorted uint32 arrays, so the intersection is a
+            # merge rather than a Python set build per candidate block.
+            hit_offsets = np.intersect1d(
+                selected_offsets,
+                encoded_offsets,
+                assume_unique=True,
+            )
+
+            if hit_offsets.size == 0:
                 continue
 
             annotation_id = int(row["annotation_id"])
@@ -1399,13 +2142,8 @@ class USAPPackage:
                     "matched_elements": [],
                 }
 
-            absolute_hits = [
-                block_start + offset
-                for offset in sorted(hit_offsets)
-            ]
-
             matches_by_annotation[annotation_id]["matched_elements"].extend(
-                absolute_hits
+                (hit_offsets.astype(np.int64) + block_start).tolist()
             )
 
         results = list(matches_by_annotation.values())
@@ -1514,6 +2252,8 @@ class USAPPackage:
         include_descendants: bool = True,
         graph_name: str = DEFAULT_GRAPH_NAME,
         expand: bool = False,
+        link_types: Sequence[str] = ("represents",),
+        containment_types: Sequence[str] = CONTAINMENT_RELATIONSHIP_TYPES,
     ) -> list[dict[str, Any]]:
         """
         Query a city object and optionally its descendants, then return
@@ -1521,10 +2261,29 @@ class USAPPackage:
 
         An annotation counts as belonging to a city object if it is linked via
         usap_annotation_object OR names it as its primary_city_object_id. Those
-        two should always agree (create_annotation links the primary object),
-        but matching both means an annotation can never silently drop out of
-        this query if they ever diverge.
+        two are kept in agreement by the write paths (create_annotation and
+        update_annotation both maintain the 'represents' link), but matching
+        both means an annotation can never silently drop out of this query if
+        they ever diverge.
+
+        Two independent type filters, on two different tables:
+
+        link_types selects which usap_annotation_object rows count as
+        "this annotation belongs to that object". It defaults to
+        ('represents',) because other link types (concerns, derivedFrom, ...)
+        say something *about* an object without claiming its elements. Pass
+        more types to follow them too, or an empty sequence to match on
+        primary_city_object_id alone.
+
+        containment_types selects which usap_city_object_relationship edges
+        count as "part of", i.e. which ones descendant expansion follows. The
+        graph is a typed graph, so a non-containment edge (adjacentTo,
+        connectedTo, ...) must NOT make its target's annotations answer for the
+        source object.
         """
+        relation_types = tuple(link_types)
+        edge_types = tuple(containment_types)
+
         city_object = self.conn.execute(
             """
             SELECT city_object_id
@@ -1539,31 +2298,31 @@ class USAPPackage:
 
         city_object_id = int(city_object["city_object_id"])
 
-        if include_descendants:
-            object_rows = self.conn.execute(
-                """
-                SELECT descendant_city_object_id
-                FROM usap_city_object_closure
-                WHERE graph_name = ?
-                  AND ancestor_city_object_id = ?
-                """,
-                (graph_name, city_object_id),
-            ).fetchall()
+        if not include_descendants:
+            edge_types = ()
 
-            object_ids = [
-                int(row["descendant_city_object_id"])
-                for row in object_rows
-            ]
-        else:
-            object_ids = [city_object_id]
+        objects_cte = _descendants_cte(len(edge_types))
+        params: list[Any] = [city_object_id, graph_name, *edge_types]
 
-        if not object_ids:
-            return []
+        if not edge_types:
+            params = [city_object_id]
 
-        placeholders = ",".join("?" for _ in object_ids)
+        link_branch = ""
+
+        if relation_types:
+            link_placeholders = ",".join("?" for _ in relation_types)
+            link_branch = f"""
+                SELECT ao.annotation_id
+                FROM usap_annotation_object AS ao
+                WHERE ao.city_object_id IN (SELECT object_id FROM objects)
+                  AND ao.relation_type IN ({link_placeholders})
+                UNION
+            """
+            params.extend(relation_types)
 
         rows = self.conn.execute(
             f"""
+            {objects_cte}
             SELECT
                 mb.membership_block_id,
                 mb.annotation_id,
@@ -1578,13 +2337,12 @@ class USAPPackage:
                 mb.payload
             FROM usap_membership_block AS mb
             WHERE mb.annotation_id IN (
-                SELECT ao.annotation_id
-                FROM usap_annotation_object AS ao
-                WHERE ao.city_object_id IN ({placeholders})
-                UNION
+                {link_branch}
                 SELECT a.annotation_id
                 FROM usap_annotation AS a
-                WHERE a.primary_city_object_id IN ({placeholders})
+                WHERE a.primary_city_object_id IN (
+                    SELECT object_id FROM objects
+                )
             )
             ORDER BY
                 mb.asset_part_id,
@@ -1592,23 +2350,596 @@ class USAPPackage:
                 mb.block_start,
                 mb.annotation_id
             """,
-            [*object_ids, *object_ids],
+            params,
         ).fetchall()
 
-        return [self._membership_block_row_to_dict(row, expand=expand) for row in rows]
+        return [
+            self._membership_block_row_to_dict(row, expand=expand)
+            for row in rows
+        ]
+
+    # ---------------------------------------------------------------------
+    # Value fields (dense per-element scalar fields)
+    # ---------------------------------------------------------------------
+    #
+    # Membership blocks store WHICH elements are a concept; value blocks
+    # store the VALUE of a property at each element (e.g. shadow fraction
+    # per face). A value field binds a registered concept to the elements of
+    # one asset part — it is a property of the geometry asset, so this API
+    # takes no city-object parameters and the owning annotation's
+    # primary_city_object_id stays NULL.
+    #
+    # V1 contract: a field covers every element of its asset part
+    # (len(values) == element_count); "no value" is NaN inside a float
+    # array. Partial/sub-range fields are a future format — readers raise.
+
+    def replace_value_field(
+        self,
+        annotation_id: int,
+        asset_part_id: int,
+        element_kind: int | str,
+        values: Any,
+        value_dtype: str | None = None,
+    ) -> None:
+        """
+        Replace the whole value field for one annotation on one asset part.
+
+        Editing is whole-field rewrite by design (write-once, read-many).
+        Dtype resolution: explicit value_dtype > the ndarray's own dtype when
+        it is in VALUE_DTYPES > 'f4'.
+        """
+        element_kind = normalize_element_kind(element_kind)
+
+        annotation = self.conn.execute(
+            """
+            SELECT annotation_id
+            FROM usap_annotation
+            WHERE annotation_id = ?
+            """,
+            (annotation_id,),
+        ).fetchone()
+
+        if annotation is None:
+            raise USAPError(f"Annotation not found: {annotation_id}")
+
+        asset_part = self.conn.execute(
+            """
+            SELECT element_kind, element_count
+            FROM usap_asset_part
+            WHERE asset_part_id = ?
+            """,
+            (asset_part_id,),
+        ).fetchone()
+
+        if asset_part is None:
+            raise USAPError(f"Unknown asset_part_id: {asset_part_id}")
+
+        expected_kind = int(asset_part["element_kind"])
+        part_element_count = int(asset_part["element_count"])
+
+        if element_kind != expected_kind:
+            raise USAPError(
+                f"Element kind mismatch: asset part expects "
+                f"{expected_kind}, got {element_kind}"
+            )
+
+        array = np.asarray(values)
+
+        if array.ndim != 1:
+            raise USAPError(
+                f"Value field must be one-dimensional, got shape {array.shape}."
+            )
+
+        if len(array) != part_element_count:
+            raise USAPError(
+                f"Value field must cover the whole asset part: got "
+                f"{len(array)} values, asset part has {part_element_count} "
+                "elements. Use NaN for elements without a value."
+            )
+
+        if value_dtype is not None:
+            value_dtype = normalize_value_dtype(value_dtype)
+        elif isinstance(values, np.ndarray) and array.dtype.str[1:] in VALUE_DTYPES:
+            value_dtype = array.dtype.str[1:]
+        else:
+            value_dtype = DEFAULT_VALUE_DTYPE
+
+        target_dtype = np.dtype("<" + value_dtype)
+
+        if (
+            target_dtype.kind != "f"
+            and array.dtype.kind == "f"
+            and bool(np.isnan(array).any())
+        ):
+            raise USAPError(
+                f"NaN is not representable in integer value_dtype "
+                f"{value_dtype!r}. Use a float dtype for fields with "
+                "missing values."
+            )
+
+        _check_value_cast(array, target_dtype, value_dtype)
+
+        typed = np.ascontiguousarray(array, dtype=target_dtype)
+
+        with self.transaction():
+            self.conn.execute(
+                """
+                DELETE FROM usap_value_block
+                WHERE annotation_id = ?
+                AND asset_part_id = ?
+                AND element_kind = ?
+                """,
+                (annotation_id, asset_part_id, element_kind),
+            )
+
+            for block_start in range(0, len(typed), VALUE_CHUNK_SIZE):
+                chunk = typed[block_start : block_start + VALUE_CHUNK_SIZE]
+
+                if target_dtype.kind == "f":
+                    real = chunk[~np.isnan(chunk)]
+                else:
+                    real = chunk
+
+                value_min = float(real.min()) if real.size else None
+                value_max = float(real.max()) if real.size else None
+
+                self.conn.execute(
+                    """
+                    INSERT INTO usap_value_block (
+                        annotation_id,
+                        asset_part_id,
+                        element_kind,
+                        block_start,
+                        element_count,
+                        value_dtype,
+                        value_min,
+                        value_max,
+                        payload
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        annotation_id,
+                        asset_part_id,
+                        element_kind,
+                        block_start,
+                        len(chunk),
+                        value_dtype,
+                        value_min,
+                        value_max,
+                        encode_value_block(chunk, value_dtype),
+                    ),
+                )
+
+            self.log_edit(
+                "replace_value_field",
+                "usap_annotation",
+                annotation_id,
+                f'{{"asset_part_id": {asset_part_id}, '
+                f'"element_kind": {element_kind}, '
+                f'"element_count": {len(typed)}, '
+                f'"value_dtype": "{value_dtype}"}}',
+            )
+
+    def annotate_value_field(
+        self,
+        *,
+        concept: int | str,
+        asset_part_id: int,
+        element_kind: int | str,
+        values: Any,
+        value_dtype: str | None = None,
+        annotation_uid: str | None = None,
+        label: str | None = None,
+        status: str = "draft",
+        confidence: float | None = None,
+        attributes: dict[str, Any] | None = None,
+        attributes_json: str | None = None,
+        scheme: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Create an annotation for a concept and attach a per-element value
+        field in one step:
+
+            this asset part carries these values, meaning this concept.
+
+        The concept must be registered (CityGML, ADE, or a minimal local
+        vocabulary — any scheme). Field metadata (unit, validAt, method, ...)
+        belongs in `attributes`. There are deliberately no city-object
+        parameters: a value field is a property of the geometry asset.
+        """
+        element_kind = normalize_element_kind(element_kind)
+
+        with self.transaction():
+            annotation = self.create_concept_annotation(
+                concept=concept,
+                annotation_uid=annotation_uid,
+                label=label,
+                status=status,
+                confidence=confidence,
+                attributes=attributes,
+                attributes_json=attributes_json,
+                scheme=scheme,
+            )
+
+            annotation_id = int(annotation["annotation_id"])
+
+            self.replace_value_field(
+                annotation_id=annotation_id,
+                asset_part_id=asset_part_id,
+                element_kind=element_kind,
+                values=values,
+                value_dtype=value_dtype,
+            )
+
+        result = self.get_annotation(
+            annotation_id,
+            include_membership_summary=True,
+        )
+
+        if result is None:
+            raise USAPError(
+                f"Annotation disappeared after value-field annotation: "
+                f"{annotation_id}"
+            )
+
+        return result
+
+    def _value_blocks_for_annotation(
+        self,
+        annotation_id: int,
+        asset_part_id: int | None,
+        element_kind: int | None,
+    ) -> list[sqlite3.Row]:
+        """
+        Fetch one annotation's value blocks (optionally filtered) and check
+        that they belong to exactly one (asset part, element kind) pair,
+        share one dtype, and tile the whole asset part (v1 full coverage) —
+        so every reader enforces the same contract.
+        """
+        where = ["vb.annotation_id = ?"]
+        params: list[Any] = [annotation_id]
+
+        if asset_part_id is not None:
+            where.append("vb.asset_part_id = ?")
+            params.append(asset_part_id)
+
+        if element_kind is not None:
+            where.append("vb.element_kind = ?")
+            params.append(element_kind)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                vb.value_block_id,
+                vb.asset_part_id,
+                vb.element_kind,
+                vb.block_start,
+                vb.element_count,
+                vb.value_dtype,
+                vb.value_min,
+                vb.value_max,
+                vb.payload,
+                ap.element_count AS part_element_count
+            FROM usap_value_block AS vb
+            JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = vb.asset_part_id
+            WHERE {" AND ".join(where)}
+            ORDER BY vb.asset_part_id, vb.element_kind, vb.block_start
+            """,
+            params,
+        ).fetchall()
+
+        if not rows:
+            raise USAPError(
+                f"No value field found for annotation {annotation_id}."
+            )
+
+        targets = {(int(r["asset_part_id"]), int(r["element_kind"])) for r in rows}
+
+        if len(targets) > 1:
+            raise USAPError(
+                f"Annotation {annotation_id} has value fields on several "
+                f"asset parts: {sorted(targets)}. Pass asset_part_id."
+            )
+
+        dtypes = {r["value_dtype"] for r in rows}
+
+        if len(dtypes) > 1:
+            raise USAPError(
+                f"Value field of annotation {annotation_id} mixes dtypes "
+                f"{sorted(dtypes)}; the field is corrupt."
+            )
+
+        expected_start = 0
+
+        for row in rows:
+            if int(row["block_start"]) != expected_start:
+                raise USAPError(
+                    f"Value field of annotation {annotation_id} has a gap at "
+                    f"element {expected_start}; partial fields are not "
+                    "supported in v1."
+                )
+
+            expected_start += int(row["element_count"])
+
+        part_element_count = int(rows[0]["part_element_count"])
+
+        if expected_start != part_element_count:
+            raise USAPError(
+                f"Value field of annotation {annotation_id} covers "
+                f"{expected_start} of {part_element_count} elements; partial "
+                "fields are not supported in v1."
+            )
+
+        return rows
+
+    def values_for_annotation(
+        self,
+        annotation_id: int,
+        *,
+        asset_part_id: int | None = None,
+        element_kind: int | str | None = None,
+    ) -> np.ndarray:
+        """
+        Forward query: annotation -> its dense value array.
+
+        Element i's value is result[i]; the array always spans the whole
+        asset part (v1 contract), with NaN marking "no value" in float fields.
+        """
+        if element_kind is not None:
+            element_kind = normalize_element_kind(element_kind)
+
+        rows = self._value_blocks_for_annotation(
+            annotation_id, asset_part_id, element_kind
+        )
+
+        value_dtype = rows[0]["value_dtype"]
+
+        # Tiling/coverage was already verified by _value_blocks_for_annotation.
+        return np.concatenate(
+            [
+                decode_value_block(
+                    row["payload"], value_dtype, int(row["element_count"])
+                )
+                for row in rows
+            ]
+        )
+
+    def elements_where(
+        self,
+        annotation_id: int,
+        predicate: tuple[str, float] | Any,
+        *,
+        asset_part_id: int | None = None,
+    ) -> list[int]:
+        """
+        Value query: element indices where the field satisfies a predicate.
+
+            elements_where(ann_id, (">", 0.5))
+            elements_where(ann_id, lambda v: (v > 0.2) & (v < 0.8))
+
+        The output is a sorted element-index set — the same shape as a
+        membership query result, so it plugs into the same downstream paths.
+        NaN never matches. Comparison predicates skip blocks whose stored
+        min/max cannot match.
+        """
+        op: str | None = None
+        threshold: float | None = None
+        mask_fn = None
+
+        if isinstance(predicate, tuple):
+            if len(predicate) != 2 or predicate[0] not in _COMPARISON_OPS:
+                raise USAPError(
+                    f"Unsupported predicate {predicate!r}. Use (op, threshold) "
+                    f"with op in {sorted(_COMPARISON_OPS)}, or a callable."
+                )
+            op, threshold = predicate[0], float(predicate[1])
+        elif callable(predicate):
+            mask_fn = predicate
+        else:
+            raise USAPError(
+                f"Unsupported predicate {predicate!r}. Use (op, threshold) "
+                "or a callable returning a boolean mask."
+            )
+
+        rows = self._value_blocks_for_annotation(
+            annotation_id, asset_part_id, None
+        )
+
+        value_dtype = rows[0]["value_dtype"]
+        hits: list[np.ndarray] = []
+
+        for row in rows:
+            if op is not None and _block_cannot_match(
+                op,
+                threshold,
+                row["value_min"],
+                row["value_max"],
+            ):
+                continue
+
+            block = decode_value_block(
+                row["payload"], value_dtype, int(row["element_count"])
+            )
+
+            with np.errstate(invalid="ignore"):
+                if mask_fn is not None:
+                    mask = np.asarray(mask_fn(block), dtype=bool)
+
+                    if mask.shape != block.shape:
+                        raise USAPError(
+                            "Callable predicate must return a boolean mask of "
+                            f"the block's shape; got {mask.shape} for "
+                            f"{block.shape}."
+                        )
+                else:
+                    mask = _COMPARISON_OPS[op](block, threshold)
+
+                # NaN means "no value" and never matches — numpy would let
+                # NaN satisfy "!=" (and callables may not handle it).
+                if block.dtype.kind == "f":
+                    mask = mask & ~np.isnan(block)
+
+            block_hits = np.nonzero(mask)[0]
+
+            if block_hits.size:
+                hits.append(block_hits + int(row["block_start"]))
+
+        if not hits:
+            return []
+
+        # Blocks are visited in ascending block_start order and hits are
+        # ascending within each block, so the result is already sorted.
+        return np.concatenate(hits).tolist()
+
+    def value_field_stats(
+        self,
+        annotation_id: int,
+        *,
+        asset_part_id: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Field stats from the stored per-block min/max — no payload decode.
+
+        min/max ignore NaN; count is the total number of stored values
+        (NaN included).
+        """
+        where = ["vb.annotation_id = ?"]
+        params: list[Any] = [annotation_id]
+
+        if asset_part_id is not None:
+            where.append("vb.asset_part_id = ?")
+            params.append(asset_part_id)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                vb.asset_part_id,
+                vb.element_kind,
+                vb.value_dtype,
+                MIN(vb.value_min) AS value_min,
+                MAX(vb.value_max) AS value_max,
+                SUM(vb.element_count) AS value_count,
+                MIN(vb.block_start) AS first_block_start,
+                COUNT(*) AS block_count,
+                ap.element_count AS part_element_count
+            FROM usap_value_block AS vb
+            JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = vb.asset_part_id
+            WHERE {" AND ".join(where)}
+            GROUP BY vb.asset_part_id, vb.element_kind, vb.value_dtype
+            """,
+            params,
+        ).fetchall()
+
+        if not rows:
+            raise USAPError(
+                f"No value field found for annotation {annotation_id}."
+            )
+
+        if len(rows) > 1:
+            targets = {
+                (int(r["asset_part_id"]), int(r["element_kind"])) for r in rows
+            }
+
+            if len(targets) > 1:
+                raise USAPError(
+                    f"Annotation {annotation_id} has value fields on several "
+                    f"asset parts: {sorted(targets)}. Pass asset_part_id."
+                )
+
+            raise USAPError(
+                f"Value field of annotation {annotation_id} mixes dtypes "
+                f"{sorted(r['value_dtype'] for r in rows)}; the field is "
+                "corrupt."
+            )
+
+        row = rows[0]
+
+        # Same v1 contract as the decoding readers, kept SQL-only: the field
+        # must start at element 0 and account for every element of the part.
+        if (
+            int(row["first_block_start"]) != 0
+            or int(row["value_count"]) != int(row["part_element_count"])
+        ):
+            raise USAPError(
+                f"Value field of annotation {annotation_id} covers "
+                f"{int(row['value_count'])} of "
+                f"{int(row['part_element_count'])} elements; partial fields "
+                "are not supported in v1."
+            )
+
+        return {
+            "annotation_id": annotation_id,
+            "asset_part_id": int(row["asset_part_id"]),
+            "element_kind": int(row["element_kind"]),
+            "value_dtype": row["value_dtype"],
+            "min": row["value_min"],
+            "max": row["value_max"],
+            "count": int(row["value_count"]),
+            "block_count": int(row["block_count"]),
+        }
+
+    def _annotation_value_field_summary(
+        self,
+        annotation_id: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Summarize which asset parts an annotation carries value fields on.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT
+                vb.asset_part_id,
+                ap.asset_id,
+                asset.uri AS asset_uri,
+                asset.asset_kind,
+                ap.part_path,
+                vb.element_kind,
+                vb.value_dtype,
+                SUM(vb.element_count) AS value_count,
+                COUNT(*) AS block_count,
+                MIN(vb.value_min) AS value_min,
+                MAX(vb.value_max) AS value_max
+            FROM usap_value_block AS vb
+            JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = vb.asset_part_id
+            JOIN usap_asset AS asset
+                ON asset.asset_id = ap.asset_id
+            WHERE vb.annotation_id = ?
+            GROUP BY
+                vb.asset_part_id,
+                ap.asset_id,
+                asset.uri,
+                asset.asset_kind,
+                ap.part_path,
+                vb.element_kind,
+                vb.value_dtype
+            ORDER BY vb.asset_part_id
+            """,
+            (annotation_id,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
 
     # ---------------------------------------------------------------------
     # Validation
     # ---------------------------------------------------------------------
 
-    def validate_report(self):
+    def validate_report(self, level: str = "deep"):
         """
         Return a structured validation report.
+
+        level is 'basic' (SQL structure only, no payload decoding), 'deep'
+        (the default: every payload checked, plus graph and domain rules), or
+        'external' (also re-hashes every registered asset file). See
+        validation.validate_connection.
         """
-        return validate_connection(self.conn)
+        return validate_connection(self.conn, level=level)
 
     # ---------------------------------------------------------------------
-    # CRUD operations for integrated prototype test
+    # Concept-level API
     # --------------------------------------------------------------------- 
 
     def resolve_semantic_class(
@@ -1692,7 +3023,7 @@ class USAPPackage:
                 for row in rows
             ]
 
-            raise USAPError(
+            raise USAPAmbiguityError(
                 "Semantic class concept is ambiguous. "
                 f"Use a class_uri, semantic_class_id, or scheme. "
                 f"Concept: {concept}. Options: {options}"
@@ -1746,21 +3077,26 @@ class USAPPackage:
         scheme: str | None = None,
         is_ade: bool | None = None,
         search: str | None = None,
+        in_use: bool | None = None,
     ) -> list[dict[str, Any]]:
         """
         List concepts currently registered in the package.
 
         These are the concepts accepted by annotate_elements(...).
+
+        Each concept carries annotation_count and in_use (True when at least
+        one annotation in this package references it). Pass in_use=True/False
+        to keep only used/unused concepts.
         """
         where: list[str] = []
         params: list[Any] = []
 
         if scheme is not None:
-            where.append("scheme = ?")
+            where.append("sc.scheme = ?")
             params.append(scheme)
 
         if is_ade is not None:
-            where.append("is_ade = ?")
+            where.append("sc.is_ade = ?")
             params.append(1 if is_ade else 0)
 
         if search is not None:
@@ -1768,9 +3104,9 @@ class USAPPackage:
             where.append(
                 """
                 (
-                    local_name LIKE ?
-                    OR class_uri LIKE ?
-                    OR scheme LIKE ?
+                    sc.local_name LIKE ?
+                    OR sc.class_uri LIKE ?
+                    OR sc.scheme LIKE ?
                 )
                 """
             )
@@ -1781,19 +3117,31 @@ class USAPPackage:
         if where:
             where_sql = "WHERE " + " AND ".join(where)
 
+        having_sql = ""
+
+        if in_use is True:
+            having_sql = "HAVING COUNT(a.annotation_id) > 0"
+        elif in_use is False:
+            having_sql = "HAVING COUNT(a.annotation_id) = 0"
+
         rows = self.conn.execute(
             f"""
             SELECT
-                semantic_class_id,
-                scheme,
-                scheme_version,
-                class_uri,
-                local_name,
-                parent_class_id,
-                is_ade
-            FROM usap_semantic_class
+                sc.semantic_class_id,
+                sc.scheme,
+                sc.scheme_version,
+                sc.class_uri,
+                sc.local_name,
+                sc.parent_class_id,
+                sc.is_ade,
+                COUNT(a.annotation_id) AS annotation_count
+            FROM usap_semantic_class AS sc
+            LEFT JOIN usap_annotation AS a
+                ON a.semantic_class_id = sc.semantic_class_id
             {where_sql}
-            ORDER BY is_ade, scheme, local_name, semantic_class_id
+            GROUP BY sc.semantic_class_id
+            {having_sql}
+            ORDER BY sc.is_ade, sc.scheme, sc.local_name, sc.semantic_class_id
             """,
             params,
         ).fetchall()
@@ -1803,6 +3151,8 @@ class USAPPackage:
         for row in rows:
             item = dict(row)
             item["is_ade"] = bool(item["is_ade"])
+            item["annotation_count"] = int(item["annotation_count"])
+            item["in_use"] = item["annotation_count"] > 0
             result.append(item)
 
         return result
@@ -1827,6 +3177,88 @@ class USAPPackage:
 
         return True
     
+    def resolve_asset_part(
+        self,
+        asset_part: int | str,
+        *,
+        part_path: str | None = None,
+    ) -> int:
+        """
+        Resolve an asset-part reference to asset_part_id.
+
+        Accepted forms:
+        - asset_part_id as int
+        - asset uri as str, plus part_path when the asset has several parts
+
+        Lets batch files reference parts by name (the asset's uri) instead of
+        the numeric id from the build manifest.
+        """
+        if isinstance(asset_part, int):
+            if part_path is not None:
+                raise USAPError(
+                    "part_path only applies when the asset part is referenced "
+                    "by asset uri."
+                )
+
+            row = self.conn.execute(
+                """
+                SELECT asset_part_id
+                FROM usap_asset_part
+                WHERE asset_part_id = ?
+                """,
+                (asset_part,),
+            ).fetchone()
+
+            if row is None:
+                raise USAPError(f"Unknown asset_part_id: {asset_part}")
+
+            return int(row["asset_part_id"])
+
+        where = "a.uri = ?"
+        params: list[Any] = [asset_part]
+
+        if part_path is not None:
+            where += " AND ap.part_path = ?"
+            params.append(part_path)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                ap.asset_part_id,
+                ap.part_path,
+                a.uri
+            FROM usap_asset_part AS ap
+            JOIN usap_asset AS a
+                ON a.asset_id = ap.asset_id
+            WHERE {where}
+            ORDER BY ap.asset_part_id
+            """,
+            params,
+        ).fetchall()
+
+        if not rows:
+            raise USAPError(
+                f"Asset part not found: {asset_part!r}"
+                + (f" (part_path {part_path!r})" if part_path is not None else "")
+            )
+
+        if len(rows) > 1:
+            options = [
+                {
+                    "asset_part_id": int(row["asset_part_id"]),
+                    "part_path": row["part_path"],
+                    "uri": row["uri"],
+                }
+                for row in rows
+            ]
+
+            raise USAPAmbiguityError(
+                "Asset part reference is ambiguous. Add part_path or use "
+                f"asset_part_id. Reference: {asset_part!r}. Options: {options}"
+            )
+
+        return int(rows[0]["asset_part_id"])
+
     def resolve_city_object(
         self,
         city_object: int | str,
@@ -1878,7 +3310,7 @@ class USAPPackage:
                 for row in rows
             ]
 
-            raise USAPError(
+            raise USAPAmbiguityError(
                 "City object reference is ambiguous. "
                 f"Use city_object_id. Reference: {city_object}. Options: {options}"
             )
@@ -2036,7 +3468,6 @@ class USAPPackage:
         This is a clearer prototype name for replace_annotation_membership.
         It preserves memberships on other asset parts.
         """
-        element_kind = normalize_element_kind(element_kind)
         self.replace_annotation_membership(
             annotation_id=annotation_id,
             asset_part_id=asset_part_id,

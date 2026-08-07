@@ -5,10 +5,11 @@ from pathlib import Path
 import pytest
 
 from usap import (
+    USAPAmbiguityError,
     USAPError,
     USAPPackage,
-    seed_citygml_basic_classes,
-    seed_prototype_ade_classes,
+    seed_default_citygml_vocabulary,
+    seed_default_ade_vocabulary,
 )
 
 
@@ -17,11 +18,10 @@ def test_vocabulary_seeding_is_idempotent(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        first_citygml = seed_citygml_basic_classes(pkg)
-        first_ade = seed_prototype_ade_classes(pkg)
+        first_citygml = seed_default_citygml_vocabulary(pkg)
+        first_ade = seed_default_ade_vocabulary(pkg)
 
         count_after_first = pkg.conn.execute(
             """
@@ -30,8 +30,8 @@ def test_vocabulary_seeding_is_idempotent(tmp_path: Path) -> None:
             """
         ).fetchone()["n"]
 
-        second_citygml = seed_citygml_basic_classes(pkg)
-        second_ade = seed_prototype_ade_classes(pkg)
+        second_citygml = seed_default_citygml_vocabulary(pkg)
+        second_ade = seed_default_ade_vocabulary(pkg)
 
         count_after_second = pkg.conn.execute(
             """
@@ -53,7 +53,7 @@ def test_vocabulary_seeding_is_idempotent(tmp_path: Path) -> None:
         )
 
         report = pkg.validate_report()
-        assert report.is_ok
+        assert report.is_ok, [issue.format() for issue in report.issues]
 
 
 def test_list_accepted_concepts(tmp_path: Path) -> None:
@@ -61,11 +61,10 @@ def test_list_accepted_concepts(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        seed_citygml_basic_classes(pkg)
-        seed_prototype_ade_classes(pkg)
+        seed_default_citygml_vocabulary(pkg)
+        seed_default_ade_vocabulary(pkg)
 
         all_concepts = pkg.list_accepted_concepts()
         ade_concepts = pkg.list_accepted_concepts(is_ade=True)
@@ -95,11 +94,10 @@ def test_get_semantic_class_and_concept_exists(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        seed_citygml_basic_classes(pkg)
-        seed_prototype_ade_classes(pkg)
+        seed_default_citygml_vocabulary(pkg)
+        seed_default_ade_vocabulary(pkg)
 
         roof = pkg.get_semantic_class("RoofSurface")
         energy = pkg.get_semantic_class("EnergyRoof")
@@ -122,15 +120,16 @@ def test_unknown_concept_fails_loudly(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
-        seed_citygml_basic_classes(pkg)
+        seed_default_citygml_vocabulary(pkg)
 
-        with pytest.raises(USAPError):
+        with pytest.raises(USAPError, match="not found"):
             pkg.resolve_semantic_class("NotRegistered")
 
-        with pytest.raises(USAPError):
+        # match= guards against passing because of the nonexistent
+        # asset_part_id instead of the unknown concept.
+        with pytest.raises(USAPError, match="concept not found"):
             pkg.annotate_elements(
                 concept="NotRegistered",
                 asset_part_id=1,
@@ -144,7 +143,6 @@ def test_ambiguous_local_name_requires_scheme_or_uri(tmp_path: Path) -> None:
 
     with USAPPackage.create(
         db_path,
-        schema_path="sql/schema.sql",
         overwrite=True,
     ) as pkg:
         citygml_roof = pkg.create_semantic_class(
@@ -163,7 +161,8 @@ def test_ambiguous_local_name_requires_scheme_or_uri(tmp_path: Path) -> None:
             is_ade=True,
         )
 
-        with pytest.raises(USAPError):
+        # Ambiguity has its own exception type since the second audit.
+        with pytest.raises(USAPAmbiguityError, match="ambiguous"):
             pkg.resolve_semantic_class("Roof")
 
         assert (

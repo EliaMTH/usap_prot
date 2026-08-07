@@ -1,0 +1,8 @@
+{
+  "scheme": "local",
+  "concepts": [
+    { "local_name": "TempSurface" },
+    { "local_name": "TempRoof", "parent_uri": "TempSurface" },
+    { "local_name": "TempChimney", "parent_uri": "TempRoof" }
+  ]
+}

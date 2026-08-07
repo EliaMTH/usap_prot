@@ -74,7 +74,11 @@ def as_index_array(indices: IndexArray) -> np.ndarray:
     if values.ndim != 1:
         values = values.reshape(-1)
 
-    if not (values.size == 1 or np.all(np.diff(values) > 0)):
+    # Compared elementwise, not as np.diff(values) > 0: diff subtracts in the
+    # input's own dtype, so on an unsigned one a descending step wraps to a
+    # huge positive (5 - 500 as uint32 is 4294966801) and every unsigned array
+    # read as already sorted, skipping this branch. Also the cheaper of the two.
+    if not (values.size == 1 or np.all(values[1:] > values[:-1])):
         values = np.sort(values)
         keep = np.empty(values.size, dtype=bool)
         keep[0] = True

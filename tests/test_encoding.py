@@ -67,6 +67,58 @@ def test_negative_and_oversized_indices_are_refused() -> None:
         as_index_array([2**32])
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [np.uint8, np.uint16, np.uint32, np.uint64, np.int16, np.int32, np.int64],
+)
+def test_index_normalization_does_not_depend_on_the_input_dtype(dtype) -> None:
+    # A selection over a large asset is the case this module exists for, and a
+    # caller holding one as uint32 to halve its memory is doing the obvious
+    # thing. The monotonicity fast path used to be written as
+    # np.diff(values) > 0, which subtracts in the input's dtype: on an unsigned
+    # one a descending step wrapped to a huge positive, every unsigned array
+    # was taken for sorted, and the indices came back in the order given.
+    values = as_index_array(np.array([200, 5, 30, 5], dtype=dtype))
+
+    assert values.tolist() == [5, 30, 200]
+    assert values.dtype == np.uint32
+
+
+def test_oversized_index_is_refused_wherever_it_sits() -> None:
+    # The uint32 range check reads the last element, which is only the upper
+    # bound once the array is sorted. An unsorted uint64 input hid 2**40 behind
+    # a small final element and astype(uint32) then wrapped it to 0 — the
+    # annotation silently moved to a different element.
+    with pytest.raises(USAPError, match="too large for uint32"):
+        as_index_array(np.array([2**40, 5], dtype=np.uint64))
+
+
+def test_unsorted_selection_is_range_checked_against_the_asset_part(tmp_path) -> None:
+    # The range check in _validate_membership_indices tests the last element
+    # only, trusting as_index_array to have sorted. When that trust was
+    # misplaced for unsigned input, an out-of-range index was accepted and
+    # written, and the corruption surfaced only at validate_report() time.
+    with make_pkg(tmp_path) as pkg:
+        part = make_mesh_part(pkg, element_count=100)
+        semantic_class_id = pkg.create_semantic_class(
+            scheme="local",
+            class_uri="http://example.org/usap/Roof",
+            local_name="Roof",
+        )
+        annotation_id = pkg.create_annotation(
+            annotation_uid="ann-unsorted",
+            semantic_class_id=semantic_class_id,
+        )
+
+        with pytest.raises(USAPError, match="out of range"):
+            pkg.replace_annotation_membership(
+                annotation_id,
+                part,
+                ELEMENT_KIND_FACE,
+                np.array([500, 5], dtype=np.uint32),
+            )
+
+
 def test_blocks_split_on_block_boundaries() -> None:
     blocks = split_indices_into_blocks([0, 4095, 4096, 8192], block_size=4096)
 
@@ -74,6 +126,24 @@ def test_blocks_split_on_block_boundaries() -> None:
     assert blocks[0].tolist() == [0, 4095]
     assert blocks[4096].tolist() == [0]
     assert blocks[8192].tolist() == [0]
+
+
+def test_normalized_indices_split_into_blocks_without_loss() -> None:
+    # split_indices_into_blocks reads the sorted order to find its boundaries,
+    # so unsorted input does not merely reorder the result — it drops elements.
+    # [5, 20000, 6, 20001] as uint32 used to survive normalization unsorted and
+    # come back out of the split as two indices instead of four, no error
+    # raised anywhere. Normalization is what that contract rests on.
+    indices = as_index_array(np.array([5, 20000, 6, 20001], dtype=np.uint32))
+    blocks = split_indices_into_blocks(indices, block_size=16384)
+
+    recovered = sorted(
+        int(block_start) + int(offset)
+        for block_start, offsets in blocks.items()
+        for offset in offsets
+    )
+
+    assert recovered == [5, 6, 20000, 20001]
 
 
 def test_roundtrip_preserves_offsets() -> None:

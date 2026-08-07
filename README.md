@@ -97,7 +97,7 @@ If you know other tools that should be here, let us know!
 
 - **Once processed, 3D assets are supposed to be immutable.** An annotation is bound to *one immutable version* of an external file. LAS point order and mesh face order are **not** guaranteed to survive reprojection, re-tiling, thinning, remeshing, re-export, or conversion to COPC (which re-orders points by design). USAP records a content hash to *detect* that a file changed, but it cannot
   *rebind* annotations.
-- **Membership encoding is deliberately simple** (sorted `uint32` offsets + zlib, in blocks). Adopting *roaring bitmaps* is planned as immediate future work.
+- **Membership is stored as roaring bitmaps**, in blocks of 16384 elements, using CRoaring's *portable* serialization — the same bytes a Java, Go, C++ or Rust roaring reader consumes, so a payload is not a private blob. On a 1M-face package this is 17× less payload than the sorted-`uint32`-plus-zlib encoding it replaced (1,557 KB → 89 KB), and the reverse element query is unaffected. Block width is a deliberate compromise: roaring only reaches its bitmap container above 4096 members per block, while the same `block_start` is what the reverse query prunes on, so wider blocks compress better and query worse.
 - **Trusted inputs only.** Nothing here is hardened against hostile files: a
   CityGML document is parsed as a full tree in memory, and an arbitrary
   SQLite file is refused only by a profile check. Compressed payloads *are*

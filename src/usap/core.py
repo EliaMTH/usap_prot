@@ -14,7 +14,7 @@ Data model (each level references — never copies — the one above it)::
                      (all LAS points; one mesh geometry)           → usap_asset_part
         elements     individual point / face indices inside a part
           membership the exact indices an annotation covers, stored
-                     as zlib-compressed uint32 offset blocks        → usap_membership_block
+                     as roaring bitmap blocks                       → usap_membership_block
             annotation  an editable claim: concept + status + attrs → usap_annotation
               semantic_class  what kind of thing it is (RoofSurface) → usap_semantic_class
               city_object     which object it is (building_1_roof_1) → usap_city_object
@@ -87,6 +87,7 @@ import json
 import uuid
 
 import numpy as np
+from pyroaring import BitMap
 
 from .errors import USAPAmbiguityError, USAPError
 from .constants import (
@@ -108,11 +109,12 @@ from .encoding import (
     IndexArray,
     as_index_array,
     block_start_for_index,
-    decode_u32_zlib,
-    decode_u32_zlib_array,
+    decode_roaring_array,
+    decode_roaring_bitmap,
     decode_value_block,
-    encode_u32_zlib,
+    encode_roaring,
     encode_value_block,
+    roaring_to_array,
     split_indices_into_blocks,
 )
 from .sqlite_utils import require_lastrowid
@@ -1840,7 +1842,7 @@ class USAPPackage:
         reverse lookup would silently miss it.
         """
         element_kind = normalize_element_kind(element_kind)
-        if encoding != "u32-zlib":
+        if encoding != DEFAULT_ENCODING:
             raise USAPError(f"Unsupported encoding in phase 1: {encoding}")
 
         annotation = self.conn.execute(
@@ -1879,7 +1881,7 @@ class USAPPackage:
             )
 
             for block_start, offsets in blocks.items():
-                payload = encode_u32_zlib(offsets)
+                payload = encode_roaring(offsets)
 
                 # int(): sqlite3 has no adapter for numpy scalars and would
                 # store them as BLOBs.
@@ -2016,7 +2018,7 @@ class USAPPackage:
         }
 
         if expand:
-            offsets = decode_u32_zlib_array(row["payload"])
+            offsets = decode_roaring_array(row["payload"])
             # Vectorized add, then one conversion: the per-element Python
             # loop was the expensive half of expanding a large selection.
             item["elements"] = (
@@ -2053,8 +2055,12 @@ class USAPPackage:
 
         # Same block split as the write path, so a selection the size of the
         # asset costs one pass over an array rather than a Python loop.
+        #
+        # Built as BitMaps once here rather than per row: several annotations
+        # share a block_start, and each would otherwise rebuild the same
+        # selection bitmap before intersecting it.
         selected_by_block = {
-            block_start: offsets.astype(np.int64)
+            block_start: BitMap(offsets)
             for block_start, offsets in split_indices_into_blocks(
                 selected, block_size
             ).items()
@@ -2115,18 +2121,14 @@ class USAPPackage:
             block_start = int(row["block_start"])
             selected_offsets = selected_by_block[block_start]
 
-            encoded_offsets = decode_u32_zlib_array(row["payload"])
+            # Roaring intersects container by container, so a candidate block
+            # that shares no container with the selection costs almost nothing.
+            hit = selected_offsets & decode_roaring_bitmap(row["payload"])
 
-            # Both sides are sorted uint32 arrays, so the intersection is a
-            # merge rather than a Python set build per candidate block.
-            hit_offsets = np.intersect1d(
-                selected_offsets,
-                encoded_offsets,
-                assume_unique=True,
-            )
-
-            if hit_offsets.size == 0:
+            if not hit:
                 continue
+
+            hit_offsets = roaring_to_array(hit)
 
             annotation_id = int(row["annotation_id"])
 

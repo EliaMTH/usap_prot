@@ -13,7 +13,15 @@ from usap import (
     USAPPackage,
     seed_default_citygml_vocabulary,
 )
-from usap.constants import normalize_element_kind
+from usap.constants import DEFAULT_BLOCK_SIZE, normalize_element_kind
+
+# The tiny fixture's membership deliberately straddles a block boundary, so the
+# split-and-reassemble path stays exercised whatever block size the profile
+# uses. Derived rather than hardcoded: pinning it to one block size is how a
+# block-size change silently stops these tests from testing anything.
+SECOND_BLOCK_FACE = DEFAULT_BLOCK_SIZE + 100
+TINY_PART_ELEMENT_COUNT = DEFAULT_BLOCK_SIZE + 4000
+TINY_FACES = [100, 101, 102, SECOND_BLOCK_FACE, SECOND_BLOCK_FACE + 1]
 
 
 def build_tiny_package(db_path: Path) -> tuple[USAPPackage, int, int, int]:
@@ -33,7 +41,7 @@ def build_tiny_package(db_path: Path) -> tuple[USAPPackage, int, int, int]:
         asset_id=asset_id,
         part_path="node=0/mesh=0/primitive=0",
         element_kind=ELEMENT_KIND_FACE,
-        element_count=10000,
+        element_count=TINY_PART_ELEMENT_COUNT,
     )
 
     building_class_id = pkg.create_semantic_class(
@@ -81,7 +89,7 @@ def build_tiny_package(db_path: Path) -> tuple[USAPPackage, int, int, int]:
         annotation_id=annotation_id,
         asset_part_id=asset_part_id,
         element_kind=ELEMENT_KIND_FACE,
-        element_indices=[100, 101, 102, 6000, 6001],
+        element_indices=TINY_FACES,
     )
 
     return pkg, asset_part_id, roof_class_id, annotation_id
@@ -96,14 +104,14 @@ def test_selected_face_returns_roof_annotation(tmp_path: Path) -> None:
         matches = pkg.annotations_for_elements(
             asset_part_id=asset_part_id,
             element_kind=ELEMENT_KIND_FACE,
-            selected_indices=[6000],
+            selected_indices=[SECOND_BLOCK_FACE],
         )
 
         assert len(matches) == 1
         assert matches[0]["annotation_uid"] == "ann_building_1_roof_mesh"
         assert matches[0]["semantic_class"] == "RoofSurface"
         assert matches[0]["primary_city_object_uid"] == "building_1_roof_1"
-        assert matches[0]["matched_elements"] == [6000]
+        assert matches[0]["matched_elements"] == [SECOND_BLOCK_FACE]
 
     finally:
         pkg.close()
@@ -123,13 +131,13 @@ def test_annotation_membership_is_split_into_two_blocks(tmp_path: Path) -> None:
         assert len(blocks) == 2
 
         block_starts = [block["block_start"] for block in blocks]
-        assert block_starts == [0, 4096]
+        assert block_starts == [0, DEFAULT_BLOCK_SIZE]
 
         all_faces = []
         for block in blocks:
             all_faces.extend(block["elements"])
 
-        assert all_faces == [100, 101, 102, 6000, 6001]
+        assert all_faces == TINY_FACES
 
     finally:
         pkg.close()
@@ -253,7 +261,7 @@ def test_city_object_query_uses_usap_default_descendants(tmp_path: Path) -> None
         for block in blocks:
             all_faces.extend(block["elements"])
 
-        assert all_faces == [100, 101, 102, 6000, 6001]
+        assert all_faces == TINY_FACES
 
     finally:
         pkg.close()
@@ -438,10 +446,13 @@ def test_default_paths_work_from_any_cwd(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_annotations_for_elements_survives_huge_selection(tmp_path: Path) -> None:
-    block_size = 4096
+    # Must be the profile's real block size: hardcoding a smaller one would
+    # spread the selection over fewer blocks than intended and quietly stop
+    # exercising the chunking this test exists for.
+    block_size = DEFAULT_BLOCK_SIZE
 
     with make_pkg(tmp_path) as pkg:
-        part = make_mesh_part(pkg, element_count=40_000_000)
+        part = make_mesh_part(pkg, element_count=block_size * 2600)
         pkg.create_semantic_class(scheme="s", class_uri="s:Roof", local_name="Roof")
 
         hit_low = 0
@@ -455,9 +466,15 @@ def test_annotations_for_elements_survives_huge_selection(tmp_path: Path) -> Non
             element_indices=[hit_low, hit_high],
         )
 
-        # One selected index in each of 2500 distinct blocks: more than the
-        # 999-variable limit of older SQLite builds, so it must be chunked.
+        # One selected index in each of 2500 distinct blocks, so the IN clause
+        # would need 2500 placeholders and the query must be chunked.
         selected = list(range(0, block_size * 2500, block_size))
+
+        # Pin the connection's variable limit to the 999 of older SQLite
+        # builds. Without this the test cannot fail: this build allows 250_000
+        # variables, so an unchunked 2500-placeholder query succeeds and
+        # deleting the chunking loop goes unnoticed.
+        pkg.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
 
         matches = pkg.annotations_for_elements(
             asset_part_id=part,

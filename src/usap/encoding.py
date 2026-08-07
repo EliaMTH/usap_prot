@@ -4,6 +4,7 @@ import zlib
 from collections.abc import Sequence
 
 import numpy as np
+from pyroaring import BitMap
 
 from .constants import VALUE_DTYPES
 from .errors import USAPError
@@ -17,11 +18,13 @@ from .errors import USAPError
 # lists so callers need not change.
 IndexArray = Sequence[int] | np.ndarray
 
-# A payload is decompressed before anything has checked how big it will get,
-# so an untrusted package could otherwise hand over a few KB that expand to
-# gigabytes. A real membership block holds at most block_size offsets (16 KiB
-# at the 4096 default), so this ceiling is far above anything legitimate while
-# still bounded.
+# A value-block payload is decompressed before anything has checked how big it
+# will get, so an untrusted package could otherwise hand over a few KB that
+# expand to gigabytes. decode_value_block knows its exact expected size and
+# passes that instead; this ceiling is the fallback for callers that do not.
+#
+# Membership payloads no longer need it: roaring is a structural format, not an
+# expanding one, so a small payload cannot decode into a large allocation.
 MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024
 
 
@@ -87,27 +90,58 @@ def as_index_array(indices: IndexArray) -> np.ndarray:
     return values.astype(np.uint32, copy=False)
 
 
-def encode_u32_zlib(offsets: IndexArray) -> bytes:
-    return zlib.compress(as_index_array(offsets).astype("<u4").tobytes())
-
-
-def decode_u32_zlib_array(payload: bytes) -> np.ndarray:
+def encode_roaring(offsets: IndexArray) -> bytes:
     """
-    Decode a u32-zlib payload to a uint32 array (no per-element Python objects).
+    Encode within-block offsets as a roaring bitmap.
+
+    The bytes are CRoaring's *portable* serialization — the format the Java,
+    Go, C++ and Rust implementations interoperate on — so a membership payload
+    is readable outside this SDK rather than being a private blob.
+
+    Roaring picks its own container per block (array / bitmap / run), which is
+    the whole point: a wall or roof surface exports as a contiguous face range
+    and collapses to a run container of a few bytes, where a compressed uint32
+    array of the same run costs kilobytes.
+    """
+    return BitMap(as_index_array(offsets)).serialize()
+
+
+def decode_roaring_bitmap(payload: bytes) -> BitMap:
+    """
+    Decode a roaring payload to a BitMap.
+
+    The reverse query intersects candidate blocks against a selection, and
+    roaring intersects two bitmaps natively; going via arrays would throw away
+    the structure that makes that cheap.
     """
     try:
-        raw = _decompress_bounded(payload, MAX_DECOMPRESSED_BYTES)
-    except zlib.error as exc:
-        raise USAPError(f"Corrupt u32-zlib payload: {exc}") from exc
-
-    if len(raw) % 4 != 0:
-        raise USAPError("Invalid u32-zlib payload length")
-
-    return np.frombuffer(raw, dtype="<u4")
+        return BitMap.deserialize(payload)
+    except Exception as exc:
+        # pyroaring raises ValueError for a malformed body and IndexError for
+        # a truncated header; neither is worth distinguishing to a caller.
+        raise USAPError(f"Corrupt roaring payload: {exc}") from exc
 
 
-def decode_u32_zlib(payload: bytes) -> list[int]:
-    return decode_u32_zlib_array(payload).tolist()
+def roaring_to_array(bitmap: BitMap) -> np.ndarray:
+    """
+    View a BitMap's members as a uint32 array (no per-element Python objects).
+
+    to_array() hands back a C 'I' buffer, so this is a reinterpret rather than
+    a copy; np.asarray(bitmap) would build an int64 array element by element
+    and costs ~300x more on a full block.
+    """
+    return np.frombuffer(bitmap.to_array(), dtype=np.uint32)
+
+
+def decode_roaring_array(payload: bytes) -> np.ndarray:
+    """
+    Decode a roaring payload to a uint32 array.
+    """
+    return roaring_to_array(decode_roaring_bitmap(payload))
+
+
+def decode_roaring(payload: bytes) -> list[int]:
+    return decode_roaring_array(payload).tolist()
 
 
 def encode_value_block(values: np.ndarray, value_dtype: str) -> bytes:

@@ -57,7 +57,7 @@ from usap import (
     USAPPackage,
     create_synthetic_package,
 )
-from usap.encoding import decode_u32_zlib, decode_value_block
+from usap.encoding import decode_roaring, decode_value_block
 
 MEMBERSHIP_BLOCK_COLUMNS = (
     "membership_block_id",
@@ -223,7 +223,7 @@ def naive_annotations_for_elements(
     for row in rows:
         block_start = int(row["block_start"])
         elements = {
-            block_start + offset for offset in decode_u32_zlib(row["payload"])
+            block_start + offset for offset in decode_roaring(row["payload"])
         }
         hits = selected.intersection(elements)
 

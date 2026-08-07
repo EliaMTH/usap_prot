@@ -82,8 +82,8 @@ CREATE TABLE usap_profile (
     profile_id          INTEGER PRIMARY KEY CHECK (profile_id = 1),
     profile_name        TEXT NOT NULL DEFAULT 'USAP',
     profile_version     TEXT NOT NULL,
-    default_block_size  INTEGER NOT NULL DEFAULT 4096,
-    default_encoding    TEXT NOT NULL DEFAULT 'u32-zlib',
+    default_block_size  INTEGER NOT NULL DEFAULT 16384,
+    default_encoding    TEXT NOT NULL DEFAULT 'roaring',
     metadata_json       TEXT
 );
 

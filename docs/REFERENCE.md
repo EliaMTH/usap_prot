@@ -162,7 +162,7 @@ attributes: claim metadata (method, source, assessed_at)
 
 ### Membership block
 
-A compressed set of selected element indices for one annotation, one asset part, and one element kind.
+A compressed set of selected element indices for one annotation, one asset part, and one element kind. Stored as a **roaring bitmap** in CRoaring's portable serialization (`encoding = 'roaring'`), so the payload is readable by any roaring implementation, not only this SDK. Indices are partitioned into blocks of `usap_profile.default_block_size` (16384) and held as within-block offsets; `block_start` is what the reverse element query prunes on.
 
 Example:
 

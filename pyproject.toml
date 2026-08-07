@@ -11,7 +11,8 @@ dependencies = [
     "laspy>=2.5",
     "lxml>=5",
     "trimesh>=4",
-    "numpy>=1.26"
+    "numpy>=1.26",
+    "pyroaring>=1.0"
 ]
 
 # Plain `laspy` reads LAS but not LAZ, and parses no CRS: both need a backend

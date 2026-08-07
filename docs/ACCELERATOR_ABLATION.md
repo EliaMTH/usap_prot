@@ -51,7 +51,8 @@ delta-encoded array per (annotation, asset part, kind).
 
 **Novelty assessment (storage-only).** Every individual ingredient is known
 prior art: standoff annotation (W3C Web Annotation, brat), compressed integer
-sets (roaring bitmaps), labels-outside-the-asset via stable indices (ScanNet
+sets (roaring bitmaps — which USAP now uses directly rather than merely
+resembling), labels-outside-the-asset via stable indices (ScanNet
 `.segs.json`/`.aggregation.json`), per-element IDs → property tables (glTF
 `EXT_mesh_features`/`EXT_structural_metadata`), LAS classification codes.
 What survives the storage-only cut as genuinely uncommon:
@@ -98,33 +99,49 @@ gradient (min/max pruning can skip blocks) and uniform noise (it cannot).
 Each ablation runs the accelerated SDK query and a **naive equivalent using
 only base tables** (recursive CTEs, full decode), asserts the results are
 **identical** (any mismatch aborts the run), and times both. Scales tested:
-100 / 500 / 2000 buildings = 50k / 250k / 1M faces (312 / 1,560 / 6,239
-membership blocks). All equality assertions passed at every scale — **every
-USAP query is answerable from the base tables alone.**
+100 / 500 / 2000 buildings = 50k / 250k / 1M faces (6,059 membership blocks at
+the largest, at `block_size` 16384). All equality assertions passed at every
+scale — **every USAP query is answerable from the base tables alone.**
 
 ### Results (2000 buildings, 1M faces, repeat=5, mean ms)
 
-| Ablation | Accelerated | Naive | Speedup |
-|---|---:|---:|---:|
-| A1 block pruning — 100-face pick, 1 block | 0.30 | 75.6 | **251×** |
-| A1 block pruning — 1000 faces across 20 blocks | 5.5 | 72.8 | **13×** |
-| A2 semantic-class closure vs recursive CTE | 18.5 | 15.4 | 0.8× (CTE faster) |
-| A3 city-object closure vs recursive CTE (root, depth 3) | 35.1 | 32.3 | 0.9× (CTE faster) |
-| A4 value min/max skipping — gradient field (13/16 blocks skipped) | 2.8 | 11.5 | 4.1× |
-| A4 value min/max skipping — uniform noise (0/16 skipped) | 15.4 | 17.5 | 1.1× |
-| A5 `value_field_stats` stored min/max vs full decode | 0.04 | 9.9 | 245× |
+Re-measured after membership moved to roaring bitmaps at `block_size` 16384
+(6,059 blocks); the original `u32-zlib` @4096 figures are kept alongside for
+comparison. A1 and A5 are the rows the codec change touches.
 
-Scaling of the two headline cases (accelerated / naive, ms):
+| Ablation | Accelerated | Naive | Speedup | was (u32-zlib @4096) |
+|---|---:|---:|---:|---|
+| A1 block pruning — 100-face pick, 1 block | 0.43 | 72.2 | **167×** | 0.30 / 251× |
+| A1 block pruning — 1000 faces across 20 blocks | 7.6 | 79.1 | **10×** | 5.5 / 13× |
+| A2 semantic-class closure vs recursive CTE | 20.3 | 19.3 | 1.0× (CTE parity) | 18.5 / 0.8× |
+| A3 city-object closure vs recursive CTE (root, depth 3) | — | — | — | 35.1 / 0.9× (closure removed in 0.1.0) |
+| A4 value min/max skipping — gradient field (13/16 blocks skipped) | 4.2 | 13.8 | 3.3× | 2.8 / 4.1× |
+| A4 value min/max skipping — uniform noise (0/16 skipped) | 18.5 | 23.8 | 1.3× | 15.4 / 1.1× |
+| A5 `value_field_stats` stored min/max vs full decode | 0.06 | 13.0 | **221×** | 0.04 / 245× |
 
-| Scale | A1 one-block pick | A3 closure vs CTE |
-|---|---|---|
-| 50k faces | 0.31 / 3.8 (12×) | 1.3 / 1.2 (0.9×) |
-| 250k faces | 0.31 / 18.8 (60×) | 7.2 / 6.2 (0.9×) |
-| 1M faces | 0.30 / 75.6 (251×) | 35.1 / 32.3 (0.9×) |
+The A1 *ratios* fall because roaring speeds the naive path up too — it decodes
+every block, and roaring decodes ~4.5× faster per block than zlib+`intersect1d`
+(2.0 µs vs 9.2 µs on a 300-element block). Measured at equal block size the
+codec makes the accelerated path faster as well: 0.44 → 0.22 ms one-block and
+8.5 → 2.0 ms many-block, both @4096. The residual gap at 16384 is the coarser
+pruning that width buys, traded for the bitmap container (see
+`constants.DEFAULT_BLOCK_SIZE`).
 
-Accelerator costs at 1M faces: city-object closure = 30,089 rows vs 8,044
-relationship rows (3.7× row amplification), rebuild 0.07s; class closure
-11 rows; package 13.11 MiB.
+Scaling of the A1 one-block pick (accelerated / naive, ms). The accelerated
+path is flat in asset size — it reads one block whatever the package holds —
+while the naive path grows with the block count, which is the whole point:
+
+| Scale | blocks | A1 one-block pick | was (u32-zlib @4096) |
+|---|---:|---|---|
+| 50k faces | 303 | 0.64 / 3.5 (5×) | 0.31 / 3.8 (12×) |
+| 250k faces | 1,514 | 0.41 / 19.5 (48×) | 0.31 / 18.8 (60×) |
+| 1M faces | 6,059 | 0.43 / 72.2 (167×) | 0.30 / 75.6 (251×) |
+
+A3 is absent: the city-object closure it measured was removed in 0.1.0 (§4).
+
+Accelerator costs at 1M faces: class closure 11 rows; package 10.70 MiB
+(13.11 MiB before roaring — the membership table alone went 1,960 KB → 324 KB
+of pages, and its payloads 1,557 KB → 89 KB).
 
 ### The A3 planner trap (why the naive CTE needs care)
 

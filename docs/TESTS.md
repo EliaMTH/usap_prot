@@ -284,10 +284,21 @@ selection over a 10 GB point cloud is hundreds of millions of them).
   the storage format, so its edges are errors.
 - `test_blocks_split_on_block_boundaries` / `test_roundtrip_preserves_offsets`
   — the block split and the payload round-trip.
-- `test_decoding_refuses_an_oversized_payload` — a payload is decompressed
-  before anything knows how big it becomes; without a ceiling a few hundred KB
-  of crafted input expands to gigabytes. USAP packages are meant to be
-  exchanged, so this cannot rest on trusting the file.
+- `test_a_run_of_offsets_costs_a_fraction_of_the_indices_it_names` — a surface
+  exports as a contiguous face range and must land in a roaring run container.
+  A regression to per-element encoding still round-trips, so only size catches
+  it.
+- `test_decoding_refuses_a_malformed_payload` — USAP packages are meant to be
+  exchanged, so decoding cannot rest on trusting the file. Roaring removes the
+  decompression-bomb form of this threat (it is a structural format, so a small
+  payload cannot expand into a large allocation), but it decodes in C: a
+  malformed payload must surface as a `USAPError` rather than taking the
+  process down or being read as if valid.
+- `test_payload_is_readable_by_any_roaring_implementation` — the reason
+  membership is roaring rather than a codec of USAP's own. A stored payload is
+  CRoaring's portable serialization, asserted against bare `pyroaring` with no
+  USAP code in the decode path, plus the format cookie. Without this, "we use
+  the standard format" is an untested claim.
 - `test_membership_write_accepts_a_numpy_selection` — end to end: an ndarray
   selection stores identically to the same selection as a list, and stored
   bounds are SQLite integers rather than numpy scalars smuggled in as BLOBs.

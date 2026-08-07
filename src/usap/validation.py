@@ -16,7 +16,7 @@ from .constants import (
     DEFAULT_ENCODING,
     VALUE_DTYPES,
 )
-from .encoding import decode_u32_zlib_array, decode_value_block
+from .encoding import decode_roaring_bitmap, decode_value_block
 from .errors import USAPError
 from .geopackage import (
     GPKG_APPLICATION_ID,
@@ -582,18 +582,24 @@ def _validate_membership_blocks(
             continue
 
         try:
-            offsets = decode_u32_zlib_array(row["payload"])
+            bitmap = decode_roaring_bitmap(row["payload"])
         except Exception as exc:
             report.add(
                 severity="error",
                 code="CORRUPT_MEMBERSHIP_PAYLOAD",
-                message=f"Could not decode u32-zlib payload: {exc}",
+                message=f"Could not decode roaring payload: {exc}",
                 table="usap_membership_block",
                 row_id=block_id,
             )
             continue
 
-        if offsets.size != declared_element_count:
+        # A roaring bitmap is a set: it cannot carry duplicate or unsorted
+        # offsets, so the checks that used to look for them are gone. What a
+        # payload can still do is disagree with the row that describes it,
+        # which is what the rest of this block checks.
+        decoded_count = len(bitmap)
+
+        if decoded_count != declared_element_count:
             report.add(
                 severity="error",
                 code="MEMBERSHIP_COUNT_MISMATCH",
@@ -605,36 +611,11 @@ def _validate_membership_blocks(
                 row_id=block_id,
                 details={
                     "declared": declared_element_count,
-                    "decoded": int(offsets.size),
+                    "decoded": decoded_count,
                 },
             )
 
-        # Array comparisons throughout: validating a package that annotates
-        # a 10 GB point cloud means decoding every block, so the per-block
-        # work stays vectorized.
-        sorted_offsets = np.sort(offsets)
-
-        if np.any(np.diff(sorted_offsets) == 0):
-            report.add(
-                severity="error",
-                code="DUPLICATE_MEMBERSHIP_OFFSETS",
-                message="Decoded payload contains duplicate offsets.",
-                table="usap_membership_block",
-                row_id=block_id,
-            )
-
-        if not np.array_equal(offsets, sorted_offsets):
-            report.add(
-                severity="warning",
-                code="UNSORTED_MEMBERSHIP_OFFSETS",
-                message="Decoded payload offsets are not sorted.",
-                table="usap_membership_block",
-                row_id=block_id,
-            )
-
-        outside = offsets[offsets >= block_size]
-
-        if outside.size:
+        if decoded_count and bitmap.max() >= block_size:
             report.add(
                 severity="error",
                 code="OFFSET_OUTSIDE_BLOCK",
@@ -642,14 +623,17 @@ def _validate_membership_blocks(
                 table="usap_membership_block",
                 row_id=block_id,
                 details={
-                    "offset": int(outside[0]),
+                    "offset": int(bitmap.max()),
                     "block_size": block_size,
                 },
             )
 
-        if offsets.size:
-            actual_min = block_start + int(sorted_offsets[0])
-            actual_max = block_start + int(sorted_offsets[-1])
+        if decoded_count:
+            # min()/max() are O(1) on a roaring bitmap — no sort, and no
+            # decode to an array, which matters when validating a package
+            # that annotates a 10 GB point cloud block by block.
+            actual_min = block_start + int(bitmap.min())
+            actual_max = block_start + int(bitmap.max())
 
             if actual_min != min_element_index:
                 report.add(

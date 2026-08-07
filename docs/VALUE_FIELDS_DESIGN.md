@@ -16,9 +16,11 @@ highlighted, **without tying them to a city object**.
 ## 1. Motivation
 
 USAP today stores exactly one kind of element-level data: **set membership** —
-"these face/point indices belong to concept C" — as compressed `uint32` index blocks in
-`usap_membership_block` (see `src/usap/encoding.py` for the codec; `_materialize` in the
-demo backend shows the decode: `zlib.decompress` → `np.frombuffer(..., uint32)` → `+ block_start`).
+"these face/point indices belong to concept C" — as roaring bitmap blocks in
+`usap_membership_block` (see `src/usap/encoding.py` for the codec; the decode is
+`BitMap.deserialize` → `np.frombuffer(..., uint32)` → `+ block_start`). Note that
+value blocks below keep the plain `zlib` path: they are dense arrays of values,
+not sets of indices, so roaring does not apply to them.
 
 What's missing is **element → value**: a number attached to *each* element. Concretely:
 
@@ -43,7 +45,7 @@ What's missing is **element → value**: a number attached to *each* element. Co
 |---|---|---|
 | meaning | which elements *are* C | the value of property P *at* each element |
 | shape | sparse **set** | dense **array** |
-| store | `usap_membership_block` (compressed `uint32` indices) | `usap_value_block` (compressed value array) |
+| store | `usap_membership_block` (roaring bitmap of indices) | `usap_value_block` (compressed value array) |
 | good for | categories, booleans, "this set is a RoofSurface" | continuous scalar fields |
 
 **Important:** a *boolean / categorical* field does **not** need any new mechanism — it is a

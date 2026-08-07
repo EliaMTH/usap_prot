@@ -8,6 +8,7 @@ from usap import (
     USAPPackage,
     create_synthetic_package,
 )
+from usap.constants import DEFAULT_BLOCK_SIZE
 
 
 def test_synthetic_selected_roof_face_returns_roof_annotation(tmp_path: Path) -> None:
@@ -114,7 +115,11 @@ def test_selected_faces_across_multiple_blocks_return_annotations(tmp_path: Path
     result = create_synthetic_package(
         db_path,
         config=SyntheticConfig(
-            building_count=20,
+            # Enough buildings that the asset spans several blocks: at 500
+            # faces each the package must exceed 3 x DEFAULT_BLOCK_SIZE, or
+            # the "across multiple blocks" this test is named for cannot
+            # happen and it silently degrades into a single-block query.
+            building_count=(3 * DEFAULT_BLOCK_SIZE) // 500 + 1,
             roof_faces_per_building=120,
             wall_faces_per_building=300,
             ground_faces_per_building=80,
@@ -123,7 +128,22 @@ def test_selected_faces_across_multiple_blocks_return_annotations(tmp_path: Path
     )
 
     with USAPPackage.open(db_path) as pkg:
-        selected_faces = [0, 4096, 8192]
+        selected_faces = [0, DEFAULT_BLOCK_SIZE, 2 * DEFAULT_BLOCK_SIZE]
+
+        # The premise, asserted rather than assumed: these three faces really
+        # do live in three different blocks. Without this the test still
+        # passes if they collapse into one, having quietly stopped covering
+        # the multi-block path in its own name.
+        distinct_blocks = pkg.conn.execute(
+            """
+            SELECT COUNT(DISTINCT block_start)
+            FROM usap_membership_block
+            WHERE asset_part_id = ?
+            """,
+            (result.asset_part_id,),
+        ).fetchone()[0]
+
+        assert distinct_blocks >= 3
 
         matches = pkg.annotations_for_elements(
             asset_part_id=result.asset_part_id,

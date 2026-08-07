@@ -25,8 +25,22 @@ _ELEMENT_KIND_BY_NAME = {
     "features": ELEMENT_KIND_FEATURE,
 }
 
-DEFAULT_BLOCK_SIZE = 4096
-DEFAULT_ENCODING = "u32-zlib"
+# Picked against roaring's container rules, not as a round number.
+#
+# Roaring stores a chunk as a sorted uint16 array up to 4096 members and as a
+# flat 8 KiB bitmap above it. A block only 4096 wide can never hold more than
+# 4096 members, so the bitmap container is unreachable and a scattered
+# membership falls back to 2 uncompressed bytes per element — *larger* than
+# the zlib-compressed uint32 blocks this replaced. 16384 is the narrowest
+# width that clears the threshold.
+#
+# Wider still (32768, 65536) amortizes that fixed 8 KiB bitmap over more
+# elements and compresses better again, but block_start is also what the
+# reverse query prunes on: at 65536 annotations_for_elements measured 6-10x
+# slower than at 4096, worse than the codec this replaced. 16384 keeps the
+# reverse query at parity with it while compressing better on every shape.
+DEFAULT_BLOCK_SIZE = 16384
+DEFAULT_ENCODING = "roaring"
 
 # An annotation is a revisable claim, so its lifecycle state is part of the
 # format rather than free text: readers filter on it (list_annotations),

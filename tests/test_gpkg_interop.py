@@ -387,18 +387,30 @@ def test_builder_config_srs_and_las_sniffing(tmp_path: Path, monkeypatch) -> Non
         assert_package_valid(pkg)
 
 
-def test_srs_row_needs_a_definition(tmp_path: Path) -> None:
+def test_srs_row_needs_a_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # GeoPackage reserves the "undefined" definitions for srs_id -1 and 0 and
     # requires a record defining every SRS the package uses. Writing
     # definition='undefined' under a positive EPSG code produced a row that
     # named a CRS without defining it — and INSERT OR IGNORE meant a later
     # call with real WKT could never repair it.
+    #
+    # ensure_srs_row falls back to wkt_for_epsg before giving up, so whether
+    # the bare code reaches the error at all depends on the *optional* crs
+    # extra being absent. Pin the lookup to "no definition available" so this
+    # covers the branch either way — without it the test passes on a bare
+    # install and fails under usap[crs], which is what it did.
     from usap.geopackage import ensure_srs_row
+
+    monkeypatch.setattr("usap.geopackage.wkt_for_epsg", lambda srs_id: None)
 
     with _make_pkg(tmp_path) as pkg:
         with pytest.raises(USAPError, match="without a definition"):
             ensure_srs_row(pkg.conn, 25833)
 
+        # An explicit definition never consults wkt_for_epsg, so the patch
+        # above is irrelevant here: this is the real repair path.
         ensure_srs_row(pkg.conn, 25833, definition_wkt=WKT1_25833)
 
         row = pkg.conn.execute(
@@ -406,6 +418,26 @@ def test_srs_row_needs_a_definition(tmp_path: Path) -> None:
         ).fetchone()
 
         assert row["definition"] == WKT1_25833
+
+
+def test_srs_row_resolves_epsg_when_crs_extra_is_installed(tmp_path: Path) -> None:
+    # The other half of the contract above: with usap[crs] present, a bare
+    # EPSG code is enough, because pyproj carries the definition. Skipped on
+    # a bare install — this is the branch the CI extras job exists to cover.
+    pytest.importorskip("pyproj")
+
+    from usap.geopackage import ensure_srs_row
+
+    with _make_pkg(tmp_path) as pkg:
+        ensure_srs_row(pkg.conn, 25833)
+
+        row = pkg.conn.execute(
+            "SELECT definition FROM gpkg_spatial_ref_sys WHERE srs_id = 25833"
+        ).fetchone()
+
+        assert row is not None, "no SRS row written for a resolvable EPSG code"
+        assert row["definition"] not in (None, "", "undefined")
+        assert epsg_from_wkt(row["definition"]) == 25833
 
 
 def test_incomplete_srs_row_is_repaired(tmp_path: Path) -> None:

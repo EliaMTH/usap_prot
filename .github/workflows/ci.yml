@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run's answer worthless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # The bare install: no extras. That is what the suite is written against
+    # and what `pip install usap` gives you, so it is the configuration that
+    # has to stay green across the whole supported interpreter range. It is
+    # also the only check that requires-python = ">=3.11" is true rather than
+    # merely declared — pyroaring is compiled, and a missing wheel shows up
+    # here first.
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+
+      - name: Run the test suite
+        run: python -m pytest -q
+
+  test-extras:
+    # laz and crs do not merely add capability, they change behaviour: with
+    # pyproj installed, ensure_srs_row resolves a bare EPSG code instead of
+    # refusing it, and laspy grows a CRS parser and a LAZ backend. The first
+    # attempt at this workflow installed ".[laz,crs]" for every matrix entry
+    # and went red immediately on a test that had quietly assumed pyproj was
+    # absent, so both configurations now get their own job.
+    name: test (extras)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install with the optional backends
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[laz,crs]" pytest
+
+      - name: Run the test suite
+        run: python -m pytest -q
+
+  clean-wheel:
+    # The schema and vocabularies are runtime data read by USAPPackage.create
+    # and seed_default_*_vocabulary. They once lived outside the package, so a
+    # normally installed wheel could not create a package at all. This job is
+    # the regression test: build the wheel, install it somewhere with no
+    # checkout in sight, and use the defaults.
+    #
+    # No test under tests/ can stand in for this. pytest runs with
+    # pythonpath = ["src"], so the data files are always found in the
+    # checkout whether or not the wheel would carry them.
+    name: clean wheel install
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: Install the wheel outside the checkout
+        run: |
+          python -m venv /tmp/wheel-env
+          /tmp/wheel-env/bin/pip install dist/*.whl
+
+      - name: Create a package using only the packaged defaults
+        working-directory: /tmp
+        run: |
+          /tmp/wheel-env/bin/python - <<'PY'
+          from usap import USAPPackage, seed_default_citygml_vocabulary
+
+          with USAPPackage.create("/tmp/clean.usap.gpkg", overwrite=True) as pkg:
+              classes = seed_default_citygml_vocabulary(pkg)
+              assert classes.by_name, "no concepts seeded from the packaged vocabulary"
+
+              report = pkg.validate_report()
+              assert report.is_ok, [issue.format() for issue in report.issues]
+
+          print("clean wheel install OK")
+          PY

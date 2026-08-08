@@ -48,9 +48,26 @@ def seed_vocabulary_file(
     Minimal / no-ontology vocabularies: class_uri may be omitted, in which
     case it is derived as "{scheme}:{local_name}". parent_uri accepts either
     a class_uri or the local name of an already-registered concept (resolved
-    within the same scheme first). Re-running this function on an updated
-    file is additive and idempotent; changing an existing concept's parent
-    raises instead of silently rewiring the hierarchy.
+    within the same scheme first).
+
+    Provenance (both optional, both nullable, neither populated by the shipped
+    registries yet):
+        source_namespace  the authority's namespace this concept comes from.
+                          For a CityGML-derived concept, the XML namespace URI
+                          — with local_name that is the QName the .gml uses.
+                          May be given once at the top level as the default for
+                          every concept in the file, and overridden per concept.
+        concept_iri       the authority's own IRI for the concept, per concept,
+                          when it publishes one.
+    Recording these is what keeps a stable IRI *derivable* later without
+    re-deciding anything, which is why the format carries them before any
+    decision about IRIs has been made.
+
+    Re-running this function on an updated file is additive and idempotent, and
+    also **enriching**: a field that is still NULL on an existing concept is
+    filled in, so provenance added to a registry later reaches packages that
+    already exist by re-seeding rather than rebuilding. A field that already
+    holds a *different* value raises instead of being silently rewritten.
     """
     vocab_path = Path(path)
 
@@ -62,6 +79,11 @@ def seed_vocabulary_file(
     scheme = require_str(data, "scheme", source=str(vocab_path))
     scheme_version = data.get("scheme_version")
     is_ade = bool(data.get("is_ade", False))
+
+    # One namespace usually covers a whole registry, so it is a top-level
+    # default; a concept may still override it (a CityGML registry spans
+    # several module namespaces).
+    default_source_namespace = data.get("source_namespace")
 
     concepts = data.get("concepts")
 
@@ -102,7 +124,8 @@ def seed_vocabulary_file(
             )
 
         # create_semantic_class is itself idempotent on class_uri (the globally
-        # unique key), which is what makes vocabulary seeding idempotent.
+        # unique key), which is what makes vocabulary seeding idempotent, and
+        # backfills NULL fields, which is what makes a re-seed enriching.
         class_id = pkg.create_semantic_class(
             scheme=scheme,
             scheme_version=scheme_version,
@@ -110,6 +133,11 @@ def seed_vocabulary_file(
             local_name=local_name,
             parent_class_id=parent_class_id,
             is_ade=is_ade,
+            source_namespace=item.get(
+                "source_namespace",
+                default_source_namespace,
+            ),
+            concept_iri=item.get("concept_iri"),
         )
 
         by_name[local_name] = class_id

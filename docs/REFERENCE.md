@@ -27,6 +27,11 @@ The motivation and mental model are in [README.md](../README.md); this file is t
 
 This repository contains a working MVP. The file format, schema, and API may still change, and packages created with this version should be treated as experimental.
 
+The current schema is profile version **0.2.0**. There is no migration path
+from 0.1.0 — a 0.1.0 package has no `package_iri` at all — so `USAPPackage.open`
+refuses one with an explicit "unsupported profile version" error. Rebuild
+rather than migrate.
+
 What the prototype can do, end to end:
 
 ```text
@@ -100,13 +105,53 @@ python -m pytest
 
 ## Key concepts
 
+### Package identity
+
+Every package carries a stable identifier in `usap_profile.package_iri`, minted
+at creation as a UUID URN (`urn:uuid:...`) and readable with
+`pkg.get_package_iri()`. A UUID is globally unique by construction, so this
+needs no domain, registry, or namespace — nothing external can make it fail,
+and the caller never has to supply one:
+
+```python
+with USAPPackage.create("area.usap.gpkg", overwrite=True) as pkg:
+    print(pkg.get_package_iri())      # urn:uuid:1f25293f-...
+
+# only to adopt an identity that already exists elsewhere
+USAPPackage.create("area.usap.gpkg", package_iri="https://example.org/pkg/area")
+```
+
+Identity has to be born with the package: one invented at read time would
+differ between two readers of the same file, which is the opposite of what it
+is for.
+
 ### 3D Asset
 
 An external file registered in USAP, like a LAS/LAZ point cloud or an OBJ/PLY/STL mesh. USAP stores the path, kind, media type, optional content hash, and metadata.
 
+The content hash is stored canonically as `algorithm:digest` — e.g.
+`sha256:a48f...`. The algorithm is part of the stored value because
+`usap_asset` is unique on `(uri, content_hash)`: a bare digest could not be
+told apart from the same file hashed differently, and changing the spelling
+later would register one file as two assets. A bare 64-character hex digest is
+still *read* as SHA-256, so older records stay comparable; `deep` validation
+reports anything that is not a recognizable digest as
+`NON_CANONICAL_CONTENT_HASH` (a warning — such a value can never be verified
+against the file).
+
 ### 3D Asset part
 
 A stable indexable part of an asset. Each part stores its `element_kind` (point or face) and its `element_count` (number of points or faces). Element indices into a part are the coordinate system annotations live in.
+
+A part also records an optional **`indexing_profile`**: which convention
+assigned those indices, e.g. `usap:ply-face-record-order-v1`. A content hash
+proves the source bytes are unchanged but says nothing about how a reader turns
+them into face 0, 1, 2 — two readers of one PLY can disagree on face order and
+each be self-consistent, which would repoint every membership without changing
+a stored index. The adapters write a token per format; re-registering a part
+under a different one raises. What each token means normatively (parsing,
+triangulation, duplicate handling) is not yet specified, so the field is
+advisory.
 
 ### Semantic class / concept
 
@@ -197,6 +242,7 @@ USAP ships **no** built-in taxonomy and does not enforce one. A new package star
 - `class_uri` — its globally-unique identifier (optional: derived as
   `scheme:local_name` when omitted)
 - *(optional)* `parent_uri` (parent concept, for hierarchy), `scheme_version`, `is_ade`
+- *(optional, provenance)* `source_namespace`, `concept_iri` — see below
 
 Annotations then **reference** the registered concept; they do not re-describe it.
 
@@ -224,6 +270,47 @@ If your authoritative taxonomy lives in another format (a CityGML ADE registry, 
 bundle adapters for foreign formats — they are source-specific and belong in your project.
 
 WIP: ingestion of ontologies in OWL format.
+
+#### Concept provenance
+
+Two further optional fields record where a concept came from in its authority:
+
+- **`source_namespace`** — the authority's namespace. For a CityGML-derived
+  concept this is the XML namespace URI, which together with `local_name` is
+  the QName the `.gml` actually uses, and so the only exact join key back to
+  the source. May be given once at the top level as the default for the whole
+  file and overridden per concept (a CityGML registry spans several module
+  namespaces).
+- **`concept_iri`** — the authority's own IRI for the concept, when it
+  publishes one.
+
+```json
+{
+  "scheme": "citygml",
+  "scheme_version": "3.0",
+  "source_namespace": "http://www.opengis.net/citygml/building/3.0",
+  "concepts": [
+    { "local_name": "RoofSurface",
+      "class_uri": "citygml-3.0:building:RoofSurface" }
+  ]
+}
+```
+
+Both are nullable and neither is populated by the shipped registries yet.
+`class_uri` remains the *internal* key — unique, and what seeding is idempotent
+on; these two are the *external* facts. Recording them is what keeps a stable
+identifier **derivable** later without re-deciding anything, which is why the
+format carries them before any decision about IRIs has been made (see
+[FW_FEATURE_W3C_WEB_ANNOTATION_PROFILE.md](../FW_FEATURE_W3C_WEB_ANNOTATION_PROFILE.md)).
+
+**Re-seeding is enriching, not just additive.** A field still `NULL` on an
+existing concept is filled in, so provenance added to a registry later reaches
+packages that already exist by re-seeding rather than rebuilding. A field that
+already holds a *different* value raises instead of being silently rewritten —
+seeding must never change what a package already asserts. Concept identity
+(`scheme`, `class_uri`, `local_name`) is never backfilled: a change there is a
+different concept, not an enrichment. A parent arriving late is propagated into
+the class closure, so subclass queries see the new edge.
 
 ### Example registries
 
@@ -294,7 +381,7 @@ When no CityGML registry or ontology is provided, a vocabulary file only needs a
 ```
 
 See [`src/usap/data/vocabularies/local_minimal_example.json`](../src/usap/data/vocabularies/local_minimal_example.json).
-Re-loading an updated copy is additive and idempotent; changing an existing concept's parent raises. Concepts declared this way stay identifiable by their scheme (`list_accepted_concepts(scheme="local")`), so annotations made this way can later be aligned to a full ontology-based package (the latter is WIP).
+Re-loading an updated copy is additive, idempotent, and enriching — new concepts are added and fields still `NULL` on existing ones are filled in; changing an existing concept's parent (or any other field that already has a value) raises. Concepts declared this way stay identifiable by their scheme (`list_accepted_concepts(scheme="local")`), so annotations made this way can later be aligned to a full ontology-based package (the latter is WIP).
 
 ---
 
@@ -505,7 +592,12 @@ JSON files. Several fields are derivable, so the minimal entry is just
   (inherited from it); required otherwise, and when creating carriers.
 - `annotation_uid` — optional when a city object is linked; derived as
   `ann_{object_uid}_{concept_local_name}` (stable across re-runs, so
-  re-applying with `--replace-existing` edits in place).
+  re-applying with `--replace-existing` edits in place). **The derivation is
+  scoped to one object/concept pair**, which is what makes a re-run idempotent
+  rather than duplicating — so two assertions that differ only in *when* or
+  *how* they were made (the same concept on the same object at two timesteps,
+  or from two methods) collide on it. Give those an explicit `annotation_uid`.
+  Value-field annotations link no city object, so they already require one.
 - `element_kind` — optional; defaults to the asset part's stored kind.
 - parts are referenced by `asset_part_id` (int) **or** `asset_uri`
   (+ `part_path` when the asset has several parts) — exactly one of the two.
@@ -903,7 +995,7 @@ for**" — a clean `basic` report is not a claim about payloads, and a clean
 
 ```text
 basic     GeoPackage metadata and registered layers
-          USAP profile presence
+          USAP profile presence and package_iri (INVALID_PACKAGE_IRI)
           orphan references
           membership/value block structure (counts, bounds, element kinds)
           semantic class closure
@@ -914,6 +1006,7 @@ basic     GeoPackage metadata and registered layers
 deep      + membership payload decoding, offsets, stored min/max agreement
           + value payload decoding and stored min/max agreement
           + asset extent recomputation
+          + content hash canonical form  (NON_CANONICAL_CONTENT_HASH, warning)
           + city object containment cycles
           + annotation status / confidence / attributes-JSON domain values
 
@@ -944,3 +1037,44 @@ city object status   accepted | temporary
 confidence           NULL, or a number in [0, 1]
 attributes_json      NULL, or text that parses as JSON
 ```
+
+Timestamps (`usap_annotation.created_at` / `updated_at`,
+`usap_edit_log.created_at`) are UTC ISO-8601 to the second, with the `Z`
+offset — `2026-08-08T14:37:30Z`. Not SQLite's `CURRENT_TIMESTAMP`
+(`YYYY-MM-DD HH:MM:SS`), which has no date/time separator and no timezone
+marker and so is not an `xsd:dateTime`.
+
+---
+
+## Standards positioning
+
+USAP's annotation model lines up with the **W3C Web Annotation Data Model**:
+an annotation carries bodies identifying the semantic concept and the
+authoritative city object, and targets selecting indexed elements of
+operational 3D assets. The concept-registry format is likewise a thin JSON
+form of a SKOS concept scheme (see "Concept registries").
+
+**Full adoption is future work** — a published JSON-LD context, a USAP
+vocabulary for the 3D-specific terms W3C leaves extensible (a digest-based
+state and an indexed-element selector), and conforming export/import. USAP
+does **not** currently claim conformance, and a `.usap.gpkg` is not a W3C
+JSON-LD document.
+
+What is already in place are the parts that could not be added afterwards
+without rewriting existing packages:
+
+```text
+package identity      usap_profile.package_iri, minted as a UUID URN
+content hashes        canonical 'algorithm:digest'
+timestamps            UTC ISO-8601 with 'Z'
+index provenance      usap_asset_part.indexing_profile
+concept provenance    source_namespace / concept_iri, backfillable by re-seeding
+```
+
+Deliberately still open: which namespace concept IRIs live under. Nothing
+above depends on that choice — recording provenance is what keeps the
+identifier *derivable* whenever the namespace is settled.
+
+The full mapping, the remaining work, and the conformance classes it would
+introduce are in
+[FW_FEATURE_W3C_WEB_ANNOTATION_PROFILE.md](../FW_FEATURE_W3C_WEB_ANNOTATION_PROFILE.md).

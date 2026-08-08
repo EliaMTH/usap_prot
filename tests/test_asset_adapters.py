@@ -141,3 +141,84 @@ def test_gltf_mesh_registration_is_refused(tmp_path: Path) -> None:
 
         # Nothing half-registered is left behind.
         assert pkg.list_assets() == []
+
+
+@pytest.mark.parametrize(
+    "filename, expected_profile",
+    [
+        ("tiny.ply", "usap:ply-face-record-order-v1"),
+        ("tiny.obj", "usap:obj-face-record-order-v1"),
+        ("tiny.stl", "usap:stl-face-record-order-v1"),
+    ],
+)
+def test_mesh_registration_records_the_indexing_profile(
+    tmp_path: Path,
+    filename: str,
+    expected_profile: str,
+) -> None:
+    # A content hash proves the bytes are unchanged; it says nothing about how
+    # a reader turns those bytes into face 0, 1, 2. The convention has to be
+    # recorded, or two readers can disagree on face order and silently repoint
+    # every membership without changing a stored index.
+    mesh_path = tmp_path / filename
+    _write_tiny_mesh(mesh_path)
+
+    with make_pkg(tmp_path) as pkg:
+        register_mesh_asset(pkg, mesh_path, representation_name="tiny")
+
+        rows = pkg.conn.execute(
+            "SELECT indexing_profile FROM usap_asset_part"
+        ).fetchall()
+
+        assert [r["indexing_profile"] for r in rows] == [expected_profile]
+
+
+def test_las_registration_records_the_indexing_profile(tmp_path: Path) -> None:
+    las_path = tmp_path / "tiny.las"
+    _write_tiny_las(las_path, point_count=10)
+
+    with make_pkg(tmp_path) as pkg:
+        register_las_asset(pkg, las_path)
+
+        row = pkg.conn.execute(
+            "SELECT indexing_profile FROM usap_asset_part"
+        ).fetchone()
+
+        assert row["indexing_profile"] == "usap:las-point-record-order-v1"
+
+
+def test_reregistering_a_part_under_a_different_profile_raises(
+    tmp_path: Path,
+) -> None:
+    # Reading one part under two conventions would repoint its memberships
+    # without changing a single stored index, so it must be refused like any
+    # other conflicting re-registration.
+    with make_pkg(tmp_path) as pkg:
+        asset_id = pkg.register_asset(uri="area.ply", asset_kind="mesh")
+
+        common = {
+            "asset_id": asset_id,
+            "part_path": "geometry/0",
+            "element_kind": ELEMENT_KIND_FACE,
+            "element_count": 10,
+        }
+
+        first = pkg.register_asset_part(
+            **common,
+            indexing_profile="usap:ply-face-record-order-v1",
+        )
+
+        # Re-registering identically stays idempotent.
+        assert (
+            pkg.register_asset_part(
+                **common,
+                indexing_profile="usap:ply-face-record-order-v1",
+            )
+            == first
+        )
+
+        with pytest.raises(USAPError, match="already.*registered with different"):
+            pkg.register_asset_part(
+                **common,
+                indexing_profile="usap:obj-face-record-order-v1",
+            )

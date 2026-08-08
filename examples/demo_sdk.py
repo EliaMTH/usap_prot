@@ -23,11 +23,15 @@ def main() -> None:
         # ------------------------------------------------------------
         # 1. External mesh asset
         # ------------------------------------------------------------
+        # No file backs this demo, so there is nothing to hash. Registering
+        # without one is honest; a placeholder token in the digest column
+        # would make the asset look verifiable and trips the
+        # NON_CANONICAL_CONTENT_HASH warning at deep validation. Real
+        # registrations get 'sha256:<hex>' from the adapters.
         asset_id = pkg.register_asset(
             uri="city_mesh.ply",
             asset_kind="mesh",
             media_type="application/ply",
-            content_hash="fake_hash_for_phase_1a",
         )
 
         # ------------------------------------------------------------

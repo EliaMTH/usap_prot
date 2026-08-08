@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .._util import sha256_file
+from .._util import canonical_hash
 from ..core import USAPPackage
 from ..domain_vocab import seed_default_citygml_vocabulary
 from ..errors import USAPError
@@ -231,7 +231,7 @@ def import_citygml_semantics(
         )
 
     version_hint = _citygml_version_hint(root)
-    content_hash = sha256_file(path) if compute_hash else None
+    content_hash = canonical_hash(path) if compute_hash else None
 
     asset_metadata = {
         "adapter": "citygml_adapter",

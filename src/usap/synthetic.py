@@ -90,14 +90,15 @@ def create_synthetic_package(
             # ------------------------------------------------------------
             # 1. One fake external mesh asset
             # ------------------------------------------------------------
+            # No content_hash: the mesh is generated, never written to disk,
+            # so there is nothing to hash. A descriptive token here used to
+            # stand in for a digest, which put a non-digest in a digest column
+            # and made the asset look verifiable when it is not.
             asset_id = pkg.register_asset(
                 uri=config.mesh_uri,
                 asset_kind="mesh",
                 media_type="application/ply",
-                content_hash=(
-                    f"synthetic_buildings_{config.building_count}_"
-                    f"faces_{total_face_count}"
-                ),
+                content_hash=None,
             )
 
             # everything else in the synthetic generation stays indented

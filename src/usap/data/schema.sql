@@ -82,6 +82,14 @@ CREATE TABLE usap_profile (
     profile_id          INTEGER PRIMARY KEY CHECK (profile_id = 1),
     profile_name        TEXT NOT NULL DEFAULT 'USAP',
     profile_version     TEXT NOT NULL,
+
+    -- Stable identity for this package, minted at creation as a UUID URN.
+    -- Every identifier a future interchange format derives (for annotations,
+    -- assets, or package-scoped concepts) hangs off this one, so it has to be
+    -- born with the package rather than invented later. A UUID needs no
+    -- domain, registry, or namespace to be globally unique.
+    package_iri         TEXT NOT NULL,
+
     default_block_size  INTEGER NOT NULL DEFAULT 16384,
     default_encoding    TEXT NOT NULL DEFAULT 'roaring',
     metadata_json       TEXT
@@ -92,7 +100,13 @@ CREATE TABLE usap_asset (
     uri            TEXT NOT NULL,
     asset_kind     TEXT NOT NULL,
     media_type     TEXT,
+
+    -- Canonical form is 'algorithm:digest', e.g. 'sha256:a48f...'. A bare
+    -- 64-char hex digest is still read as sha-256 (see parse_content_hash),
+    -- but writers emit the canonical form: the (uri, content_hash) key below
+    -- means a change of spelling would register the same file twice.
     content_hash   TEXT,
+
     srs_id         INTEGER,
     metadata_json  TEXT,
 
@@ -110,6 +124,16 @@ CREATE TABLE usap_asset_part (
     element_kind    INTEGER NOT NULL,
     element_count   INTEGER NOT NULL,
     index_origin    TEXT NOT NULL DEFAULT 'zero_based', -- declaring it to avoid doubts
+
+    -- How element indices into this part were assigned, e.g.
+    -- 'usap:ply-face-record-order-v1'. A content hash proves the source bytes
+    -- are unchanged; it says nothing about how a reader turns those bytes into
+    -- index 0, 1, 2 — two readers of one PLY can disagree on face order and
+    -- both be self-consistent, which would silently repoint every membership.
+    -- The token records which convention was used. What each token *means*
+    -- normatively (parsing, triangulation, duplicate handling) is not yet
+    -- specified, so this stays nullable and advisory.
+    indexing_profile TEXT,
 
     minx            REAL,
     miny            REAL,
@@ -145,6 +169,27 @@ CREATE TABLE usap_semantic_class (
 
     parent_class_id    INTEGER
         REFERENCES usap_semantic_class(semantic_class_id),
+
+    -- Where this concept came from in its authority, and its identity there.
+    --
+    -- class_uri is the *internal* key: unique, and what seeding is idempotent
+    -- on. These two are the *external* facts, and they are what makes a stable
+    -- IRI derivable later without re-deciding anything:
+    --
+    --   source_namespace  the authority's namespace. For a CityGML-derived
+    --                     concept, the XML namespace URI — which, with
+    --                     local_name, is the QName the .gml actually uses and
+    --                     so the only exact join key back to the source.
+    --   concept_iri       the authority's own IRI for the concept, when it
+    --                     publishes one. Left NULL otherwise; minting one
+    --                     requires choosing a namespace, which is deliberately
+    --                     not settled here.
+    --
+    -- Both are nullable and neither is populated by the shipped vocabularies
+    -- yet. create_semantic_class backfills a NULL from a later re-seed, so a
+    -- package can be enriched in place rather than rebuilt.
+    source_namespace   TEXT,
+    concept_iri        TEXT,
 
     is_ade             INTEGER NOT NULL DEFAULT 0,
     metadata_json      TEXT,
@@ -249,8 +294,14 @@ CREATE TABLE usap_annotation (
     confidence             REAL,
     attributes_json        TEXT,
 
-    created_at             TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at             TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    -- UTC ISO-8601 with the 'Z' offset, not SQLite's CURRENT_TIMESTAMP
+    -- ('YYYY-MM-DD HH:MM:SS'), which has no date/time separator and no
+    -- timezone marker and so is not an xsd:dateTime. Same expression in
+    -- update_annotation, so both columns stay in one format.
+    created_at             TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at             TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
 -- Lets class-hierarchy queries start from the (small) closure and reach
@@ -335,10 +386,15 @@ CREATE TABLE usap_value_block (
 
     value_dtype         TEXT NOT NULL,   -- 'f4', 'f2', 'u1', ... little-endian
 
+    -- How payload is compressed. Mirrors usap_membership_block.encoding: it
+    -- was implicit here, which left a reader no way to tell zlib from any
+    -- future codec except by trying it.
+    encoding            TEXT NOT NULL DEFAULT 'zlib',
+
     value_min           REAL,            -- NaN-ignoring block min; NULL if all-NaN
     value_max           REAL,
 
-    payload             BLOB NOT NULL,   -- zlib(values.tobytes())
+    payload             BLOB NOT NULL,   -- encoding(values.tobytes())
 
     -- The auto-index behind this constraint doubles as the annotation-first
     -- lookup index (value readers, annotation-delete cascade); do not add
@@ -360,7 +416,8 @@ CREATE TABLE usap_edit_log (
     target_table  TEXT,
     target_id     INTEGER,
     details_json  TEXT,
-    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at    TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
 -- -------------------------------------------------------------------------

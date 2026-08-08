@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .._util import sha256_file
+from .._util import canonical_hash
 from ..constants import ELEMENT_KIND_FACE
 from ..core import USAPPackage
 from ..errors import USAPError
@@ -80,6 +80,20 @@ def _guess_mesh_media_type(path: Path) -> str:
         return "model/stl"
 
     return "application/octet-stream"
+
+
+# Which convention assigned the face indices, per format: face i is the i-th
+# face record in the file, in file order. Recorded so a later reader can tell
+# whether it agrees; what each token means normatively is not yet specified.
+_INDEXING_PROFILE_BY_SUFFIX = {
+    ".obj": "usap:obj-face-record-order-v1",
+    ".ply": "usap:ply-face-record-order-v1",
+    ".stl": "usap:stl-face-record-order-v1",
+}
+
+
+def _indexing_profile_for(path: Path) -> str | None:
+    return _INDEXING_PROFILE_BY_SUFFIX.get(path.suffix.lower())
 
 
 def _face_count(mesh: trimesh.Trimesh | StreamedMeshPart) -> int:
@@ -216,7 +230,7 @@ def register_mesh_asset(
     if not geometries:
         raise ValueError(f"No triangular mesh geometries found in: {path}")
 
-    content_hash = sha256_file(path) if compute_hash else None
+    content_hash = canonical_hash(path) if compute_hash else None
 
     total_face_count = sum(_face_count(mesh) for _, mesh in geometries)
 
@@ -285,6 +299,7 @@ def register_mesh_asset(
                 maxy=maxy,
                 maxz=maxz,
                 metadata_json=json.dumps(part_metadata),
+                indexing_profile=_indexing_profile_for(path),
             )
 
             parts.append(

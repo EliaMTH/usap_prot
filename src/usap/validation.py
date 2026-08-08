@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from ._util import sha256_file
+from ._util import parse_content_hash, sha256_file
 from .constants import (
     ANNOTATION_STATUSES,
     CITY_OBJECT_STATUSES,
@@ -162,6 +162,7 @@ def validate_connection(
         if deep:
             _validate_asset_extents(conn, report)
             _validate_asset_crs(conn, report)
+            _validate_content_hashes(conn, report)
             _validate_city_object_graph(conn, report)
             _validate_annotation_domain(conn, report)
 
@@ -190,6 +191,35 @@ def _validate_profile(conn: sqlite3.Connection, report: ValidationReport) -> Non
             message="Expected exactly one usap_profile row with profile_id = 1.",
             table="usap_profile",
         )
+
+        # Every other check here reads that row.
+        return
+
+    row = conn.execute(
+        """
+        SELECT package_iri
+        FROM usap_profile
+        WHERE profile_id = 1
+        """
+    ).fetchone()
+
+    package_iri = (row["package_iri"] or "").strip()
+
+    # The column is NOT NULL, so this catches a package written by something
+    # other than USAPPackage.create: whitespace, or a value that is not an
+    # absolute IRI and so cannot identify the package outside this file.
+    if not package_iri or ":" not in package_iri:
+        report.add(
+            severity="error",
+            code="INVALID_PACKAGE_IRI",
+            message=(
+                "usap_profile.package_iri must be an absolute IRI "
+                "(USAPPackage.create mints a 'urn:uuid:...')."
+            ),
+            table="usap_profile",
+            details={"package_iri": row["package_iri"]},
+        )
+
 
 def _validate_semantic_class_registry(
     conn: sqlite3.Connection,
@@ -1046,15 +1076,31 @@ def verify_assets(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         recorded_hash = row["content_hash"]
         path = Path(uri)
 
+        recorded = parse_content_hash(recorded_hash)
+
         if not path.exists():
             status = "missing"
             actual_hash = None
-        elif recorded_hash is None:
+        elif recorded is None:
+            # No hash at all, or a caller-supplied token that is not a digest:
+            # either way there is nothing to compare against, and re-hashing
+            # the file could only produce a bogus "changed".
             status = "unhashed"
             actual_hash = None
         else:
-            actual_hash = sha256_file(path)
-            status = "ok" if actual_hash == recorded_hash else "changed"
+            algorithm, recorded_digest = recorded
+
+            if algorithm != "sha256":
+                # Recording an algorithm we cannot compute is not a mismatch.
+                status = "unhashed"
+                actual_hash = None
+            else:
+                # Compare digests, not spellings: a record written before the
+                # canonical form (bare hex) still matches a freshly computed
+                # one. actual_hash is reported canonically either way.
+                actual_digest = sha256_file(path)
+                actual_hash = f"sha256:{actual_digest}"
+                status = "ok" if actual_digest == recorded_digest else "changed"
 
         results.append(
             {
@@ -1362,6 +1408,54 @@ def _validate_gis_layers(
             details={
                 "gpkg_contents_srs_id": features_row["srs_id"],
                 "gpkg_geometry_columns_srs_id": geometry_row["srs_id"],
+            },
+        )
+
+
+def _validate_content_hashes(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    """
+    Report content hashes that are not in the canonical 'algorithm:digest'
+    form.
+
+    A warning, not an error: content_hash is a free-text column and
+    register_asset accepts any token, so a package written by another tool is
+    unusual rather than corrupt. What it costs is verifiability — a value that
+    does not parse as a digest can never be checked against the file
+    (verify_assets reports it as 'unhashed'), and it cannot be exported as a
+    digest-bearing state.
+
+    A bare 64-char hex digest is canonical enough to pass: parse_content_hash
+    reads it as sha-256, so it still compares equal to a freshly computed one.
+    """
+    rows = conn.execute(
+        """
+        SELECT asset_id, uri, content_hash
+        FROM usap_asset
+        WHERE content_hash IS NOT NULL
+        ORDER BY asset_id
+        """
+    ).fetchall()
+
+    for row in rows:
+        if parse_content_hash(row["content_hash"]) is not None:
+            continue
+
+        report.add(
+            severity="warning",
+            code="NON_CANONICAL_CONTENT_HASH",
+            message=(
+                "Asset content_hash is not a recognizable digest; it cannot "
+                "be verified against the file. Expected 'algorithm:digest', "
+                "e.g. 'sha256:a48f...'."
+            ),
+            table="usap_asset",
+            row_id=int(row["asset_id"]),
+            details={
+                "uri": row["uri"],
+                "content_hash": row["content_hash"],
             },
         )
 

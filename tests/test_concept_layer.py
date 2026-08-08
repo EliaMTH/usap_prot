@@ -143,6 +143,114 @@ def test_changing_parent_on_reingest_raises(tmp_path: Path) -> None:
             seed_vocabulary_file(pkg, conflicting_path)
 
 
+def test_reingest_backfills_missing_provenance(tmp_path: Path) -> None:
+    # A registry that gains provenance later must be able to reach packages
+    # that already exist. Without backfill, seeding returns success and
+    # silently keeps the old NULLs, so the only way to enrich a package would
+    # be to rebuild it — which is exactly what a stable identifier scheme
+    # added after the fact would require.
+    vocab_path = _write_vocab(tmp_path, MINIMAL_VOCAB)
+
+    enriched = json.loads(json.dumps(MINIMAL_VOCAB))
+    enriched["source_namespace"] = "https://example.org/ns/local#"
+    enriched["concepts"][0]["concept_iri"] = "https://example.org/c/TempSurface"
+    enriched_path = _write_vocab(tmp_path, enriched, name="enriched.json")
+
+    with _make_pkg(tmp_path) as pkg:
+        seed_vocabulary_file(pkg, vocab_path)
+
+        before = pkg.conn.execute(
+            """
+            SELECT source_namespace, concept_iri
+            FROM usap_semantic_class
+            WHERE local_name = 'TempSurface'
+            """
+        ).fetchone()
+
+        assert before["source_namespace"] is None
+        assert before["concept_iri"] is None
+
+        seed_vocabulary_file(pkg, enriched_path)
+
+        after = pkg.conn.execute(
+            """
+            SELECT source_namespace, concept_iri
+            FROM usap_semantic_class
+            WHERE local_name = 'TempSurface'
+            """
+        ).fetchone()
+
+        assert after["source_namespace"] == "https://example.org/ns/local#"
+        assert after["concept_iri"] == "https://example.org/c/TempSurface"
+
+        # Enriching is not duplicating.
+        count = pkg.conn.execute(
+            "SELECT COUNT(*) AS n FROM usap_semantic_class"
+        ).fetchone()
+
+        assert int(count["n"]) == 3
+        assert_package_valid(pkg)
+
+
+def test_reingest_does_not_overwrite_existing_provenance(
+    tmp_path: Path,
+) -> None:
+    # Backfill fills gaps; it must not rewrite an assertion the package
+    # already carries, or re-seeding would be a silent way to change what a
+    # concept claims to be.
+    first = json.loads(json.dumps(MINIMAL_VOCAB))
+    first["source_namespace"] = "https://example.org/ns/one#"
+
+    second = json.loads(json.dumps(MINIMAL_VOCAB))
+    second["source_namespace"] = "https://example.org/ns/two#"
+
+    with _make_pkg(tmp_path) as pkg:
+        seed_vocabulary_file(pkg, _write_vocab(tmp_path, first, name="a.json"))
+
+        with pytest.raises(USAPError, match="different source_namespace"):
+            seed_vocabulary_file(
+                pkg,
+                _write_vocab(tmp_path, second, name="b.json"),
+            )
+
+
+def test_backfilled_parent_reaches_the_closure(tmp_path: Path) -> None:
+    # The closure is written eagerly at insert, so a parent arriving through a
+    # backfill has to be propagated too — otherwise the hierarchy looks right
+    # in usap_semantic_class while subclass queries keep missing the edge.
+    flat = {
+        "scheme": "local",
+        "concepts": [{"local_name": "Base"}, {"local_name": "Derived"}],
+    }
+
+    linked = json.loads(json.dumps(flat))
+    linked["concepts"][1]["parent_uri"] = "Base"
+
+    with _make_pkg(tmp_path) as pkg:
+        seed_vocabulary_file(pkg, _write_vocab(tmp_path, flat, name="flat.json"))
+        seed_vocabulary_file(
+            pkg,
+            _write_vocab(tmp_path, linked, name="linked.json"),
+        )
+
+        base_id = pkg.resolve_semantic_class("Base")
+        derived_id = pkg.resolve_semantic_class("Derived")
+
+        depth = pkg.conn.execute(
+            """
+            SELECT depth
+            FROM usap_semantic_class_closure
+            WHERE ancestor_class_id = ?
+              AND descendant_class_id = ?
+            """,
+            (base_id, derived_id),
+        ).fetchone()
+
+        assert depth is not None, "backfilled parent never reached the closure"
+        assert int(depth["depth"]) == 1
+        assert_package_valid(pkg)
+
+
 def test_list_accepted_concepts_in_use_flag(tmp_path: Path) -> None:
     vocab_path = _write_vocab(tmp_path, MINIMAL_VOCAB)
 

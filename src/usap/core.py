@@ -89,17 +89,20 @@ import uuid
 import numpy as np
 from pyroaring import BitMap
 
+from ._util import mint_package_iri
 from .errors import USAPAmbiguityError, USAPError
 from .constants import (
     ANNOTATION_STATUSES,
     CITY_OBJECT_STATUSES,
     CONFIDENCE_RANGE,
     CONTAINMENT_RELATIONSHIP_TYPES,
+    CURRENT_PROFILE_VERSION,
     DEFAULT_BLOCK_SIZE,
     DEFAULT_ENCODING,
     DEFAULT_GRAPH_NAME,
     DEFAULT_VALUE_DTYPE,
     SUPPORTED_PROFILE_VERSIONS,
+    VALUE_BLOCK_ENCODING,
     VALUE_CHUNK_SIZE,
     VALUE_DTYPES,
     normalize_element_kind,
@@ -411,8 +414,18 @@ class USAPPackage:
         db_path: str | Path,
         schema_path: str | Path = DEFAULT_SCHEMA_PATH,
         overwrite: bool = False,
-        profile_version: str = "0.1.0",
+        profile_version: str = CURRENT_PROFILE_VERSION,
+        package_iri: str | None = None,
     ) -> "USAPPackage":
+        """
+        Create a new package.
+
+        package_iri is the package's stable identity. It defaults to a freshly
+        minted UUID URN, which is globally unique by construction and needs no
+        domain, registry, or namespace to be valid — so the caller never has to
+        supply one. Pass an explicit IRI only to adopt an identity that already
+        exists elsewhere.
+        """
         db_path = Path(db_path)
         schema_path = Path(schema_path)
 
@@ -447,15 +460,17 @@ class USAPPackage:
                     INSERT INTO usap_profile (
                         profile_id,
                         profile_version,
+                        package_iri,
                         default_block_size,
                         default_encoding,
                         metadata_json
                     )
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         1,
                         profile_version,
+                        package_iri or mint_package_iri(),
                         DEFAULT_BLOCK_SIZE,
                         DEFAULT_ENCODING,
                         None,
@@ -551,6 +566,35 @@ class USAPPackage:
             return DEFAULT_BLOCK_SIZE
 
         return int(row["default_block_size"])
+
+    def get_package_iri(self) -> str:
+        """
+        Return this package's stable identity (a UUID URN by default).
+
+        Unlike get_default_block_size there is no sensible fallback: an
+        identity invented on read would differ between two readers of the
+        same file, which is the opposite of what it is for.
+        """
+        row = self.conn.execute(
+            """
+            SELECT package_iri
+            FROM usap_profile
+            WHERE profile_id = 1
+            """
+        ).fetchone()
+
+        package_iri = (row["package_iri"] or "").strip() if row else ""
+
+        # Stripped before the check, matching _validate_profile: a whitespace
+        # value is as unusable as an empty one, and the two must not disagree
+        # about whether a package has an identity.
+        if not package_iri:
+            raise USAPError(
+                f"Package has no package_iri: {self.db_path}. It was not "
+                "created by USAPPackage.create()."
+            )
+
+        return package_iri
 
     def log_edit(
         self,
@@ -668,17 +712,25 @@ class USAPPackage:
         maxy: float | None = None,
         maxz: float | None = None,
         metadata_json: str | None = None,
+        indexing_profile: str | None = None,
     ) -> int:
         """
         Register a stable sub-location inside an asset.
 
         Returns asset_part_id.
 
+        indexing_profile names the convention that assigned element indices
+        (e.g. 'usap:ply-face-record-order-v1'). It is advisory for now, but it
+        is compared like every other field below: reading one part under two
+        different conventions would repoint its memberships without changing
+        a single stored index.
+
         Idempotent on (asset_id, part_path, element_kind), with the same
         caveat as register_asset: element_count is the index space every
         annotation on this part is validated against, so a re-registration
-        that changes it (or the bounds, origin, or metadata) raises rather
-        than leaving existing memberships silently mis-scoped.
+        that changes it (or the bounds, origin, metadata, or indexing
+        profile) raises rather than leaving existing memberships silently
+        mis-scoped.
         """
         element_kind = normalize_element_kind(element_kind)
         if element_count < 0:
@@ -692,7 +744,8 @@ class USAPPackage:
                 index_origin,
                 minx, miny, minz,
                 maxx, maxy, maxz,
-                metadata_json
+                metadata_json,
+                indexing_profile
             FROM usap_asset_part
             WHERE asset_id = ?
               AND part_path = ?
@@ -714,6 +767,7 @@ class USAPPackage:
                     "maxy": maxy,
                     "maxz": maxz,
                     "metadata_json": metadata_json,
+                    "indexing_profile": indexing_profile,
                 },
             )
 
@@ -743,9 +797,10 @@ class USAPPackage:
                     maxx,
                     maxy,
                     maxz,
-                    metadata_json
+                    metadata_json,
+                    indexing_profile
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     asset_id,
@@ -760,6 +815,7 @@ class USAPPackage:
                     maxy,
                     maxz,
                     metadata_json,
+                    indexing_profile,
                 ),
             )
             asset_part_id = require_lastrowid(cur)
@@ -928,6 +984,18 @@ class USAPPackage:
     # Semantic classes
     # ---------------------------------------------------------------------
 
+    # Columns a re-seed may fill in on a concept that already exists. Identity
+    # (scheme, class_uri, local_name) is deliberately not here: those decide
+    # *which* concept this is, so a change is a different concept, not an
+    # enrichment.
+    _SEMANTIC_CLASS_BACKFILLABLE = (
+        "scheme_version",
+        "parent_class_id",
+        "source_namespace",
+        "concept_iri",
+        "metadata_json",
+    )
+
     def create_semantic_class(
         self,
         scheme: str,
@@ -937,15 +1005,26 @@ class USAPPackage:
         parent_class_id: int | None = None,
         is_ade: bool = False,
         metadata_json: str | None = None,
+        source_namespace: str | None = None,
+        concept_iri: str | None = None,
     ) -> int:
         """
         Create or reuse a semantic class.
 
         Also updates usap_semantic_class_closure.
+
+        Re-seeding an *enriched* vocabulary over a package that already has the
+        concept fills in whatever is still NULL — provenance added to a
+        registry later reaches existing packages by re-seeding, instead of
+        needing them rebuilt. A field that already holds a different value is a
+        contradiction, not an enrichment, and raises: seeding must never
+        silently rewrite what a package already asserts.
         """
         existing = self.conn.execute(
-            """
-            SELECT semantic_class_id, parent_class_id
+            f"""
+            SELECT
+                semantic_class_id,
+                {", ".join(self._SEMANTIC_CLASS_BACKFILLABLE)}
             FROM usap_semantic_class
             WHERE class_uri = ?
             """,
@@ -953,22 +1032,64 @@ class USAPPackage:
         ).fetchone()
 
         if existing is not None:
-            existing_parent_id = existing["parent_class_id"]
+            class_id = int(existing["semantic_class_id"])
 
-            # A requested None parent makes no claim, so plain re-creates and
-            # re-seeding stay idempotent; only a contradicting parent raises.
-            if (
-                parent_class_id is not None
-                and existing_parent_id != parent_class_id
-            ):
-                raise USAPError(
-                    f"Semantic class already exists with a different parent: "
-                    f"{class_uri!r} has parent_class_id {existing_parent_id}, "
-                    f"requested {parent_class_id}. "
-                    "Changing a concept's parent is not supported yet."
-                )
+            requested = {
+                "scheme_version": scheme_version,
+                "parent_class_id": parent_class_id,
+                "source_namespace": source_namespace,
+                "concept_iri": concept_iri,
+                "metadata_json": metadata_json,
+            }
 
-            return int(existing["semantic_class_id"])
+            backfill: dict[str, Any] = {}
+
+            for column, value in requested.items():
+                # Requesting None makes no claim, so plain re-creates and
+                # re-seeds of an unchanged file stay a no-op.
+                if value is None or existing[column] == value:
+                    continue
+
+                if existing[column] is not None:
+                    raise USAPError(
+                        f"Semantic class already exists with a different "
+                        f"{column}: {class_uri!r} has "
+                        f"{existing[column]!r}, requested {value!r}. "
+                        "Re-seeding fills in missing fields; it does not "
+                        "overwrite what a package already asserts."
+                    )
+
+                backfill[column] = value
+
+            if backfill:
+                assignments = ", ".join(f"{c} = ?" for c in backfill)
+
+                with self.transaction():
+                    self.conn.execute(
+                        f"""
+                        UPDATE usap_semantic_class
+                        SET {assignments}
+                        WHERE semantic_class_id = ?
+                        """,
+                        (*backfill.values(), class_id),
+                    )
+
+                    # A parent arriving late has to reach the closure too,
+                    # which is otherwise only written at insert.
+                    if "parent_class_id" in backfill:
+                        self._inherit_closure_from_parent(
+                            class_id=class_id,
+                            parent_class_id=int(backfill["parent_class_id"]),
+                        )
+
+                    self.log_edit(
+                        "backfill_semantic_class",
+                        "usap_semantic_class",
+                        class_id,
+                        details_json=json.dumps(sorted(backfill)),
+                    )
+
+            return class_id
 
         with self.transaction():
             cur = self.conn.execute(
@@ -980,9 +1101,11 @@ class USAPPackage:
                     local_name,
                     parent_class_id,
                     is_ade,
-                    metadata_json
+                    metadata_json,
+                    source_namespace,
+                    concept_iri
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     scheme,
@@ -992,6 +1115,8 @@ class USAPPackage:
                     parent_class_id,
                     1 if is_ade else 0,
                     metadata_json,
+                    source_namespace,
+                    concept_iri,
                 ),
             )
             class_id = require_lastrowid(cur)
@@ -1009,33 +1134,11 @@ class USAPPackage:
                 (class_id, class_id, 0),
             )
 
-            # If the class has a parent, inherit all parent ancestors.
             if parent_class_id is not None:
-                parent_ancestors = self.conn.execute(
-                    """
-                    SELECT ancestor_class_id, depth
-                    FROM usap_semantic_class_closure
-                    WHERE descendant_class_id = ?
-                    """,
-                    (parent_class_id,),
-                ).fetchall()
-
-                for row in parent_ancestors:
-                    self.conn.execute(
-                        """
-                        INSERT OR IGNORE INTO usap_semantic_class_closure (
-                            ancestor_class_id,
-                            descendant_class_id,
-                            depth
-                        )
-                        VALUES (?, ?, ?)
-                        """,
-                        (
-                            int(row["ancestor_class_id"]),
-                            class_id,
-                            int(row["depth"]) + 1,
-                        ),
-                    )
+                self._inherit_closure_from_parent(
+                    class_id=class_id,
+                    parent_class_id=parent_class_id,
+                )
 
             self.log_edit(
                 "create_semantic_class",
@@ -1044,6 +1147,46 @@ class USAPPackage:
             )
 
         return class_id
+
+    def _inherit_closure_from_parent(
+        self,
+        *,
+        class_id: int,
+        parent_class_id: int,
+    ) -> None:
+        """
+        Give a class every ancestor of its parent, one level deeper.
+
+        Shared by the insert path and by a parent arriving later through a
+        re-seed backfill: the closure is written eagerly, so a parent that
+        appears after the row exists has to reach it here or subclass queries
+        would keep missing the new edge.
+        """
+        parent_ancestors = self.conn.execute(
+            """
+            SELECT ancestor_class_id, depth
+            FROM usap_semantic_class_closure
+            WHERE descendant_class_id = ?
+            """,
+            (parent_class_id,),
+        ).fetchall()
+
+        for row in parent_ancestors:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO usap_semantic_class_closure (
+                    ancestor_class_id,
+                    descendant_class_id,
+                    depth
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    int(row["ancestor_class_id"]),
+                    class_id,
+                    int(row["depth"]) + 1,
+                ),
+            )
 
     # ---------------------------------------------------------------------
     # City objects and graph
@@ -1540,10 +1683,12 @@ class USAPPackage:
 
             return existing
 
-        # Keep updated_at meaningful: it is set to CURRENT_TIMESTAMP on creation
-        # and must advance on every real edit, otherwise it just mirrors
-        # created_at. CURRENT_TIMESTAMP is inline SQL, so it needs no parameter.
-        updates.append("updated_at = CURRENT_TIMESTAMP")
+        # Keep updated_at meaningful: it is stamped on creation and must
+        # advance on every real edit, otherwise it just mirrors created_at.
+        # The expression must match the schema default exactly (UTC ISO-8601
+        # with 'Z'), or an edited row would be spelled differently from a
+        # fresh one. Inline SQL, so it needs no parameter.
+        updates.append("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')")
 
         params.append(annotation_id)
 
@@ -2494,11 +2639,12 @@ class USAPPackage:
                         block_start,
                         element_count,
                         value_dtype,
+                        encoding,
                         value_min,
                         value_max,
                         payload
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         annotation_id,
@@ -2507,6 +2653,7 @@ class USAPPackage:
                         block_start,
                         len(chunk),
                         value_dtype,
+                        VALUE_BLOCK_ENCODING,
                         value_min,
                         value_max,
                         encode_value_block(chunk, value_dtype),
@@ -3135,6 +3282,8 @@ class USAPPackage:
                 sc.class_uri,
                 sc.local_name,
                 sc.parent_class_id,
+                sc.source_namespace,
+                sc.concept_iri,
                 sc.is_ade,
                 COUNT(a.annotation_id) AS annotation_count
             FROM usap_semantic_class AS sc

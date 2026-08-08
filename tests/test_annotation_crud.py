@@ -81,8 +81,12 @@ def test_get_and_update_annotation(tmp_path: Path) -> None:
 
         # updated_at must track the last edit, not stay frozen at created_at.
         # Backdate the row so the assertion is deterministic despite the
-        # one-second resolution of CURRENT_TIMESTAMP, then confirm an update
-        # advances updated_at while leaving created_at untouched.
+        # one-second resolution of the timestamp, then confirm an update
+        # advances updated_at while leaving created_at untouched. The backdated
+        # value uses the stored format (UTC ISO-8601 with 'Z') so the string
+        # comparison below stays lexicographic within one format.
+        backdated = "2000-01-01T00:00:00Z"
+
         with pkg.transaction():
             pkg.conn.execute(
                 """
@@ -90,7 +94,7 @@ def test_get_and_update_annotation(tmp_path: Path) -> None:
                 SET created_at = ?, updated_at = ?
                 WHERE annotation_id = ?
                 """,
-                ("2000-01-01 00:00:00", "2000-01-01 00:00:00", annotation_id),
+                (backdated, backdated, annotation_id),
             )
 
         pkg.update_annotation(annotation_id, label="Touched roof annotation")
@@ -104,8 +108,9 @@ def test_get_and_update_annotation(tmp_path: Path) -> None:
             (annotation_id,),
         ).fetchone()
 
-        assert timestamps["created_at"] == "2000-01-01 00:00:00"
-        assert timestamps["updated_at"] > "2000-01-01 00:00:00"
+        assert timestamps["created_at"] == backdated
+        assert timestamps["updated_at"] > backdated
+        assert timestamps["updated_at"].endswith("Z")
 
 
 def test_list_annotations_with_filters(tmp_path: Path) -> None:

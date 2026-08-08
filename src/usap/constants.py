@@ -42,6 +42,12 @@ _ELEMENT_KIND_BY_NAME = {
 DEFAULT_BLOCK_SIZE = 16384
 DEFAULT_ENCODING = "roaring"
 
+# How usap_value_block payloads are compressed (see encode_value_block).
+# Membership and value blocks are compressed differently — roaring is a set
+# codec and has nothing to say about a dense scalar array — so they name their
+# encodings separately.
+VALUE_BLOCK_ENCODING = "zlib"
+
 # An annotation is a revisable claim, so its lifecycle state is part of the
 # format rather than free text: readers filter on it (list_annotations),
 # and an unrecognised value silently drops out of every such filter.
@@ -55,10 +61,19 @@ CITY_OBJECT_STATUSES = ("accepted", "temporary")
 # compared against another annotation's, which is the only reason to store it.
 CONFIDENCE_RANGE = (0.0, 1.0)
 
+# The version stamped on packages this build creates.
+#
+# 0.2.0 added usap_profile.package_iri, the canonical 'algorithm:digest'
+# content hash, UTC ISO-8601 timestamps, concept provenance columns, and
+# usap_asset_part.indexing_profile. A 0.1.0 package has no package_iri at all,
+# so it cannot be read as a 0.2.0 one; packages were experimental and are
+# rebuilt rather than migrated.
+CURRENT_PROFILE_VERSION = "0.2.0"
+
 # Only packages written by a profile version this build understands can be
 # opened; there is no migration path yet, so opening a newer one would
 # silently misread it.
-SUPPORTED_PROFILE_VERSIONS = ("0.1.0",)
+SUPPORTED_PROFILE_VERSIONS = (CURRENT_PROFILE_VERSION,)
 
 DEFAULT_GRAPH_NAME = "usap_default"
 

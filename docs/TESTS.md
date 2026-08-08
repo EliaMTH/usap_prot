@@ -124,6 +124,17 @@ python -m pytest
   vocabulary file adds concepts without duplicating existing ones.
 - `test_changing_parent_on_reingest_raises` — silently re-parenting a concept
   would corrupt the hierarchy closure; it must raise.
+- `test_reingest_backfills_missing_provenance` — a registry that gains
+  provenance later must be able to reach packages that already exist. Without
+  backfill, seeding reports success and silently keeps the old `NULL`s, so
+  enriching a package would mean rebuilding it.
+- `test_reingest_does_not_overwrite_existing_provenance` — backfill fills
+  gaps only; re-seeding must never become a quiet way to change what a
+  concept already claims to be.
+- `test_backfilled_parent_reaches_the_closure` — the closure is written
+  eagerly at insert, so a parent arriving through a backfill has to be
+  propagated too, or the hierarchy looks right in `usap_semantic_class` while
+  subclass queries keep missing the edge.
 - `test_list_accepted_concepts_in_use_flag` — `in_use`/`annotation_count`
   scouting reflects actual annotations.
 - `test_subclass_block_query_uses_indexes` — hierarchy-accelerated queries
@@ -199,6 +210,14 @@ rewrite.
   transforms and instancing that this adapter cannot see, so registering one
   would record wrong bounds and part identity rather than none; `.glb`/`.gltf`
   must be refused, leaving nothing half-registered.
+- `test_mesh_registration_records_the_indexing_profile[ply|obj|stl]` /
+  `test_las_registration_records_the_indexing_profile` — a content hash proves
+  the source bytes, not how a reader turns them into element 0, 1, 2. Each
+  adapter must record the convention it used.
+- `test_reregistering_a_part_under_a_different_profile_raises` — reading one
+  part under two conventions would repoint every membership without changing
+  a single stored index, so it is refused like any other conflicting
+  re-registration.
 
 `test_citygml_adapter.py`:
 
@@ -355,6 +374,43 @@ Conformance additions:
 - `test_no_explicit_index_duplicates_a_unique_autoindex` — schema hygiene: no
   explicit index may duplicate a UNIQUE constraint's auto-index (asserts on
   `EXPLAIN QUERY PLAN`; may need updating on SQLite upgrades).
+
+## Package identity and interchange format — `test_package_identity.py`
+
+The facts a future W3C Web Annotation export has to build on, and that cannot
+be added afterwards without rewriting existing packages (see
+[FW_FEATURE_W3C_WEB_ANNOTATION_PROFILE.md](../FW_FEATURE_W3C_WEB_ANNOTATION_PROFILE.md)).
+
+- `test_package_iri_is_minted_and_stable` / `test_each_package_gets_its_own_iri`
+  — identity is born with the package and survives reopening. One invented at
+  read time would differ between two readers of the same file.
+- `test_explicit_package_iri_is_honoured` — adopting an identity that already
+  exists elsewhere must be possible; only the default is minted.
+- `test_blank_package_iri_is_reported` — the column is `NOT NULL`, so this is
+  the shape a package written by something else could still take: validation
+  reports `INVALID_PACKAGE_IRI` and the accessor raises.
+- `test_profile_version_is_current` /
+  `test_extension_definition_carries_the_profile_version` — the version rides
+  in the `gpkg_extensions` URI path, so it must follow the version being
+  written rather than whatever was current when the constant was last edited.
+- `test_parse_content_hash_accepts_canonical_and_bare` /
+  `test_parse_content_hash_rejects_non_digests` — `algorithm:digest` and a
+  bare 64-hex digest both parse; a caller token comes back as "no comparable
+  hash" rather than raising or being mistaken for a digest.
+- `test_adapters_write_canonical_hashes` — every adapter stores the canonical
+  form, since `(uri, content_hash)` is a uniqueness key and a change of
+  spelling would register one file as two assets.
+- `test_verify_assets_matches_a_legacy_bare_digest` /
+  `test_verify_assets_detects_a_changed_file` — tolerant parsing must not cost
+  detection: an older bare digest still verifies, a modified file still
+  reports `changed`.
+- `test_non_canonical_hash_is_a_deep_warning` — a warning, not an error:
+  `register_asset` accepts any token, so this is unusual rather than corrupt.
+  What it costs is verifiability.
+- `test_annotation_timestamps_are_utc_iso8601` /
+  `test_edit_log_timestamps_are_utc_iso8601` — stored timestamps are
+  `xsd:dateTime`-shaped, and `update_annotation` writes the same spelling as
+  the schema default so edited rows do not drift into a second format.
 
 ## Validation — `test_validation.py`
 

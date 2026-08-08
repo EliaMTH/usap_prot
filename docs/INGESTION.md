@@ -1,13 +1,10 @@
 # USAP ingestion — the three procedures
 
-These are the supported creation / data-ingestion / editing procedures. Everything runs off two JSON files plus one semantic authority:
+These are the supported creation, data-ingestion, and editing procedures. Everything runs from two JSON files plus one semantic authority:
 
-- a **project config** — what the package is made of: assets, semantic source,
-  and which linking files to apply;
-- a **linking JSON** (annotation batch) — which city object owns which
-  elements of which 3D asset;
-- the **semantic authority** — either a CityGML file (procedure 1) or a
-  minimal vocabulary JSON (procedure 2).
+- a **project config** — what the package is made of: operational 3D assets, the semantic source, and which linking files to apply;
+- a **linking JSON** (annotation batch) — which indexed elements of which operational asset are associated with which city-object instance and concept;
+- the **semantic authority** — either a CityGML file (procedure 1) or a minimal vocabulary JSON (procedure 2).
 
 One command executes either procedure end to end:
 
@@ -20,22 +17,19 @@ build_project_package_from_file("update.json", update=True)   # edit (3)
 
 (or `python examples/build_project_package.py project.json [--update]`).
 
-The division of authority behind all three: **USAP owns the claim layer**
-(which elements, under which concept, status/confidence/provenance) and the
-**semantic source owns the meaning layer** (which concepts and objects exist,
-their properties, their hierarchy). USAP stores references and element
-indices — never geometry, never object properties.
+The division of authority is the same in all three procedures:
+
+- **USAP owns the claim layer** — which indexed elements are associated with which object or concept, with what status, confidence, provenance, and temporal metadata;
+- **the semantic source owns the meaning layer** — which concepts and objects exist, their authoritative properties, and their hierarchy.
+
+A CityGML source may contain its own geometry, but this workflow does not copy or restate the native CityGML object-geometry association. The CityGML import is used for object identity, class, relationships, and provenance. Element memberships are stored for the separately registered operational 3D assets. USAP stores references and indices — never source geometry and never authoritative object properties.
 
 ---
-
 ## Procedure 1 — init from 3D assets + CityGML + linking JSON
 
-City-object names in the linking JSON are the **gml ids** from the CityGML
-file. Objects, their classes, and their decomposition come from the CityGML
-import; the linking JSON only has to say *which object owns which elements*.
+City-object names in the linking JSON are the **`gml:id` values** from the CityGML file. Objects, their classes, and their decomposition come from the CityGML import; the linking JSON only states which elements in the registered operational assets correspond to which authoritative city object.
 
 `project.json`:
-
 ```json
 {
   "db_path": "city.usap.gpkg",
@@ -52,7 +46,6 @@ import; the linking JSON only has to say *which object owns which elements*.
 ```
 
 `links.json` — the minimal entry is *object + elements*:
-
 ```json
 {
   "annotations": [
@@ -67,7 +60,6 @@ import; the linking JSON only has to say *which object owns which elements*.
 ```
 
 What is derived when omitted:
-
 - `concept` — inherited from the linked object's CityGML class
   (say it explicitly to make a *different* claim, e.g. an ADE concept like
   `EnergyRoof` on a `RoofSurface` object);
@@ -75,7 +67,7 @@ What is derived when omitted:
   re-applying the file edits in place instead of duplicating);
 - `element_kind` — the asset part's stored kind;
 - `asset_uri` refers to the `uri` given at asset registration (give assets
-  stable logical uris in the config); add `"part_path"` only when the asset
+  stable logical URIs in the config); add `"part_path"` only when the asset
   has several parts. Numeric `"asset_part_id"` from the manifest still works.
 
 Optional per entry: `label`, `status`, `confidence`, `attributes`
@@ -91,7 +83,6 @@ unique**. The linking JSON carries the documented minimum per entry:
 `"create_missing_city_objects": true`.
 
 `vocab.json`:
-
 ```json
 {
   "scheme": "local",
@@ -106,7 +97,6 @@ unique**. The linking JSON carries the documented minimum per entry:
 no `citygml` section.
 
 `links.json`:
-
 ```json
 {
   "create_missing_city_objects": true,
@@ -134,19 +124,26 @@ Carriers are the alignment hook: when a proper CityGML-backed package
 arrives, find them with `object_status = 'temporary'` and map them onto real
 objects (alignment tooling is future work).
 
-## Procedure 3 — edit an existing usap
+## Procedure 3 — edit an existing USAP package
 
-Same file formats, applied to the existing package with `update=True`:
+The same file formats are applied to the existing package with `update=True`:
 
 ```python
 build_project_package_from_file("update.json", update=True)
 ```
 
 - **Add assets**: list them in the config; registration is idempotent, so
-  already-known assets (same uri + hash) are skipped and new ones added.
+  already-known assets (same URI + hash) are skipped and new ones added.
 - **Add concepts**: an edit can only make claims with concepts the package
   already accepts; to extend the accepted list, provide the new concepts in
-  the vocabulary-registry format and list the file either in the config's `"vocabularies"` key or in the linking JSON's own top-level `"vocabularies"` key (loaded in the same transaction as its annotations). Seeding is additive and idempotent:  already-registered concepts are skipped, new ones added.
+  the vocabulary-registry format and list the file either in the config's
+  `"vocabularies"` key or in the linking JSON's own top-level
+  `"vocabularies"` key (loaded in the same transaction as its annotations).
+  Seeding is additive, idempotent, and enriching: new concepts are added, and
+  on an already-registered concept any field still `NULL` (provenance,
+  `scheme_version`, a parent) is filled in from the new file. A field that
+  already holds a different value raises rather than being rewritten, so an
+  edit can enrich the registry but never silently redefine it.
 - **Edit annotations**: list batches in `annotation_batches`; in update mode
   they run with `replace_existing=True` — an entry with an existing
   `annotation_uid` (given or derived) updates the fields it carries and
@@ -161,28 +158,24 @@ any name the package does not know, so ad-hoc carriers cannot slip in
 unnoticed.
 
 ---
-
 ## What each step reads and stores
 
 | Input | Read for | Stored |
 |---|---|---|
-| 3D assets (LAS, mesh) | element counts + part structure (the index space), optional SHA-256 + bounds | uri, hash, parts, counts — never geometry |
-| CityGML | object identity, class, decomposition | mirrored ids/classes/relationships — never geometry or object attributes |
-| vocabulary JSON | accepted concepts (+ parent links) | `usap_semantic_class` + hierarchy closure |
-| linking JSON | annotations: object ↔ elements (+ optional value fields) | compressed membership/value blocks, annotation records |
+| Operational 3D assets (LAS, mesh) | element counts + part structure (the index space), optional SHA-256 + bounds | URI, hash, parts, counts — never geometry |
+| CityGML | object identity, class, decomposition, and source provenance | mirrored ids/classes/relationships — any CityGML geometry and authoritative object attributes remain only in the source |
+| Vocabulary JSON | accepted concepts (+ parent links) | `usap_semantic_class` + hierarchy closure |
+| Linking JSON | claims connecting objects/concepts to asset elements (+ optional value fields) | compressed membership/value blocks and annotation records |
 
 If your pipeline already knows the element counts, assets can also be
 declared without reading the files at all: `register_asset` +
 `register_asset_part` in the SDK.
 
-**Large assets.** Registration is the only step that opens an asset file at
-all — annotating and querying afterwards work from the stored element count,
-so asset size stops mattering once a package is built. Registration reads only
-what it stores: LAS/LAZ from the header alone, and meshes over 256 MB in a
-streaming pass rather than a full load (`stream=True`/`False` to override; see
-REFERENCE.md → Mesh support → Large meshes for the formats that support it).
-The one full read that remains is `compute_hash` — minutes on a 10 GB file,
-and what makes a later change to it detectable, so turn it off knowingly.
+**Large assets.** Registration is the only normal ingestion step that opens an operational asset file. After registration, annotation editing and querying use the stored index-space metadata and USAP's membership/value blocks; they do not reopen the source geometry. Source-file size therefore no longer directly controls query cost. Package operations still scale with the number and density of stored memberships, value blocks, and returned results.
+
+Registration reads only what it stores: LAS/LAZ from the header alone, and meshes over 256 MB in a streaming pass rather than a full load (`stream=True`/`False` to override; see REFERENCE.md → Mesh support → Large meshes for supported formats). The remaining optional full-file read is `compute_hash`: it can take minutes on a 10 GB file, but it is what makes later source changes detectable, so disable it knowingly.
+
+Keeping the annotations in USAP also means that creating, accepting, rejecting, or replacing a claim does not rewrite the CityGML authority, mesh, or point-cloud source. This separation is especially useful for large or shared assets, but it is not a claim that every CityGML workflow needs a USAP package.
 
 ## GIS interoperability
 

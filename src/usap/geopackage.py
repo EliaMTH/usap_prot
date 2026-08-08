@@ -22,7 +22,19 @@ USAP_EXTENSION_SCOPE = "read-write"
 # public home; usap.invalid is RFC 2606's reserved TLD, so this can never
 # accidentally resolve to someone else's page and reads unmistakably as a
 # placeholder.
-USAP_EXTENSION_DEFINITION = "https://usap.invalid/extensions/usap_core/0.1.0"
+USAP_EXTENSION_DEFINITION_BASE = "https://usap.invalid/extensions/usap_core"
+
+
+def usap_extension_definition(profile_version: str) -> str:
+    """
+    Return the gpkg_extensions.definition URI for a profile version.
+
+    The version rides in the URI path, so it has to be built from the version
+    actually being written rather than hardcoded — otherwise every package
+    claims to conform to whichever version happened to be current when the
+    constant was last edited.
+    """
+    return f"{USAP_EXTENSION_DEFINITION_BASE}/{profile_version}"
 
 USAP_EXTENSION_TABLES = [
     "usap_profile",
@@ -145,7 +157,7 @@ def _register_usap_extension(
     # The definition must stay a bare URI (the standard asks for a reference
     # to the defining document); the profile version rides in the URI path
     # rather than as appended prose.
-    definition = USAP_EXTENSION_DEFINITION
+    definition = usap_extension_definition(profile_version)
 
     rows = [
         (

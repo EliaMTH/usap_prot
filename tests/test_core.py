@@ -34,7 +34,11 @@ def build_tiny_package(db_path: Path) -> tuple[USAPPackage, int, int, int]:
         uri="city_mesh.ply",
         asset_kind="mesh",
         media_type="application/ply",
-        content_hash="fake_hash_for_test",
+        # No file backs this fixture, so the digest is invented — but it is
+        # spelled canonically ('algorithm:digest'), or deep validation would
+        # flag NON_CANONICAL_CONTENT_HASH in every test that checks an
+        # exact issue list.
+        content_hash="sha256:" + "11" * 32,
     )
 
     asset_part_id = pkg.register_asset_part(
@@ -654,20 +658,20 @@ def test_reregistering_an_asset_with_different_values_raises(pkg: USAPPackage) -
     first = pkg.register_asset(
         uri="area.ply",
         asset_kind="mesh",
-        content_hash="hash-1",
+        content_hash="sha256:" + "a1" * 32,
     )
 
     assert pkg.register_asset(
         uri="area.ply",
         asset_kind="mesh",
-        content_hash="hash-1",
+        content_hash="sha256:" + "a1" * 32,
     ) == first
 
     with pytest.raises(USAPError, match="already registered with different"):
         pkg.register_asset(
             uri="area.ply",
             asset_kind="pointcloud",
-            content_hash="hash-1",
+            content_hash="sha256:" + "a1" * 32,
         )
 
     # A genuinely new version of the file is a different content hash, and
@@ -675,7 +679,7 @@ def test_reregistering_an_asset_with_different_values_raises(pkg: USAPPackage) -
     assert pkg.register_asset(
         uri="area.ply",
         asset_kind="mesh",
-        content_hash="hash-2",
+        content_hash="sha256:" + "b2" * 32,
     ) != first
 
 

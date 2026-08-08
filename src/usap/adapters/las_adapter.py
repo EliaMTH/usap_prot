@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .._util import sha256_file
+from .._util import canonical_hash
 from ..constants import ELEMENT_KIND_POINT
 from ..core import USAPPackage
 from ..errors import USAPError
@@ -108,7 +108,7 @@ def register_las_asset(
 
         crs_wkt = _try_read_crs_wkt(header)
 
-    content_hash = sha256_file(path) if compute_hash else None
+    content_hash = canonical_hash(path) if compute_hash else None
 
     asset_metadata = {
         "adapter": "las_adapter",
@@ -158,6 +158,10 @@ def register_las_asset(
             maxy=maxy,
             maxz=maxz,
             metadata_json=json.dumps(part_metadata),
+            # Point i is the i-th point record in the file. COPC and other
+            # reordering exports break this, which is exactly why the
+            # convention is recorded rather than assumed.
+            indexing_profile="usap:las-point-record-order-v1",
         )
 
     return LASRegistrationResult(

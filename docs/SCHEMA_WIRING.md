@@ -2,7 +2,7 @@
 
 How the objects in [`src/usap/data/schema.sql`](../src/usap/data/schema.sql) connect: which foreign keys wire the tables together, and which tables each view reads from.
 
-**Object counts:** 13 USAP tables + 4 GeoPackage plumbing tables = 17 base tables, plus 4 views and 6 indexes.
+**Object counts:** 14 USAP tables + 4 GeoPackage plumbing tables = 18 base tables, plus 4 views and 9 indexes.
 
 In every diagram, an arrow `A ──▶ B` means **"A has a foreign key pointing to B"** (A references B; the arrow points at the thing being referenced).
 
@@ -18,6 +18,7 @@ flowchart TB
     SCC[usap_semantic_class_closure]
     CO[usap_city_object]
     COR[usap_city_object_relationship]
+    RTYPE[usap_relationship_type]
     ANN[usap_annotation]
     ANNO[usap_annotation_object]
     MB[usap_membership_block]
@@ -30,7 +31,8 @@ flowchart TB
     SCC -->|ancestor + descendant| SCLASS
     CO -->|semantic_class_id| SCLASS
     CO -->|source_asset_id| ASSET
-    COR -->|parent + child| CO
+    COR -->|from + to| CO
+    COR -->|relationship_type_id| RTYPE
     COR -->|source_asset_id| ASSET
     ANN -->|semantic_class_id| SCLASS
     ANN -->|primary_city_object_id| CO
@@ -50,7 +52,11 @@ flowchart TB
 
 This distinction is important: a city-object link identifies the semantic referent of a claim, whereas a membership or value block identifies concrete points, faces, or other indexed elements in a registered geometry asset. The schema connects the two through the annotation without treating the city object itself as another geometry membership.
 
-`usap_semantic_class_closure` is a precomputed shortcut hanging off the class hierarchy; the *object* hierarchy has no such table — "an object and its parts" is walked from `usap_city_object_relationship` with a recursive CTE, because those edges are typed and edited one at a time (see `elements_for_city_object`). `usap_profile` and `usap_edit_log` (dashed) stand alone — no foreign keys in or out.
+`usap_semantic_class_closure` is a precomputed shortcut hanging off the class hierarchy; the object graph has no such table — "an object and its parts" is walked from `usap_city_object_relationship` with a recursive CTE, because those edges are typed and edited one at a time (see `elements_for_city_object`).
+
+Note the object graph is a *graph*, not a tree. `from`/`to` record the direction the source asserted an edge in, and whether that makes the target a **part** of the source is a property of the link type's `category` in `usap_relationship_type`, not of the columns. A peer link (`adjacentTo`, `predecessor`) is directed too, and is simply never followed by a containment query.
+
+`usap_profile`, `usap_edit_log` and `usap_relationship_type` stand alone as far as outgoing keys go — the first two are dashed because nothing points at them either, whereas the relationship table points at the third.
 
 ### Foreign keys, table by table
 
@@ -63,8 +69,9 @@ This distinction is important: a city-object link identifies the semantic refere
 | `usap_semantic_class_closure` | `descendant_class_id` | `usap_semantic_class(semantic_class_id)` |
 | `usap_city_object` | `semantic_class_id` | `usap_semantic_class(semantic_class_id)` |
 | `usap_city_object` | `source_asset_id` | `usap_asset(asset_id)` |
-| `usap_city_object_relationship` | `parent_city_object_id` | `usap_city_object(city_object_id)` |
-| `usap_city_object_relationship` | `child_city_object_id` | `usap_city_object(city_object_id)` |
+| `usap_city_object_relationship` | `from_city_object_id` | `usap_city_object(city_object_id)` |
+| `usap_city_object_relationship` | `to_city_object_id` (nullable) | `usap_city_object(city_object_id)` |
+| `usap_city_object_relationship` | `relationship_type_id` | `usap_relationship_type(relationship_type_id)` |
 | `usap_city_object_relationship` | `source_asset_id` | `usap_asset(asset_id)` |
 | `usap_annotation` | `semantic_class_id` | `usap_semantic_class(semantic_class_id)` |
 | `usap_annotation` | `primary_city_object_id` | `usap_city_object(city_object_id)` |
@@ -75,7 +82,7 @@ This distinction is important: a city-object link identifies the semantic refere
 | `usap_value_block` | `annotation_id` | `usap_annotation(annotation_id)` |
 | `usap_value_block` | `asset_part_id` | `usap_asset_part(asset_part_id)` |
 
-`usap_profile` and `usap_edit_log` have no foreign keys.
+`usap_profile`, `usap_edit_log` and `usap_relationship_type` have no foreign keys.
 
 ### Columns that carry identity and provenance
 
@@ -89,6 +96,10 @@ something that cannot be reconstructed later from the rest of the package:
 | `usap_asset_part` | `indexing_profile` | which convention assigned the element indices — a hash proves the bytes, not the ordering |
 | `usap_semantic_class` | `source_namespace`, `concept_iri` | where a concept came from in its authority; `class_uri` stays the internal key |
 | `usap_value_block` | `encoding` | payload compression, mirroring `usap_membership_block.encoding` |
+| `usap_relationship_type` | `code_space` | the namespace the link property came from; with `local_name` it is the QName the source document wrote, and the only way a reader resolves a link type back to its definition |
+| `usap_relationship_type` | `category` | whether the link means part-of. No CityGML artifact states this — not the XSD, not the conceptual model, not an OWL rendering — so it is asserted by whoever builds the package. NULL is a real value meaning *unclassified*, reported by `validate_report()` |
+| `usap_city_object_relationship` | `to_external_uri` | an xlink target outside the package. The link is a genuine typed statement even though its target is not here; dropping it is how an xlink-serialized CityGML file used to import as unrelated roots |
+| `usap_city_object_relationship` | `role` | `grp:Role.role`, the only role qualifier in CityGML 3.0. Never derived from the target's class, which would only restate `usap_city_object.semantic_class_id` |
 
 **Primary-object invariant.** An annotation's primary city object is recorded twice: in `usap_annotation.primary_city_object_id` and as a `represents` row in `usap_annotation_object`. When the column is not NULL, the matching `represents` row must exist. `create_annotation` and `update_annotation` maintain both together; `validate_report()` reports a disagreement as `ANNOTATION_PRIMARY_OBJECT_LINK_MISSING`. Additional `usap_annotation_object` rows (other objects, other `relation_type`s) are free-form and are not constrained by this invariant.
 
@@ -147,8 +158,11 @@ Fast-lookup structures on non-primary-key columns:
 | Index | On table | Column(s) |
 |-------|----------|-----------|
 | `usap_scc_by_descendant` | `usap_semantic_class_closure` | `descendant_class_id` |
-| `usap_rel_by_parent_graph` | `usap_city_object_relationship` | `graph_name, parent_city_object_id, relationship_type` |
-| `usap_rel_by_child_graph` | `usap_city_object_relationship` | `graph_name, child_city_object_id, relationship_type` |
+| `usap_rel_by_from_graph` | `usap_city_object_relationship` | `graph_name, from_city_object_id, relationship_type_id` |
+| `usap_rel_by_to_graph` | `usap_city_object_relationship` | `graph_name, to_city_object_id, relationship_type_id` |
+| `usap_rel_unresolved` | `usap_city_object_relationship` | `to_external_uri` **(partial:** `WHERE to_external_uri IS NOT NULL`**)** |
+| `usap_relationship_type_identity` | `usap_relationship_type` | `local_name, COALESCE(code_space, '')` **(unique, expression)** |
+| `usap_relationship_type_by_category` | `usap_relationship_type` | `category` |
 | `usap_annotation_by_class` | `usap_annotation` | `semantic_class_id` |
 | `usap_mb_by_element_block` | `usap_membership_block` | `asset_part_id, element_kind, block_start` |
 | `usap_vb_by_part` | `usap_value_block` | `asset_part_id, element_kind` |

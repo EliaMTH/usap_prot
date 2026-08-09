@@ -31,6 +31,7 @@ from .adapters import (
     CityGMLImportResult,
     ImportedCityObject,
     ImportedRelationship,
+    UnresolvedTarget,
     LASRegistrationResult,
     MeshPartRegistration,
     MeshRegistrationResult,
@@ -40,8 +41,11 @@ from .adapters import (
 )
 from .domain_vocab import (
     VocabularyResult,
+    city_object_classes,
+    is_city_object_class,
+    load_citygml_schema,
+    load_ontology,
     seed_default_ade_vocabulary,
-    seed_default_citygml_vocabulary,
     seed_vocabulary_file,
 )
 from .batch import (
@@ -90,12 +94,16 @@ __all__ = [
     "CityGMLImportResult",
     "ImportedCityObject",
     "ImportedRelationship",
+    "UnresolvedTarget",
     "import_citygml_semantics",
     "MeshPartRegistration",
     "MeshRegistrationResult",
     "register_mesh_asset",
     "seed_default_ade_vocabulary",
-    "seed_default_citygml_vocabulary",
+    "city_object_classes",
+    "is_city_object_class",
+    "load_citygml_schema",
+    "load_ontology",
     "seed_vocabulary_file",
     "BatchAnnotationResult",
     "BatchImportResult",

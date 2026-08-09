@@ -7,7 +7,7 @@ from usap import (
     ELEMENT_KIND_POINT,
     USAPPackage,
     register_las_asset,
-    seed_default_citygml_vocabulary,
+    load_citygml_schema,
     seed_default_ade_vocabulary,
 )
 
@@ -23,13 +23,26 @@ def main() -> None:
         default="prototype_las.usap.gpkg",
     )
 
+    parser.add_argument(
+        "--citygml-schema",
+        required=True,
+        help=(
+            "Path to the OGC CityGML 3.0 XSDs (a directory or a single .xsd). "
+            "USAP ships no CityGML vocabulary: concepts are read from the "
+            "schema you supply. Get them from "
+            "schemas.opengis.net/citygml/citygml-3_0_0.zip."
+        ),
+    )
+
     args = parser.parse_args()
 
     with USAPPackage.create(
         args.db,
         overwrite=True,
     ) as pkg:
-        citygml_classes = seed_default_citygml_vocabulary(pkg)
+        citygml_classes = load_citygml_schema(
+            pkg, args.citygml_schema, scheme_version="3.0"
+        )
         ade_classes = seed_default_ade_vocabulary(pkg)
 
         las = register_las_asset(pkg, args.las_path)

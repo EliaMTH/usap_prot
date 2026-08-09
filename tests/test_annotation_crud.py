@@ -5,14 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from conftest import assert_package_valid, make_mesh_part, make_pkg
+from conftest import assert_package_valid, make_mesh_part, make_pkg, seed_citygml_concepts
 from conftest import write_tiny_mesh as _write_tiny_mesh
 from usap import (
     ELEMENT_KIND_FACE,
     USAPError,
     USAPPackage,
     register_mesh_asset,
-    seed_default_citygml_vocabulary,
     seed_default_ade_vocabulary,
 )
 
@@ -24,7 +23,7 @@ def test_get_and_update_annotation(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        classes = seed_default_citygml_vocabulary(pkg)
+        classes = seed_citygml_concepts(pkg)
 
         building_id = pkg.create_city_object(
             object_uid="building_1",
@@ -39,9 +38,10 @@ def test_get_and_update_annotation(tmp_path: Path) -> None:
         )
 
         pkg.link_city_objects(
-            parent_city_object_id=building_id,
-            child_city_object_id=roof_id,
-            relationship_type="boundedBy",
+            building_id,
+            roof_id,
+            "boundedBy",
+            category="containment",
             role="roof",
             graph_name="usap_default",
         )
@@ -120,7 +120,7 @@ def test_list_annotations_with_filters(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        classes = seed_default_citygml_vocabulary(pkg)
+        classes = seed_citygml_concepts(pkg)
         ade = seed_default_ade_vocabulary(pkg)
 
         roof_object_id = pkg.create_city_object(
@@ -181,7 +181,7 @@ def test_delete_annotation_cascades_membership(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        classes = seed_default_citygml_vocabulary(pkg)
+        classes = seed_citygml_concepts(pkg)
 
         mesh = register_mesh_asset(
             pkg,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from conftest import write_tiny_las as _write_tiny_las, write_tiny_mesh as _write_tiny_mesh
+from conftest import seed_citygml_concepts, write_tiny_las as _write_tiny_las, write_tiny_mesh as _write_tiny_mesh
 from usap import (
     ELEMENT_KIND_FACE,
     ELEMENT_KIND_POINT,
@@ -17,21 +17,22 @@ from usap import (
 
 TINY_CITYGML = """<?xml version="1.0" encoding="UTF-8"?>
 <core:CityModel
-    xmlns:core="http://www.opengis.net/citygml/2.0"
-    xmlns:gml="http://www.opengis.net/gml"
-    xmlns:bldg="http://www.opengis.net/citygml/building/2.0">
+    xmlns:core="http://www.opengis.net/citygml/3.0"
+    xmlns:gml="http://www.opengis.net/gml/3.2"
+    xmlns:con="http://www.opengis.net/citygml/construction/3.0"
+    xmlns:bldg="http://www.opengis.net/citygml/building/3.0">
   <core:cityObjectMember>
     <bldg:Building gml:id="building_1">
-      <bldg:boundedBy>
-        <bldg:RoofSurface gml:id="building_1_roof_1"/>
-      </bldg:boundedBy>
-      <bldg:boundedBy>
-        <bldg:WallSurface gml:id="building_1_wall_1">
-          <bldg:opening>
-            <bldg:Window gml:id="building_1_window_1"/>
-          </bldg:opening>
-        </bldg:WallSurface>
-      </bldg:boundedBy>
+      <core:boundary>
+        <con:RoofSurface gml:id="building_1_roof_1"/>
+      </core:boundary>
+      <core:boundary>
+        <con:WallSurface gml:id="building_1_wall_1">
+          <con:fillingSurface>
+            <con:WindowSurface gml:id="building_1_window_1"/>
+          </con:fillingSurface>
+        </con:WallSurface>
+      </core:boundary>
     </bldg:Building>
   </core:cityObjectMember>
 </core:CityModel>
@@ -52,6 +53,7 @@ def test_integrated_citygml_las_mesh_ade_annotation(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
+        seed_citygml_concepts(pkg)
         citygml = import_citygml_semantics(pkg, citygml_path)
         las = register_las_asset(pkg, las_path)
 

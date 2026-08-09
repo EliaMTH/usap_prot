@@ -13,10 +13,13 @@ import usap
 ## Examples
 
 ```python
-from usap import USAPPackage, register_mesh_asset, seed_default_citygml_vocabulary
+from usap import USAPPackage, load_citygml_schema, register_mesh_asset
 
 with USAPPackage.create("area.usap.gpkg", overwrite=True) as pkg:   # or .open(path)
-    seed_default_citygml_vocabulary(pkg)                 # register accepted concepts
+    # USAP ships no CityGML vocabulary. Concepts are read from the OGC
+    # schemas you supply, so the package asserts nothing of its own about
+    # what CityGML contains.
+    load_citygml_schema(pkg, "citygml-3.0-schemas/")
     mesh = register_mesh_asset(pkg, "area.obj", representation_name="lod2")
     ann = pkg.annotate_elements(                         # create an annotation
         concept="RoofSurface",
@@ -43,7 +46,12 @@ Every list returns `list[dict]`; every getter returns a `dict` (or `None`).
 |---|---|
 | `pkg.list_assets(asset_kind=None)` | registered assets + part/element counts |
 | `pkg.list_asset_parts(asset_id=None)` | the index spaces of an asset |
-| `pkg.list_city_objects(object_status=None, parent_object=None, ...)` | object list / tree (`parent_object` = expand a node to its direct children; `object_status="temporary"` = carrier objects) |
+| `pkg.list_city_objects(object_status=None, related_to=None, descendants_of=None, direction="out", ...)` | object list / graph walk (`related_to` = expand a node one hop, `descendants_of` = it and its parts, `direction` = `out`/`in`/`both`; `object_status="temporary"` = carrier objects) |
+| `pkg.related_city_objects(uid, direction="out", ...)` | the **edges** touching an object, with link type, code space, category and role — the only view that shows a target outside the package |
+| `pkg.list_relationship_types(category=None)` | the link vocabulary + edge counts; `category=None` also lists unclassified types |
+| `pkg.register_relationship_type(name, code_space=..., category=...)` | classify a link type (what an ontology supplies) |
+| `pkg.load_citygml_schema(path)` | register concepts and their hierarchy from the OGC XSDs |
+| `load_ontology(pkg, path)` | register link types, their categories, and ADE classes from an RDF/XML ontology |
 | `pkg.list_accepted_concepts(scheme=None, search=None, in_use=None)` | the vocabulary picker |
 | `pkg.list_annotations(status=None, city_object_uid=None, limit=None, ...)` | annotation list (filters AND-combined) |
 | `pkg.get_annotation(annotation_id \| annotation_uid=...)` | one annotation + its membership/value summary |
@@ -73,4 +81,6 @@ pkg.delete_annotation(ann_id)                                     # cascades its
 
 Python ≥ 3.11; `pip install -e .`
 
-Dependencies: `numpy`, `laspy`, `lxml`, `trimesh`.
+Dependencies: `numpy`, `laspy`, `lxml`, `trimesh`, `pyroaring`.
+
+USAP supplies no CityGML vocabulary of its own. An import needs two inputs from you: the OGC CityGML 3.0 **XSDs** (`load_citygml_schema`) for the concepts and their hierarchy, and a statement of which link types mean *part of* (`load_ontology`, `register_relationship_type`, or a project-config `relationship_types` block). Without the second, edges are still recorded and queryable by name, but nothing is reported as a part and `validate_report()` warns `UNCLASSIFIED_RELATIONSHIP_TYPE`.

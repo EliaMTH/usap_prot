@@ -12,7 +12,6 @@ from .constants import (
     ANNOTATION_STATUSES,
     CITY_OBJECT_STATUSES,
     CONFIDENCE_RANGE,
-    CONTAINMENT_RELATIONSHIP_TYPES,
     DEFAULT_ENCODING,
     VALUE_DTYPES,
 )
@@ -158,6 +157,7 @@ def validate_connection(
         _validate_value_blocks(conn, report, decode_payloads=deep)
         _validate_semantic_class_closure(conn, report)
         _validate_city_object_relationships(conn, report)
+        _validate_relationship_types(conn, report)
 
         if deep:
             _validate_asset_extents(conn, report)
@@ -254,6 +254,88 @@ def _validate_semantic_class_registry(
             },
         )
 
+def _validate_relationship_types(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    """
+    Report link types in use that no ontology has classified, and edges whose
+    target is not in this package.
+
+    Both are warnings, and both exist so that an accepted consequence of the
+    design stays *visible*. USAP ships no link vocabulary: an import registers
+    whatever types the document uses, and until something supplies a category
+    those edges are stored and queryable by name but sit outside the default
+    "and its parts" traversal. That must be reported, never silent — a
+    descendants query quietly returning the root alone is the failure mode this
+    check exists to prevent.
+    """
+    unclassified = conn.execute(
+        """
+        SELECT
+            rt.local_name,
+            rt.code_space,
+            COUNT(*) AS n
+        FROM usap_city_object_relationship AS r
+        JOIN usap_relationship_type AS rt
+            ON rt.relationship_type_id = r.relationship_type_id
+        WHERE rt.category IS NULL
+        GROUP BY rt.relationship_type_id
+        ORDER BY rt.local_name
+        """
+    ).fetchall()
+
+    for row in unclassified:
+        report.add(
+            severity="warning",
+            code="UNCLASSIFIED_RELATIONSHIP_TYPE",
+            message=(
+                "Relationship type has no category, so its edges are stored "
+                "but not followed by the default traversal."
+            ),
+            table="usap_relationship_type",
+            details={
+                "local_name": row["local_name"],
+                "code_space": row["code_space"],
+                "edge_count": int(row["n"]),
+            },
+        )
+
+    unresolved = conn.execute(
+        """
+        SELECT to_external_uri
+        FROM usap_city_object_relationship
+        WHERE to_external_uri IS NOT NULL
+        ORDER BY to_external_uri
+        LIMIT 5
+        """
+    ).fetchall()
+
+    if unresolved:
+        total = _count(
+            conn,
+            """
+            SELECT COUNT(*) AS n
+            FROM usap_city_object_relationship
+            WHERE to_external_uri IS NOT NULL
+            """,
+        )
+
+        report.add(
+            severity="warning",
+            code="UNRESOLVED_RELATIONSHIP_TARGET",
+            message=(
+                "Relationship target is outside this package; the link is "
+                "recorded but its target cannot be dereferenced here."
+            ),
+            table="usap_city_object_relationship",
+            details={
+                "count": total,
+                "sample": [row["to_external_uri"] for row in unresolved],
+            },
+        )
+
+
 def _validate_city_object_relationships(
     conn: sqlite3.Connection,
     report: ValidationReport,
@@ -268,19 +350,24 @@ def _validate_city_object_relationships(
     rows = conn.execute(
         """
         SELECT
-            graph_name,
-            parent_city_object_id,
-            child_city_object_id,
-            relationship_type,
+            r.graph_name,
+            r.from_city_object_id,
+            r.to_city_object_id,
+            r.to_external_uri,
+            rt.local_name AS relationship_type,
+            rt.code_space,
             COUNT(*) AS n
-        FROM usap_city_object_relationship
+        FROM usap_city_object_relationship AS r
+        JOIN usap_relationship_type AS rt
+            ON rt.relationship_type_id = r.relationship_type_id
         GROUP BY
-            graph_name,
-            parent_city_object_id,
-            child_city_object_id,
-            relationship_type,
-            role,
-            source_relation_id
+            r.graph_name,
+            r.from_city_object_id,
+            r.to_city_object_id,
+            r.to_external_uri,
+            r.relationship_type_id,
+            r.role,
+            r.source_relation_id
         HAVING COUNT(*) > 1
         """
     ).fetchall()
@@ -293,9 +380,17 @@ def _validate_city_object_relationships(
             table="usap_city_object_relationship",
             details={
                 "graph_name": row["graph_name"],
-                "parent_city_object_id": int(row["parent_city_object_id"]),
-                "child_city_object_id": int(row["child_city_object_id"]),
+                "from_city_object_id": int(row["from_city_object_id"]),
+                "to_city_object_id": (
+                    int(row["to_city_object_id"])
+                    if row["to_city_object_id"] is not None
+                    else None
+                ),
+                "to_external_uri": row["to_external_uri"],
+                # Joined back to a name: the stored column is an id, and a
+                # report that printed it would be unreadable.
                 "relationship_type": row["relationship_type"],
+                "code_space": row["code_space"],
                 "count": int(row["n"]),
             },
         )
@@ -439,28 +534,44 @@ def _validate_orphans(conn: sqlite3.Connection, report: ValidationReport) -> Non
             "Annotation-object link references a missing city object.",
         ),
         (
-            "ORPHAN_RELATIONSHIP_PARENT",
+            "ORPHAN_RELATIONSHIP_FROM",
             "usap_city_object_relationship",
             """
             SELECT COUNT(*) AS n
             FROM usap_city_object_relationship AS r
             LEFT JOIN usap_city_object AS co
-                ON co.city_object_id = r.parent_city_object_id
+                ON co.city_object_id = r.from_city_object_id
             WHERE co.city_object_id IS NULL
             """,
-            "City-object relationship references a missing parent object.",
+            "City-object relationship references a missing source object.",
         ),
         (
-            "ORPHAN_RELATIONSHIP_CHILD",
+            # The IS NOT NULL guard is load-bearing: an edge whose target is
+            # an external URI legitimately has no to_city_object_id, and
+            # without it every xlink-carrying package reports as invalid.
+            "ORPHAN_RELATIONSHIP_TO",
             "usap_city_object_relationship",
             """
             SELECT COUNT(*) AS n
             FROM usap_city_object_relationship AS r
             LEFT JOIN usap_city_object AS co
-                ON co.city_object_id = r.child_city_object_id
-            WHERE co.city_object_id IS NULL
+                ON co.city_object_id = r.to_city_object_id
+            WHERE r.to_city_object_id IS NOT NULL
+              AND co.city_object_id IS NULL
             """,
-            "City-object relationship references a missing child object.",
+            "City-object relationship references a missing target object.",
+        ),
+        (
+            "ORPHAN_RELATIONSHIP_TYPE",
+            "usap_city_object_relationship",
+            """
+            SELECT COUNT(*) AS n
+            FROM usap_city_object_relationship AS r
+            LEFT JOIN usap_relationship_type AS rt
+                ON rt.relationship_type_id = r.relationship_type_id
+            WHERE rt.relationship_type_id IS NULL
+            """,
+            "City-object relationship references a missing relationship type.",
         ),
     ]
 
@@ -1224,28 +1335,33 @@ def _validate_city_object_graph(
     one (the recursive CTE deduplicates), but the package is stating something
     it cannot mean, so it is an error rather than a silent oddity.
 
-    Only CONTAINMENT_RELATIONSHIP_TYPES edges are checked — the graph is typed,
-    and a cycle of adjacentTo edges is perfectly legitimate.
-    """
-    placeholders = ",".join("?" for _ in CONTAINMENT_RELATIONSHIP_TYPES)
+    Only containment edges are checked — the graph is typed, and a cycle of
+    peer edges (adjacentTo, predecessor/successor) is perfectly legitimate.
+    An unclassified type is not containment and is reported separately by
+    _validate_relationship_types, so it is skipped rather than assumed.
 
+    Edges that leave the document are excluded: an external URI is not a node
+    and cannot take part in a cycle within this package.
+    """
     rows = conn.execute(
-        f"""
+        """
         SELECT
-            graph_name,
-            parent_city_object_id,
-            child_city_object_id
-        FROM usap_city_object_relationship
-        WHERE relationship_type IN ({placeholders})
-        """,
-        CONTAINMENT_RELATIONSHIP_TYPES,
+            r.graph_name,
+            r.from_city_object_id,
+            r.to_city_object_id
+        FROM usap_city_object_relationship AS r
+        JOIN usap_relationship_type AS rt
+            ON rt.relationship_type_id = r.relationship_type_id
+        WHERE rt.category = 'containment'
+          AND r.to_city_object_id IS NOT NULL
+        """
     ).fetchall()
 
     edges_by_graph: dict[str, list[tuple[int, int]]] = {}
 
     for row in rows:
         edges_by_graph.setdefault(row["graph_name"], []).append(
-            (int(row["parent_city_object_id"]), int(row["child_city_object_id"]))
+            (int(row["from_city_object_id"]), int(row["to_city_object_id"]))
         )
 
     for graph_name, edges in sorted(edges_by_graph.items()):

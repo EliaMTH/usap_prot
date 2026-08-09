@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 
+from conftest import seed_citygml_concepts
 from usap import (
     USAPAmbiguityError,
     USAPError,
     USAPPackage,
-    seed_default_citygml_vocabulary,
     seed_default_ade_vocabulary,
 )
 
@@ -20,7 +20,7 @@ def test_vocabulary_seeding_is_idempotent(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        first_citygml = seed_default_citygml_vocabulary(pkg)
+        first_citygml = seed_citygml_concepts(pkg)
         first_ade = seed_default_ade_vocabulary(pkg)
 
         count_after_first = pkg.conn.execute(
@@ -30,7 +30,7 @@ def test_vocabulary_seeding_is_idempotent(tmp_path: Path) -> None:
             """
         ).fetchone()["n"]
 
-        second_citygml = seed_default_citygml_vocabulary(pkg)
+        second_citygml = seed_citygml_concepts(pkg)
         second_ade = seed_default_ade_vocabulary(pkg)
 
         count_after_second = pkg.conn.execute(
@@ -63,7 +63,7 @@ def test_list_accepted_concepts(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        seed_default_citygml_vocabulary(pkg)
+        seed_citygml_concepts(pkg)
         seed_default_ade_vocabulary(pkg)
 
         all_concepts = pkg.list_accepted_concepts()
@@ -96,7 +96,7 @@ def test_get_semantic_class_and_concept_exists(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        seed_default_citygml_vocabulary(pkg)
+        seed_citygml_concepts(pkg)
         seed_default_ade_vocabulary(pkg)
 
         roof = pkg.get_semantic_class("RoofSurface")
@@ -122,7 +122,7 @@ def test_unknown_concept_fails_loudly(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        seed_default_citygml_vocabulary(pkg)
+        seed_citygml_concepts(pkg)
 
         with pytest.raises(USAPError, match="not found"):
             pkg.resolve_semantic_class("NotRegistered")
@@ -148,7 +148,7 @@ def test_ambiguous_local_name_requires_scheme_or_uri(tmp_path: Path) -> None:
         citygml_roof = pkg.create_semantic_class(
             scheme="citygml",
             scheme_version="3.0",
-            class_uri="citygml-3.0:building:Roof",
+            class_uri="http://www.opengis.net/citygml/construction/3.0#Roof",
             local_name="Roof",
             is_ade=False,
         )

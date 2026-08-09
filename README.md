@@ -30,7 +30,7 @@ A `*.usap.gpkg` file stores, for one study area:
 - an optional link to the authoritative **city-object instance** represented or concerned by the claim;
 - editable **annotation records** with label, status, confidence, and claim-level attributes such as method, source, and timestamps;
 - optional **per-element value fields**, stored as compressed typed blocks and queryable by value;
-- a lightweight mirror of **city-object identity** and a typed **relationship graph** used to retrieve annotations across an object and its parts.
+- a lightweight mirror of **city-object identity** and a typed, directed **relationship graph** used to retrieve annotations across an object and its parts, or across whatever else the source says it relates to.
 
 The division of authority is deliberate:
 
@@ -79,9 +79,13 @@ annotation: ann_energy_roof_001
 ---
 ## Concepts & vocabularies
 
-A new package starts with **zero concepts** and enforces no taxonomy of its own. It accepts only vocabulary explicitly seeded into it: a thin JSON concept registry derived from an external scheme, or a minimal local scheme when no ontology is available. Every annotation references exactly one registered concept.
+A new package starts with **zero concepts** and enforces no taxonomy of its own. Every annotation references exactly one registered concept, and every concept comes from a source you supply.
 
-Example registries ship with the package — a CityGML 3.0 MVP subset, an ADE prototype, and a minimal local scheme. They are starting points to seed or replace, not a built-in taxonomy.
+For CityGML that source is the **OGC schemas themselves**: `load_citygml_schema()` reads each element's namespace and its `substitutionGroup`, so both the classes and their hierarchy are the normative ones rather than a transcription. For anything without a schema — an ADE, a local scheme for exploratory work — a thin JSON concept registry does the same job.
+
+USAP deliberately ships **no CityGML vocabulary**. It used to, and the file accumulated exactly the errors a hand-written one accumulates: surfaces filed under the wrong module, a class parented to the wrong supertype, a class that exists only in CityGML 2.0. Two example registries do ship — an ADE prototype and a minimal local scheme — as starting points to seed or replace, not as a taxonomy.
+
+The same holds for **link types**. Which CityGML property means "part of" is stated in no CityGML artifact — not the XSD, not the conceptual model, not an OWL rendering — so USAP does not assert it either. The package builder does, and until they do, an imported edge is stored and queryable by name but is not reported as a part.
 
 ## Per-element value fields
 
@@ -120,7 +124,7 @@ What is already in place are the parts that could not be added afterwards withou
 
 - **Once processed, 3D assets are supposed to be immutable.** An annotation is bound to one immutable version of an external file. LAS point order and mesh face order are not guaranteed to survive reprojection, re-tiling, thinning, remeshing, re-export, or conversion to COPC, which reorders points by design. USAP records a content hash to detect that a file changed, but it cannot rebind annotations.
 - **Membership is stored as roaring bitmaps**, in blocks of 16384 elements, using CRoaring's portable serialization. The payload is therefore readable by Java, Go, C++, Rust, and other compatible roaring implementations rather than being a private Python blob. Block width is a deliberate compromise: wider blocks usually compress better, while narrower blocks give the reverse query more precise pruning.
-- **Trusted inputs only.** Nothing here is hardened against hostile files. A CityGML document is parsed as a full tree in memory, and an arbitrary SQLite file is refused only by a profile check. Compressed payloads are bounded on decode, but treat a `.usap.gpkg` from a third party as you would any other untrusted file.
+- **Trusted inputs only.** Nothing here is hardened against hostile files. A CityGML document is parsed as a full tree in memory and walked twice, and an arbitrary SQLite file is refused only by a profile check. Compressed payloads are bounded on decode, but treat a `.usap.gpkg` from a third party as you would any other untrusted file.
 - **GIS tools see a summary, not the complete annotation model.** A `.usap.gpkg` opens in QGIS/GDAL as a real GeoPackage: three read-only attribute layers (annotations, concepts, city objects) and one feature layer drawing a derived 2D bounding box per registered asset. Fine-grained memberships and value fields still require the SDK, and USAP is not a registered OGC extension.
 
 ---

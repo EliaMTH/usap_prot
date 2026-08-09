@@ -16,6 +16,7 @@ import pytest
 from conftest import (
     assert_package_valid,
     make_pkg,
+    seed_citygml_concepts,
     write_tiny_las as _write_tiny_las,
     write_tiny_mesh as _write_tiny_mesh,
 )
@@ -26,7 +27,6 @@ from usap import (
     USAPPackage,
     register_las_asset,
     register_mesh_asset,
-    seed_default_citygml_vocabulary,
 )
 
 
@@ -89,7 +89,7 @@ def test_register_asset_and_annotate_elements(
     selected: list[int],
 ) -> None:
     with make_pkg(tmp_path) as pkg:
-        classes = seed_default_citygml_vocabulary(pkg)
+        classes = seed_citygml_concepts(pkg)
 
         part_id, element_kind = register(pkg, tmp_path)
 

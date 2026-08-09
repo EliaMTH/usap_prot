@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Test fixture: subset of the OGC CityGML 3.0 construction schema.
+
+  The thematic surfaces live HERE, not in building — that relocation is one of
+  the errors the deleted hand-written registry carried. Window and Door are
+  AbstractFillingElement (occupied spaces); WindowSurface and DoorSurface are
+  the AbstractFillingSurface boundaries. The old registry conflated the two.
+-->
+<schema xmlns="http://www.w3.org/2001/XMLSchema"
+        xmlns:con="http://www.opengis.net/citygml/construction/3.0"
+        xmlns:core="http://www.opengis.net/citygml/3.0"
+        elementFormDefault="qualified"
+        targetNamespace="http://www.opengis.net/citygml/construction/3.0"
+        version="3.0.0">
+
+  <import namespace="http://www.opengis.net/citygml/3.0" schemaLocation="core.xsd"/>
+
+  <element abstract="true" name="AbstractConstruction" substitutionGroup="core:AbstractOccupiedSpace" type="anyType"/>
+  <element abstract="true" name="AbstractConstructiveElement" substitutionGroup="core:AbstractOccupiedSpace" type="anyType"/>
+  <element abstract="true" name="AbstractConstructionSurface" substitutionGroup="core:AbstractThematicSurface" type="anyType"/>
+  <element abstract="true" name="AbstractFillingSurface" substitutionGroup="core:AbstractThematicSurface" type="anyType"/>
+  <element abstract="true" name="AbstractFillingElement" substitutionGroup="core:AbstractOccupiedSpace" type="anyType"/>
+  <element abstract="true" name="AbstractFurniture" substitutionGroup="core:AbstractOccupiedSpace" type="anyType"/>
+  <element abstract="true" name="AbstractInstallation" substitutionGroup="core:AbstractOccupiedSpace" type="anyType"/>
+
+  <element name="RoofSurface" substitutionGroup="con:AbstractConstructionSurface" type="anyType"/>
+  <element name="WallSurface" substitutionGroup="con:AbstractConstructionSurface" type="anyType"/>
+  <element name="GroundSurface" substitutionGroup="con:AbstractConstructionSurface" type="anyType"/>
+  <element name="CeilingSurface" substitutionGroup="con:AbstractConstructionSurface" type="anyType"/>
+  <element name="FloorSurface" substitutionGroup="con:AbstractConstructionSurface" type="anyType"/>
+  <element name="InteriorWallSurface" substitutionGroup="con:AbstractConstructionSurface" type="anyType"/>
+  <element name="OuterCeilingSurface" substitutionGroup="con:AbstractConstructionSurface" type="anyType"/>
+  <element name="OuterFloorSurface" substitutionGroup="con:AbstractConstructionSurface" type="anyType"/>
+  <element name="OtherConstruction" substitutionGroup="con:AbstractConstruction" type="anyType"/>
+
+  <element name="Window" substitutionGroup="con:AbstractFillingElement" type="anyType"/>
+  <element name="Door" substitutionGroup="con:AbstractFillingElement" type="anyType"/>
+  <element name="WindowSurface" substitutionGroup="con:AbstractFillingSurface" type="anyType"/>
+  <element name="DoorSurface" substitutionGroup="con:AbstractFillingSurface" type="anyType"/>
+</schema>

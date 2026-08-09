@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Test fixture: a faithful SUBSET of the OGC CityGML 3.0 core schema.
+
+  USAP ships no CityGML vocabulary, so the suite needs a schema of its own
+  rather than the full OGC distribution (which is ~500 KB and not vendored).
+  Every element name, namespace and substitutionGroup here is copied verbatim
+  from schemas.opengis.net/citygml/citygml-3_0_0.zip — the subset is smaller
+  than the real thing, never different from it, so a test that passes against
+  this fixture is exercising real CityGML structure.
+
+  Split across three module files on purpose: cross-module substitution
+  (con:RoofSurface -> core:AbstractThematicSurface) is exactly what the old
+  hand-written registry got wrong.
+-->
+<schema xmlns="http://www.w3.org/2001/XMLSchema"
+        xmlns:core="http://www.opengis.net/citygml/3.0"
+        xmlns:gml="http://www.opengis.net/gml/3.2"
+        elementFormDefault="qualified"
+        targetNamespace="http://www.opengis.net/citygml/3.0"
+        version="3.0.0">
+
+  <!-- The chain out of CityGML. core:AbstractFeature substitutes
+       gml:AbstractFeature, whose namespace is not a CityGML one, so the
+       hierarchy terminates here with a NULL parent. -->
+  <element abstract="true" name="AbstractFeature" substitutionGroup="gml:AbstractFeature" type="anyType"/>
+  <element abstract="true" name="AbstractFeatureWithLifespan" substitutionGroup="core:AbstractFeature" type="anyType"/>
+
+  <element abstract="true" name="AbstractCityObject" substitutionGroup="core:AbstractFeatureWithLifespan" type="anyType"/>
+
+  <!-- Space / space-boundary split, new in 3.0 and absent from the registry
+       this fixture replaces. -->
+  <element abstract="true" name="AbstractSpace" substitutionGroup="core:AbstractCityObject" type="anyType"/>
+  <element abstract="true" name="AbstractPhysicalSpace" substitutionGroup="core:AbstractSpace" type="anyType"/>
+  <element abstract="true" name="AbstractOccupiedSpace" substitutionGroup="core:AbstractPhysicalSpace" type="anyType"/>
+  <element abstract="true" name="AbstractUnoccupiedSpace" substitutionGroup="core:AbstractPhysicalSpace" type="anyType"/>
+  <element abstract="true" name="AbstractLogicalSpace" substitutionGroup="core:AbstractSpace" type="anyType"/>
+
+  <element abstract="true" name="AbstractSpaceBoundary" substitutionGroup="core:AbstractCityObject" type="anyType"/>
+  <element abstract="true" name="AbstractThematicSurface" substitutionGroup="core:AbstractSpaceBoundary" type="anyType"/>
+
+  <!-- ClosureSurface lives in core in 3.0, not in building. -->
+  <element name="ClosureSurface" substitutionGroup="core:AbstractThematicSurface" type="anyType"/>
+
+  <!-- Deliberately NOT city objects: both substitute gml:AbstractGML, so
+       is_city_object_class must reject them even though they are real
+       CityGML classes. CityObjectRelation is the objectified relation. -->
+  <element name="CityModel" substitutionGroup="core:AbstractFeatureWithLifespan" type="anyType"/>
+  <element name="CityObjectRelation" substitutionGroup="gml:AbstractGML" type="anyType"/>
+  <element name="Address" substitutionGroup="core:AbstractFeature" type="anyType"/>
+</schema>

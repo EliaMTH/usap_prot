@@ -44,6 +44,7 @@ USAP_EXTENSION_TABLES = [
     "usap_semantic_class",
     "usap_semantic_class_closure",
     "usap_city_object",
+    "usap_relationship_type",
     "usap_city_object_relationship",
     "usap_annotation",
     "usap_annotation_object",

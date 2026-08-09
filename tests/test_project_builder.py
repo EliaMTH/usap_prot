@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from conftest import CITYGML_SCHEMA_FIXTURE
 from conftest import write_tiny_las as _write_tiny_las, write_tiny_mesh as _write_tiny_mesh
 from usap import (
+    USAPError,
     USAPPackage,
     build_project_package,
     build_project_package_from_file,
@@ -15,21 +17,22 @@ from usap import (
 
 TINY_CITYGML = """<?xml version="1.0" encoding="UTF-8"?>
 <core:CityModel
-    xmlns:core="http://www.opengis.net/citygml/2.0"
-    xmlns:gml="http://www.opengis.net/gml"
-    xmlns:bldg="http://www.opengis.net/citygml/building/2.0">
+    xmlns:core="http://www.opengis.net/citygml/3.0"
+    xmlns:gml="http://www.opengis.net/gml/3.2"
+    xmlns:con="http://www.opengis.net/citygml/construction/3.0"
+    xmlns:bldg="http://www.opengis.net/citygml/building/3.0">
   <core:cityObjectMember>
     <bldg:Building gml:id="building_1">
-      <bldg:boundedBy>
-        <bldg:RoofSurface gml:id="building_1_roof_1"/>
-      </bldg:boundedBy>
-      <bldg:boundedBy>
-        <bldg:WallSurface gml:id="building_1_wall_1">
-          <bldg:opening>
-            <bldg:Window gml:id="building_1_window_1"/>
-          </bldg:opening>
-        </bldg:WallSurface>
-      </bldg:boundedBy>
+      <core:boundary>
+        <con:RoofSurface gml:id="building_1_roof_1"/>
+      </core:boundary>
+      <core:boundary>
+        <con:WallSurface gml:id="building_1_wall_1">
+          <con:fillingSurface>
+            <con:WindowSurface gml:id="building_1_window_1"/>
+          </con:fillingSurface>
+        </con:WallSurface>
+      </core:boundary>
     </bldg:Building>
   </core:cityObjectMember>
 </core:CityModel>
@@ -60,10 +63,9 @@ def test_build_project_package_from_config(tmp_path: Path) -> None:
         "manifest_path": str(manifest_path),
         # No "schema_path"/"vocabularies": both default to the files shipped
         # inside the package, which is what a normal install has.
+        "citygml_schema": str(CITYGML_SCHEMA_FIXTURE),
         "citygml": {
             "path": str(citygml_path),
-            "graph_name": "citygml_import",
-            "also_usap_default": True
         },
         "las": [
             {
@@ -160,6 +162,7 @@ def test_failed_build_leaves_no_package(tmp_path: Path) -> None:
 
     config = {
         "db_path": str(db_path),
+        "citygml_schema": str(CITYGML_SCHEMA_FIXTURE),
         "citygml": {"path": str(citygml_path)},
         "meshes": [
             {
@@ -195,6 +198,7 @@ def test_failed_update_leaves_the_previous_package_intact(tmp_path: Path) -> Non
 
     config = {
         "db_path": str(db_path),
+        "citygml_schema": str(CITYGML_SCHEMA_FIXTURE),
         "citygml": {"path": str(citygml_path)},
         "las": [{"path": str(las_path)}],
     }
@@ -228,3 +232,23 @@ def test_failed_update_leaves_the_previous_package_intact(tmp_path: Path) -> Non
 
         assert after == before
         assert pkg.validate_report().is_ok
+
+
+def test_removed_mirror_key_is_refused_not_ignored(tmp_path: Path) -> None:
+    # 'also_usap_default' switched off a mirror that no longer exists: the
+    # import writes one graph now. Ignoring the key would leave the config
+    # file asserting behaviour the build does not perform.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    citygml_path = data_dir / "tiny_city.gml"
+    citygml_path.write_text(TINY_CITYGML, encoding="utf-8")
+
+    config = {
+        "db_path": str(tmp_path / "mirror.usap.gpkg"),
+        "citygml_schema": str(CITYGML_SCHEMA_FIXTURE),
+        "citygml": {"path": str(citygml_path), "also_usap_default": True},
+    }
+
+    with pytest.raises(USAPError, match="also_usap_default"):
+        build_project_package(config, base_dir=tmp_path)

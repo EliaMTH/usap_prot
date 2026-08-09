@@ -2,12 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from conftest import write_tiny_mesh as _write_tiny_mesh
+from conftest import seed_citygml_concepts, write_tiny_mesh as _write_tiny_mesh
 from usap import (
     ELEMENT_KIND_FACE,
     USAPPackage,
     register_mesh_asset,
-    seed_default_citygml_vocabulary,
     seed_default_ade_vocabulary,
 )
 
@@ -27,7 +26,7 @@ def test_annotate_elements_with_citygml_concept(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        seed_default_citygml_vocabulary(pkg)
+        seed_citygml_concepts(pkg)
 
         mesh = register_mesh_asset(
             pkg,
@@ -74,7 +73,7 @@ def test_annotate_elements_with_ade_concept_and_city_object(tmp_path: Path) -> N
         db_path,
         overwrite=True,
     ) as pkg:
-        citygml = seed_default_citygml_vocabulary(pkg)
+        citygml = seed_citygml_concepts(pkg)
         seed_default_ade_vocabulary(pkg)
 
         roof_object_id = pkg.create_city_object(
@@ -135,7 +134,7 @@ def test_attach_annotation_elements_adds_second_representation(tmp_path: Path) -
         db_path,
         overwrite=True,
     ) as pkg:
-        seed_default_citygml_vocabulary(pkg)
+        seed_citygml_concepts(pkg)
         seed_default_ade_vocabulary(pkg)
 
         mesh_a = register_mesh_asset(

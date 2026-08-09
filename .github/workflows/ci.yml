@@ -108,10 +108,15 @@ jobs:
         working-directory: /tmp
         run: |
           /tmp/wheel-env/bin/python - <<'PY'
-          from usap import USAPPackage, seed_default_citygml_vocabulary
+          from usap import USAPPackage, seed_default_ade_vocabulary
 
+          # USAP no longer ships a CityGML vocabulary — concepts come from a
+          # schema or ontology the caller supplies — so this job can only
+          # exercise the registries that do ship. What it still proves is what
+          # it always proved: the package-data glob reached the wheel, and a
+          # package built outside the checkout validates.
           with USAPPackage.create("/tmp/clean.usap.gpkg", overwrite=True) as pkg:
-              classes = seed_default_citygml_vocabulary(pkg)
+              classes = seed_default_ade_vocabulary(pkg)
               assert classes.by_name, "no concepts seeded from the packaged vocabulary"
 
               report = pkg.validate_report()

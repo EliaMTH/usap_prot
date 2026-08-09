@@ -5,7 +5,7 @@ import argparse
 from usap import (
     USAPPackage,
     import_citygml_semantics,
-    seed_default_citygml_vocabulary,
+    load_citygml_schema,
     seed_default_ade_vocabulary,
 )
 
@@ -38,6 +38,17 @@ def main() -> None:
         help="Only show concepts referenced by at least one annotation.",
     )
 
+    parser.add_argument(
+        "--citygml-schema",
+        required=True,
+        help=(
+            "Path to the OGC CityGML 3.0 XSDs (a directory or a single .xsd). "
+            "USAP ships no CityGML vocabulary: concepts are read from the "
+            "schema you supply. Get them from "
+            "schemas.opengis.net/citygml/citygml-3_0_0.zip."
+        ),
+    )
+
     args = parser.parse_args()
 
     in_use = True if args.used else None
@@ -49,7 +60,9 @@ def main() -> None:
             db_path,
             overwrite=True,
         ) as pkg:
-            seed_default_citygml_vocabulary(pkg)
+            load_citygml_schema(
+                pkg, args.citygml_schema, scheme_version="3.0"
+            )
             seed_default_ade_vocabulary(pkg)
 
             if args.citygml is not None:

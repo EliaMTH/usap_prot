@@ -27,8 +27,12 @@ crs = ["pyproj>=3.6"]
 where = ["src"]
 
 # The schema and the example vocabularies are runtime data: USAPPackage.create
-# and seed_default_*_vocabulary read them by default, so they must ship in the
-# wheel, not just in a checkout.
+# and seed_default_ade_vocabulary read them by default, so they must ship in
+# the wheel, not just in a checkout.
+#
+# CityGML concepts are deliberately NOT here. They are read from the OGC XSDs
+# or an ontology the caller supplies (load_citygml_schema / load_ontology), so
+# USAP ships no assertion of its own about what CityGML contains.
 [tool.setuptools.package-data]
 usap = ["data/schema.sql", "data/vocabularies/*.json"]
 

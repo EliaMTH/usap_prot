@@ -148,7 +148,8 @@ of pages, and its payloads 1,557 KB → 89 KB).
 The first naive descendant CTE (plain `JOIN`) took **6.8s** at 1M faces —
 160× slower than the closure. Decomposition showed the recursive traversal
 *alone* took 6.0s over just 8k edges: SQLite's planner chose
-`usap_rel_by_child_graph` on its `graph_name` prefix and rescanned every
+`usap_rel_by_to_graph` (then named `usap_rel_by_child_graph`) on its
+`graph_name` prefix and rescanned every
 edge per recursive step. Rewriting the recursive step as
 `FROM descendants AS d CROSS JOIN usap_city_object_relationship AS r`
 (SQLite's `CROSS JOIN` pins join order) dropped traversal to **10ms**, after
@@ -184,7 +185,8 @@ Neither is fixable by being more careful: the first is a rebuild the write
 path did not owe, the second requires the containment-type policy to be
 decided at write time, which freezes it into stored rows. Walking the edges
 puts both where they belong — the policy becomes a query argument
-(`containment_types`), and there is nothing to keep in step. The rebuild that
+(`relationship_categories` / `relationship_types`), and there is nothing to
+keep in step. The rebuild that
 `link_city_objects` triggered per edge (O(objects x depth), full table
 rewrite) also disappears, which matters at city scale.
 
@@ -199,6 +201,23 @@ The costs in §5 below were accepted knowingly, with these mitigations:
   for QGIS/DB-Browser users and the main price paid here;
 - **read-time cost** — accepted; USAP object graphs are shallow (building →
   part → surface → opening).
+
+> **Profile 0.3.0 note.** The column names quoted throughout this document
+> (`parent_city_object_id`, `child_city_object_id`, `relationship_type`) are
+> the ones in force when the measurements were taken; they are now
+> `from_city_object_id`, `to_city_object_id` and a `relationship_type_id`
+> foreign key. The measurements and the decisions still hold — the recursive
+> CTE is unchanged apart from those names, and its `CROSS JOIN` is still what
+> keeps the planner off the 400x path.
+>
+> The one thing 0.3.0 adds is `usap_relationship_type.category`, which decides
+> what counts as containment. That is *not* the materialized state rejected in
+> section 4.1: it is a property of the vocabulary (a few hundred rows), never
+> of an edge, so no edit to any edge can invalidate it, and every query may
+> still override it. What 4.1 rejected was a per-edge closure that had to be
+> rebuilt — and the second bug it lists, a rebuild ignoring `relationship_type`
+> and making an `adjacentTo` target a *part*, is now structurally impossible:
+> the type is a foreign key and traversal filters on its category.
 
 ## 5. Downsides of replacing closures with smart queries
 

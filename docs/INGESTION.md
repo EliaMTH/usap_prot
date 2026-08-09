@@ -4,7 +4,7 @@ These are the supported creation, data-ingestion, and editing procedures. Everyt
 
 - a **project config** — what the package is made of: operational 3D assets, the semantic source, and which linking files to apply;
 - a **linking JSON** (annotation batch) — which indexed elements of which operational asset are associated with which city-object instance and concept;
-- the **semantic authority** — either a CityGML file (procedure 1) or a minimal vocabulary JSON (procedure 2).
+- the **semantic authority** — either a CityGML file plus the OGC CityGML 3.0 schemas its concepts come from (procedure 1), or a minimal vocabulary JSON (procedure 2).
 
 One command executes either procedure end to end:
 
@@ -27,13 +27,19 @@ A CityGML source may contain its own geometry, but this workflow does not copy o
 ---
 ## Procedure 1 — init from 3D assets + CityGML + linking JSON
 
-City-object names in the linking JSON are the **`gml:id` values** from the CityGML file. Objects, their classes, and their decomposition come from the CityGML import; the linking JSON only states which elements in the registered operational assets correspond to which authoritative city object.
+City-object names in the linking JSON are the **`gml:id` values** from the CityGML file. Objects, their classes, and their relationships come from the CityGML import — which needs `citygml_schema` in the config, since USAP ships no CityGML vocabulary, and a `relationship_types` block to say which links mean *part of*; the linking JSON only states which elements in the registered operational assets correspond to which authoritative city object.
 
 `project.json`:
 ```json
 {
   "db_path": "city.usap.gpkg",
   "manifest_path": "city_manifest.json",
+  "citygml_schema": "citygml-3.0-schemas",
+  "relationship_types": [
+    { "local_name": "boundary",
+      "code_space": "http://www.opengis.net/citygml/3.0",
+      "category": "containment" }
+  ],
   "citygml": { "path": "city.gml" },
   "meshes": [
     { "path": "city_mesh.ply", "uri": "city_mesh", "representation_name": "city_mesh" }
@@ -163,8 +169,10 @@ unnoticed.
 | Input | Read for | Stored |
 |---|---|---|
 | Operational 3D assets (LAS, mesh) | element counts + part structure (the index space), optional SHA-256 + bounds | URI, hash, parts, counts — never geometry |
-| CityGML | object identity, class, decomposition, and source provenance | mirrored ids/classes/relationships — any CityGML geometry and authoritative object attributes remain only in the source |
-| Vocabulary JSON | accepted concepts (+ parent links) | `usap_semantic_class` + hierarchy closure |
+| CityGML | object identity, class, typed relationships (inline, xlink, or objectified), and source provenance | mirrored ids/classes/edges — any CityGML geometry and authoritative object attributes remain only in the source |
+| CityGML XSDs | concept identity + `substitutionGroup` hierarchy | `usap_semantic_class` + hierarchy closure |
+| `relationship_types` config / ontology | which link types mean part-of | `usap_relationship_type.category` |
+| Vocabulary JSON | accepted ADE/local concepts (+ parent links) | `usap_semantic_class` + hierarchy closure |
 | Linking JSON | claims connecting objects/concepts to asset elements (+ optional value fields) | compressed membership/value blocks and annotation records |
 
 If your pipeline already knows the element counts, assets can also be

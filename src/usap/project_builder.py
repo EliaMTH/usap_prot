@@ -15,10 +15,11 @@ from .adapters import (
 )
 from ._util import require_str
 from .batch import BatchImportResult, apply_annotation_batch_file
+from .constants import DEFAULT_GRAPH_NAME
 from .core import DEFAULT_SCHEMA_PATH, USAPPackage
 from .domain_vocab import (
     DEFAULT_ADE_VOCABULARY_PATH,
-    DEFAULT_CITYGML_VOCABULARY_PATH,
+    load_citygml_schema,
     seed_vocabulary_file,
 )
 from .errors import USAPError
@@ -239,12 +240,30 @@ def _seed_config_vocabularies(
     config: dict[str, Any],
     base_path: Path,
 ) -> None:
+    """
+    Load the package's concept sources, in dependency order.
+
+    'citygml_schema' comes first: it is the path to the OGC CityGML 3.0 XSDs
+    and supplies the base classes plus their substitutionGroup hierarchy.
+    USAP no longer ships a CityGML registry, so a config that imports CityGML
+    must name this. ADE and local schemes follow, since they inherit from the
+    base classes those schemas define.
+    """
+    schema_path = config.get("citygml_schema")
+
+    if schema_path is not None:
+        if not isinstance(schema_path, str):
+            raise ValueError(f"Invalid 'citygml_schema' path: {schema_path!r}")
+
+        load_citygml_schema(
+            pkg,
+            _resolve_path(schema_path, base_path=base_path, must_exist=True),
+            scheme_version=config.get("citygml_schema_version"),
+        )
+
     vocabularies = config.get(
         "vocabularies",
-        [
-            str(DEFAULT_CITYGML_VOCABULARY_PATH),
-            str(DEFAULT_ADE_VOCABULARY_PATH),
-        ],
+        [str(DEFAULT_ADE_VOCABULARY_PATH)],
     )
 
     if not isinstance(vocabularies, list):
@@ -257,6 +276,52 @@ def _seed_config_vocabularies(
         seed_vocabulary_file(
             pkg,
             _resolve_path(item, base_path=base_path, must_exist=True),
+        )
+
+    _register_config_relationship_types(pkg, config=config)
+
+
+def _register_config_relationship_types(
+    pkg: USAPPackage,
+    *,
+    config: dict[str, Any],
+) -> None:
+    """
+    Classify the link types this package's builder treats as containment.
+
+    Which CityGML properties mean "part of" is stated in no CityGML artifact —
+    not the XSD, not the conceptual model, not an OWL rendering of it — so it
+    has to be asserted by whoever builds the package. Without it every edge is
+    still recorded and queryable by name, but nothing is a *part*: an
+    'and its parts' query returns the object alone, and validate_report()
+    warns UNCLASSIFIED_RELATIONSHIP_TYPE.
+
+        "relationship_types": [
+            {"local_name": "boundary",
+             "code_space": "http://www.opengis.net/citygml/3.0",
+             "category": "containment"}
+        ]
+    """
+    items = config.get("relationship_types", [])
+
+    if not isinstance(items, list):
+        raise ValueError("'relationship_types' must be a list.")
+
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError(f"Invalid relationship type entry: {item!r}")
+
+        local_name = item.get("local_name")
+
+        if not isinstance(local_name, str) or not local_name:
+            raise ValueError(
+                f"Relationship type entry needs a 'local_name': {item!r}"
+            )
+
+        pkg.register_relationship_type(
+            local_name,
+            code_space=item.get("code_space"),
+            category=item.get("category"),
         )
 
 
@@ -309,13 +374,25 @@ def _import_config_citygml(
         must_exist=True,
     )
 
+    # Refused rather than ignored. The import used to write every edge twice —
+    # once into a named import graph, once mirrored into usap_default — and
+    # this key switched the mirror off. It now writes one graph always, so a
+    # config still carrying the key is asking for behaviour that no longer
+    # exists, and silently dropping it would leave the file lying.
+    if "also_usap_default" in citygml:
+        raise USAPError(
+            "'also_usap_default' was removed in profile 0.3.0: the CityGML "
+            "import writes a single graph (usap_default by default) instead "
+            "of mirroring every edge. Remove the key; set 'graph_name' if you "
+            "need the edges somewhere other than usap_default."
+        )
+
     return import_citygml_semantics(
         pkg,
         path,
         uri=citygml.get("uri"),
         compute_hash=bool(citygml.get("compute_hash", True)),
-        graph_name=citygml.get("graph_name", "citygml_import"),
-        also_usap_default=bool(citygml.get("also_usap_default", True)),
+        graph_name=citygml.get("graph_name", DEFAULT_GRAPH_NAME),
     )
 
 

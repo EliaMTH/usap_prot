@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_mesh_part, make_pkg
+from conftest import make_mesh_part, make_pkg, seed_citygml_concepts
 from conftest import write_tiny_las as _write_tiny_las, write_tiny_mesh as _write_tiny_mesh
 from usap import (
     USAPError,
@@ -15,7 +15,6 @@ from usap import (
     register_las_asset,
     register_mesh_asset,
     seed_default_ade_vocabulary,
-    seed_default_citygml_vocabulary,
 )
 
 
@@ -31,7 +30,7 @@ def test_apply_annotation_batch_with_las_and_mesh(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        citygml_vocab = seed_default_citygml_vocabulary(pkg)
+        citygml_vocab = seed_citygml_concepts(pkg)
         seed_default_ade_vocabulary(pkg)
 
         roof_object_id = pkg.create_city_object(
@@ -152,7 +151,7 @@ def test_batch_rejects_out_of_range_indices(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        seed_default_citygml_vocabulary(pkg)
+        seed_citygml_concepts(pkg)
         las = register_las_asset(pkg, las_path)
 
         batch = {
@@ -185,7 +184,7 @@ def test_batch_replace_existing(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        seed_default_citygml_vocabulary(pkg)
+        seed_citygml_concepts(pkg)
         las = register_las_asset(pkg, las_path)
 
         batch_1 = {
@@ -271,7 +270,7 @@ def test_batch_replace_preserves_omitted_fields(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        citygml_vocab = seed_default_citygml_vocabulary(pkg)
+        citygml_vocab = seed_citygml_concepts(pkg)
         seed_default_ade_vocabulary(pkg)
 
         roof_object_id = pkg.create_city_object(
@@ -362,7 +361,7 @@ def test_batch_replace_moves_primary_object_link(tmp_path: Path) -> None:
         db_path,
         overwrite=True,
     ) as pkg:
-        citygml_vocab = seed_default_citygml_vocabulary(pkg)
+        citygml_vocab = seed_citygml_concepts(pkg)
 
         for uid in ("roof_a", "roof_b"):
             pkg.create_city_object(

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Test fixture: subset of the OGC CityGML 3.0 building schema.
+
+  Building inherits through construction, which inherits through core — the
+  three-module chain that makes RoofSurface a construction concept while
+  Building stays a building one.
+-->
+<schema xmlns="http://www.w3.org/2001/XMLSchema"
+        xmlns:bldg="http://www.opengis.net/citygml/building/3.0"
+        xmlns:con="http://www.opengis.net/citygml/construction/3.0"
+        xmlns:core="http://www.opengis.net/citygml/3.0"
+        elementFormDefault="qualified"
+        targetNamespace="http://www.opengis.net/citygml/building/3.0"
+        version="3.0.0">
+
+  <import namespace="http://www.opengis.net/citygml/3.0" schemaLocation="core.xsd"/>
+  <import namespace="http://www.opengis.net/citygml/construction/3.0" schemaLocation="construction.xsd"/>
+
+  <element abstract="true" name="AbstractBuilding" substitutionGroup="con:AbstractConstruction" type="anyType"/>
+  <element abstract="true" name="AbstractBuildingSubdivision" substitutionGroup="core:AbstractLogicalSpace" type="anyType"/>
+
+  <element name="Building" substitutionGroup="bldg:AbstractBuilding" type="anyType"/>
+  <element name="BuildingPart" substitutionGroup="bldg:AbstractBuilding" type="anyType"/>
+  <element name="BuildingRoom" substitutionGroup="core:AbstractUnoccupiedSpace" type="anyType"/>
+  <element name="BuildingUnit" substitutionGroup="bldg:AbstractBuildingSubdivision" type="anyType"/>
+  <element name="Storey" substitutionGroup="bldg:AbstractBuildingSubdivision" type="anyType"/>
+  <element name="BuildingConstructiveElement" substitutionGroup="con:AbstractConstructiveElement" type="anyType"/>
+  <element name="BuildingInstallation" substitutionGroup="con:AbstractInstallation" type="anyType"/>
+  <element name="BuildingFurniture" substitutionGroup="con:AbstractFurniture" type="anyType"/>
+</schema>

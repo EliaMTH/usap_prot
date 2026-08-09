@@ -12,7 +12,8 @@ However, any asset with stable integer-indexed elements of one of the four kinds
 
 USAP is designed for concepts from:
 
-- **CityGML standard concepts** loaded from an external vocabulary registry.
+- **CityGML standard concepts** read from the OGC CityGML 3.0 XSDs you supply
+  (`load_citygml_schema`), hierarchy included.
 - **ADE-like/custom concepts** loaded from an external vocabulary registry.
 - **minimal local schemes** (names only, optional parents) for exploratory
   work without an ontology.
@@ -27,23 +28,25 @@ The motivation and mental model are in [README.md](../README.md); this file is t
 
 This repository contains a working MVP. The file format, schema, and API may still change, and packages created with this version should be treated as experimental.
 
-The current schema is profile version **0.2.0**. There is no migration path
-from 0.1.0 — a 0.1.0 package has no `package_iri` at all — so `USAPPackage.open`
-refuses one with an explicit "unsupported profile version" error. Rebuild
-rather than migrate.
+The current schema is profile version **0.3.0**. There is no migration path
+from 0.2.0 — the relationship endpoints were renamed and its type became a
+foreign key into a new table — so `USAPPackage.open` refuses an older package
+with an explicit "unsupported profile version" error. Rebuild rather than
+migrate.
 
 What the prototype can do, end to end:
 
 ```text
 Given:
   a CityGML file (or a minimal vocabulary — INGESTION.md procedure 2),
+  the OGC CityGML 3.0 schemas, for the concepts that file uses,
   at least one 3D asset representing (at least one of) the city objects listed in the CityGML file,
 
 USAP can:
   create a package,
   register all assets,
-  import CityGML semantic objects,
-  load accepted concepts,
+  load accepted concepts from the schemas,
+  import CityGML semantic objects and their typed relationships,
   apply JSON annotation batches,
   attach annotations to 3D assets,
   link annotations to city objects,
@@ -65,8 +68,9 @@ usap_prot/
     adapters/           LAS / mesh / CityGML adapters
     data/schema.sql     the package schema (USAP tables + GeoPackage
                         metadata tables + GIS views)
-    data/vocabularies/  example concept registries (CityGML 3.0 MVP subset,
-                        ADE prototype, minimal local scheme)
+    data/vocabularies/  example concept registries (ADE prototype, minimal
+                        local scheme). No CityGML registry ships: concepts
+                        come from the OGC XSDs you supply.
   examples/             runnable CLI scripts: build, validate, smoke test,
                         batch apply, demos
   project_configs/      example_project.json — template project config
@@ -161,25 +165,61 @@ A registered concept accepted by USAP, e.g. `RoofSurface`, `Window`, `EnergyRoof
 
 A semantic object, usually imported from CityGML, e.g. `building_1`, `building_1_roof_1`, `building_1_window_1`.
 
-City objects are wired to each other by **typed** edges in
-`usap_city_object_relationship` (`link_city_objects`), grouped into named graphs
-(`usap_default` is the one queries traverse). "This object **and its parts**" —
-what `elements_for_city_object` and `list_city_objects(descendants_of=...)`
-expand — follows only *containment* edge types:
+City objects are wired to each other by **typed, directed** edges in
+`usap_city_object_relationship` (`link_city_objects`), grouped into named
+graphs (`usap_default` is the default everywhere).
 
-```text
-contains · consistsOf · boundedBy · opening      (CONTAINMENT_RELATIONSHIP_TYPES)
+Directed is not hierarchical. `from`/`to` record which way the source asserted
+an edge; whether that makes the target a *part* of the source is a property of
+the link **type**, held in `usap_relationship_type`:
+
+| Column | |
+|---|---|
+| `local_name` + `code_space` | the QName the source wrote — `boundary` in `http://www.opengis.net/citygml/3.0`. Together they are the type's identity, so the same name from two namespaces stays two types. |
+| `category` | `containment`, `peer`, `generalization`, `grouping`, or NULL. |
+
+"This object **and its parts**" — what `elements_for_city_object` and
+`list_city_objects(descendants_of=...)` expand — follows the `containment`
+category. A `peer` edge (`adjacentTo`, `predecessor`) relates two objects
+without either being part of the other, so it is recorded and simply not
+followed. Every query can override:
+
+```python
+pkg.list_city_objects(descendants_of="building_1")                       # containment
+pkg.list_city_objects(descendants_of="b1",
+                      relationship_categories=("containment", "peer"))
+pkg.list_city_objects(descendants_of="b1",
+                      relationship_types=[("boundary", CITYGML_3_0_CORE_NS)])
+pkg.list_city_objects(related_to="b1", direction="both")                 # one hop
 ```
 
-Any other type (`adjacentTo`, `connectedTo`, your own) relates two objects
-without making one a part of the other, so it is not traversed unless you pass
-`containment_types=(...)` explicitly. Containment must be acyclic — a cycle
-would make an object its own part, and `validate_report()` flags it as
-`CITY_OBJECT_GRAPH_CYCLE`.
+A type name is resolved within its code space, and a `(name, code_space)` pair
+is accepted anywhere a name is — one query routinely spans modules. An
+unregistered name **raises**: a typo must not answer "this object has no
+parts".
+
+**`category` is the one thing no CityGML artifact states.** Not the XSD, not
+the conceptual model's data dictionary, not an OWL rendering of it — all three
+carry the properties but nothing marking which are aggregations. So USAP does
+not ship it either: it is asserted by whoever builds the package
+(`register_relationship_type`, or a project-config `relationship_types`
+block). Until something does, an imported edge is stored, queryable by name,
+and reported as `UNCLASSIFIED_RELATIONSHIP_TYPE` — never silently treated as
+containment.
+
+Containment must be acyclic — a cycle would make an object its own part, and
+`validate_report()` flags it as `CITY_OBJECT_GRAPH_CYCLE`. A cycle of peer
+edges is legitimate and is not flagged.
+
+An edge may point **outside the package**: `to_external_uri` holds an
+`xlink:href` the import could not resolve locally, with `to_city_object_id`
+NULL. Such a target has no object row, so `list_city_objects` cannot show it —
+`related_city_objects()` returns edges rather than objects and is the only way
+to see one.
 
 Descendants are walked from the edges on every query; USAP stores no
 precomputed object closure, so an object never has to be "rebuilt into" the
-hierarchy and one created with no edges at all still answers for itself.
+graph and one created with no edges at all still answers for itself.
 
 ### Annotation
 
@@ -255,10 +295,10 @@ Annotations then **reference** the registered concept; they do not re-describe i
   "is_ade": false,
   "concepts": [
     { "local_name": "AbstractThematicSurface",
-      "class_uri": "citygml-3.0:construction:AbstractThematicSurface" },
+      "class_uri": "http://www.opengis.net/citygml/3.0#AbstractThematicSurface" },
     { "local_name": "RoofSurface",
-      "class_uri": "citygml-3.0:building:RoofSurface",
-      "parent_uri": "citygml-3.0:construction:AbstractThematicSurface" }
+      "class_uri": "http://www.opengis.net/citygml/construction/3.0#RoofSurface",
+      "parent_uri": "http://www.opengis.net/citygml/3.0#AbstractThematicSurface" }
   ]
 }
 ```
@@ -266,10 +306,58 @@ Annotations then **reference** the registered concept; they do not re-describe i
 Required: top-level `scheme`; `concepts[]` each with `local_name`. Optional: `class_uri` (derived as `scheme:local_name` when omitted — recommended explicit for ontology-backed schemes), `parent_uri` (accepts a `class_uri` **or** the local name of an already-registered concept, resolved within the same scheme first), `scheme_version`, `is_ade`. **Any other keys are ignored.** This minimal shape is intentionally a thin JSON form of a **SKOS** concept scheme (`class_uri` → concept IRI, `local_name` →
 `skos:prefLabel`, `parent_uri` → `skos:broader`, `scheme` → `skos:ConceptScheme`). Richer per-concept metadata (definitions, units, properties) is deliberately out of scope — that is the *application schema* (e.g. a CityGML ADE XSD / SHACL), not the concept scheme.
 
-If your authoritative taxonomy lives in another format (a CityGML ADE registry, an XSD, OWL/SKOS, ...), write a small adapter that emits the registry shape above, then load it. USAP intentionally does **not**
-bundle adapters for foreign formats — they are source-specific and belong in your project.
+**CityGML concepts do not use this format.** They are read directly from the
+OGC XSDs with `load_citygml_schema(pkg, path)`, which takes identity from each
+element's `targetNamespace` and the hierarchy from its `substitutionGroup`.
+That is the normative source, and it is the only one that carries the class
+hierarchy at all — a CityGML OWL rendering names every class but asserts
+almost no `rdfs:subClassOf`.
 
-WIP: ingestion of ontologies in OWL format.
+The JSON format above remains the way to register an **ADE or a local scheme**
+that has no schema to read, and a taxonomy in some other format can still be
+converted into it.
+
+#### Initialising on an ontology
+
+`load_ontology(pkg, path)` reads an **RDF/XML** ontology and registers what it
+declares:
+
+| Read | Becomes |
+|---|---|
+| `owl:ObjectProperty` | a link type, identified by the IRI's namespace + local name |
+| `usap:category` | that type's category — the one fact no CityGML artifact carries |
+| `owl:Class` (+ `rdfs:subClassOf`) | a concept and its parent, for ADE classes |
+
+```xml
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:owl="http://www.w3.org/2002/07/owl#"
+         xmlns:usap="urn:usap:">
+  <owl:ObjectProperty rdf:about="http://www.opengis.net/citygml/3.0#boundary">
+    <usap:category>containment</usap:category>
+  </owl:ObjectProperty>
+</rdf:RDF>
+```
+
+`urn:usap:category` is a URN because the predicate has to be globally unique
+without USAP owning a domain — the same reasoning as `package_iri`.
+
+This is what makes a package *depend* on its ontology: supply a different one
+and the link vocabulary changes with it, over the very same document. Loading
+is idempotent and order-independent — classify before or after the import, the
+result is the same, and a category that contradicts one already recorded raises
+rather than overwriting it.
+
+Two deliberate limits. **RDF/XML only**: parsing uses the `lxml` USAP already
+depends on, so ontology support adds no install. A Turtle file is refused with
+a message telling you to convert it, never half-read. And **`owl:imports` is
+not followed** — the imported IRIs are returned so you can load them yourself,
+but fetching over the network during a package build is not something the SDK
+does for you.
+
+A category only bites if the property's IRI namespace matches the namespace the
+source document writes; that pair *is* the type's identity. Mismatch it and the
+category lands on a type nothing uses, while the one the import registered
+stays unclassified — which `validate_report()` reports.
 
 #### Concept provenance
 
@@ -288,10 +376,10 @@ Two further optional fields record where a concept came from in its authority:
 {
   "scheme": "citygml",
   "scheme_version": "3.0",
-  "source_namespace": "http://www.opengis.net/citygml/building/3.0",
+  "source_namespace": "http://www.opengis.net/citygml/construction/3.0",
   "concepts": [
     { "local_name": "RoofSurface",
-      "class_uri": "citygml-3.0:building:RoofSurface" }
+      "class_uri": "http://www.opengis.net/citygml/construction/3.0#RoofSurface" }
   ]
 }
 ```
@@ -319,16 +407,21 @@ The files under `src/usap/data/vocabularies/` ship with the package but are
 concepts and seeds only what you ask for:
 
 ```text
-src/usap/data/vocabularies/citygml_3_0_mvp.json
 src/usap/data/vocabularies/usap_ade_prototype.json
 src/usap/data/vocabularies/local_minimal_example.json
 ```
 
-The first two are reachable in code as `DEFAULT_CITYGML_VOCABULARY_PATH` /
-`DEFAULT_ADE_VOCABULARY_PATH` (`usap.domain_vocab`), so config files need not
-name them by path.
+The ADE one is reachable in code as `DEFAULT_ADE_VOCABULARY_PATH`
+(`usap.domain_vocab`), so config files need not name it by path.
 
-The CityGML registry is an MVP curated subset of common CityGML 3.0 concepts. It is not a complete CityGML ontology or schema extraction.
+**No CityGML registry ships.** There used to be a hand-written
+`citygml_3_0_mvp.json`, and every error it accumulated came from being
+hand-written: thematic surfaces filed under `building` instead of
+`construction`, `Window` parented to `AbstractFillingSurface` rather than
+`AbstractFillingElement`, a `WaterClosureSurface` that exists only in CityGML
+2.0, and twenty concepts short-circuited past the space/space-boundary layer.
+Deriving them from the schema removes the whole class of error, and means USAP
+asserts nothing of its own about what CityGML contains.
 
 The ADE registry is an ADE-ready custom registry for project-specific concepts such as:
 
@@ -356,10 +449,10 @@ python examples/list_concepts_demo.py --db my_area.usap.gpkg --used
 In Python:
 
 ```python
-from usap import USAPPackage, seed_default_citygml_vocabulary, seed_default_ade_vocabulary
+from usap import USAPPackage, load_citygml_schema, seed_default_ade_vocabulary
 
 with USAPPackage.create("concepts.usap.gpkg", overwrite=True) as pkg:
-    seed_default_citygml_vocabulary(pkg)
+    load_citygml_schema(pkg, "citygml-3.0-schemas/")   # the OGC XSDs
     seed_default_ade_vocabulary(pkg)
 
     for concept in pkg.list_accepted_concepts(search="Roof"):
@@ -403,10 +496,19 @@ meshes:
   "db_path": "../outputs/example_project.usap.gpkg",
   "manifest_path": "../outputs/example_project_manifest.json",
 
+  "citygml_schema": "../citygml-3.0-schemas",
+
+  "relationship_types": [
+    { "local_name": "boundary",
+      "code_space": "http://www.opengis.net/citygml/3.0",
+      "category": "containment" },
+    { "local_name": "fillingSurface",
+      "code_space": "http://www.opengis.net/citygml/construction/3.0",
+      "category": "containment" }
+  ],
+
   "citygml": {
     "path": "../data/area.gml",
-    "graph_name": "citygml_import",
-    "also_usap_default": true,
     "compute_hash": true
   },
 
@@ -698,18 +800,27 @@ annotation UID is not duplicated unless replacement is requested
 
 ## Python API examples
 
-### Create a package and load vocabularies
+### Create a package and load concepts
 
 ```python
-from usap import (
-    USAPPackage,
-    seed_default_citygml_vocabulary,
-    seed_default_ade_vocabulary,
-)
+from usap import USAPPackage, load_citygml_schema, seed_default_ade_vocabulary
 
 with USAPPackage.create("demo.usap.gpkg", overwrite=True) as pkg:
-    seed_default_citygml_vocabulary(pkg)
+    # Concepts and their hierarchy, read from the OGC CityGML 3.0 XSDs.
+    # USAP ships none of its own; download them from
+    # schemas.opengis.net/citygml/citygml-3_0_0.zip.
+    load_citygml_schema(pkg, "citygml-3.0-schemas/")
+
     seed_default_ade_vocabulary(pkg)
+
+    # Which link types mean "part of". No CityGML artifact states this, so it
+    # is asserted here (or by an ontology). Without it every edge is still
+    # recorded and queryable by name, but nothing is reported as a part.
+    pkg.register_relationship_type(
+        "boundary",
+        code_space="http://www.opengis.net/citygml/3.0",
+        category="containment",
+    )
 ```
 
 (`schema_path` defaults to the schema shipped inside the package, so this works
@@ -867,27 +978,64 @@ constants internally, so `element_kind="point"` and
 
 ## CityGML support
 
-The current CityGML importer is intentionally semantic-only.
+The CityGML importer is semantic-only: identities and relationships, never
+geometry.
 
 It imports:
 
 ```text
 gml:id / object identity
-semantic class names
-basic object nesting relationships
+semantic class, matched on the exact QName the document writes
+typed relationships, in every serialization CityGML allows
 source provenance
 ```
 
-It does not yet import:
+It does not import:
 
 ```text
 full CityGML geometry
 full schema validation
-xlink resolution
 complete ADE XML interpretation
 ```
 
-This is enough for the MVP because USAP uses CityGML mainly as the semantic/object identity backbone and stores geometry membership against external LAS and mesh assets.
+**Concepts are a precondition, not an output.** The import classifies elements
+against concepts already registered, and raises if none are — it will not
+invent a vocabulary, which is how a CityGML 2.0 `Building` used to end up filed
+under a 3.0 class URI. Load `load_citygml_schema()` (or an ADE registry) first.
+
+### Relationships: nesting is a serialization, not the relationship
+
+The relationship is the **named property element**; whether its target sits
+inside that element or behind an `xlink:href` only says where the target is
+*defined*. Most CityGML properties accept either form — a surface shared
+between two features *must* be written by reference — and six accept nothing
+else (`generalizesTo`, `relatedTo`, `predecessor`, `successor`, `groupMember`,
+`parent`).
+
+The importer therefore runs two passes: one creating every city object and
+indexing it by element and `gml:id`, then one resolving each relationship
+property against that index. Three shapes are handled behind one resolver:
+
+| Shape | |
+|---|---|
+| inline | the target is written inside the property element |
+| xlink | the property carries `xlink:href`; the target is elsewhere in the document, or outside it |
+| objectified | the property holds a `CityObjectRelation` or a `Role`, which carries the qualifier and then points at the target |
+
+For an objectified `CityObjectRelation` the stored link type is the
+`relationType` **code value** with its `codeSpace` — `adjacentTo`, not the
+generic `relatedTo` carrier — so an open relation stays queryable in SQL. A
+`Role` supplies the edge's `role`.
+
+An `xlink:href` that does not resolve in this document is kept as an edge with
+`to_external_uri` set, warned about at import, and reported by
+`validate_report()` as `UNRESOLVED_RELATIONSHIP_TARGET`. A reference that is
+not a city-object link at all — an appearance href, say — is skipped and
+listed in `result.skipped_references` rather than minting a bogus edge.
+
+The import writes **one graph** (`usap_default` unless `graph_name` says
+otherwise). It used to write every edge twice, mirroring into `usap_default`,
+which made half the relationship table a duplicate.
 
 **What counts as CityGML.** Elements become city objects only when their
 namespace is a CityGML one (`*opengis.net/citygml*`, any module, versions
@@ -897,12 +1045,12 @@ rather than imported as zero objects. Likewise, only a real `gml:id`
 (`*opengis.net/gml*`) is adopted as object identity; an `id` attribute from
 another namespace is ignored and a generated uid is used instead.
 
-> **Known limitation — version provenance.** The detected CityGML version is
-> recorded in the asset metadata (`citygml_version_hint`), but concepts always
-> come from the shipped CityGML **3.0** vocabulary, so a 2.0 `Building` is
-> registered under a `citygml-3.0:` class URI with `scheme_version` 3.0. This
-> is pending the vocabulary-ingestion rework; until then, treat the class URI
-> of a non-3.0 import as approximate.
+**Version provenance.** The detected CityGML version is recorded in the asset
+metadata (`citygml_version_hint`), and both concepts and link types carry the
+namespace the document actually used — so a 2.0 `Building` and a 3.0 one are
+different rows, and neither is silently filed under the other. This used to be
+a known limitation: concepts came from a shipped 3.0 registry regardless of
+what the file said.
 
 ---
 
@@ -1002,12 +1150,14 @@ basic     GeoPackage metadata and registered layers
           concept registry duplicates
           annotation primary object / 'represents' link agreement
           duplicate relationship edges (warning)
+          unclassified relationship types in use (warning)
+          relationship targets outside the package (warning)
 
 deep      + membership payload decoding, offsets, stored min/max agreement
           + value payload decoding and stored min/max agreement
           + asset extent recomputation
           + content hash canonical form  (NON_CANONICAL_CONTENT_HASH, warning)
-          + city object containment cycles
+          + city object containment cycles (containment category only)
           + annotation status / confidence / attributes-JSON domain values
 
 external  + asset file exists            (ASSET_FILE_MISSING)

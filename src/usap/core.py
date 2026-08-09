@@ -95,12 +95,14 @@ from .constants import (
     ANNOTATION_STATUSES,
     CITY_OBJECT_STATUSES,
     CONFIDENCE_RANGE,
-    CONTAINMENT_RELATIONSHIP_TYPES,
     CURRENT_PROFILE_VERSION,
     DEFAULT_BLOCK_SIZE,
     DEFAULT_ENCODING,
     DEFAULT_GRAPH_NAME,
+    DEFAULT_TRAVERSAL_CATEGORIES,
     DEFAULT_VALUE_DTYPE,
+    RELATIONSHIP_CATEGORIES,
+    RELATIONSHIP_DIRECTIONS,
     SUPPORTED_PROFILE_VERSIONS,
     VALUE_BLOCK_ENCODING,
     VALUE_CHUNK_SIZE,
@@ -224,25 +226,44 @@ def _check_annotation_fields(
             ) from exc
 
 
-def _descendants_cte(edge_type_count: int) -> str:
+def _descendants_cte(edge_type_count: int, direction: str = "out") -> str:
     """
-    SQL prefix naming an object and everything contained in it as
+    SQL prefix naming an object and everything reachable from it as
     ``objects(object_id)``.
 
-    Bind (root_city_object_id, graph_name, *containment_types) in that order,
-    before any other parameter of the statement it prefixes. With
+    Bind (root_city_object_id, graph_name, *relationship_type_ids) in that
+    order, before any other parameter of the statement it prefixes; for
+    direction='both', bind (root, graph, *ids, graph, *ids). With
     edge_type_count == 0 the set is the root alone.
 
-    Descendants are walked from the edges themselves rather than read from a
+    Reachability is walked from the edges themselves rather than read from a
     stored transitive closure: no derived table to keep in step with the
     edges, so an object created on its own is still its own descendant, and no
     rebuild is owed after every link_city_objects.
 
+    Direction is a query argument because the edges are directed but not
+    hierarchical — 'out' follows from_ -> to_, 'in' the reverse, 'both' either
+    way. Only 'both' needs two recursive terms (SQLite >= 3.34).
+
+    Type filtering binds integer ids, resolved by _resolve_edge_type_ids before
+    this statement is built. Doing it there rather than joining
+    usap_relationship_type inside the recursive term is deliberate: see below.
+
     UNION (not UNION ALL) both deduplicates and terminates on a cycle.
     CROSS JOIN pins the join order (queue row -> its edges); with a plain JOIN,
-    SQLite picks usap_rel_by_child_graph on its graph_name prefix and rescans
-    every edge per recursive step (~400x slower).
+    SQLite picks the other index on its graph_name prefix and rescans every
+    edge per recursive step (~400x slower). Do not add a join or a subquery to
+    this body.
+
+    to_city_object_id IS NOT NULL excludes edges whose target is outside the
+    document: an external URI is not a node and must not enter the queue.
     """
+    if direction not in RELATIONSHIP_DIRECTIONS:
+        raise USAPError(
+            f"Unknown direction {direction!r}. "
+            f"Use one of: {', '.join(RELATIONSHIP_DIRECTIONS)}."
+        )
+
     if edge_type_count < 1:
         return """
             WITH objects(object_id) AS (
@@ -252,16 +273,32 @@ def _descendants_cte(edge_type_count: int) -> str:
 
     placeholders = ",".join("?" for _ in range(edge_type_count))
 
+    def step(from_column: str, to_column: str, alias: str) -> str:
+        return f"""
+            SELECT {alias}.{to_column}
+            FROM objects AS o
+            CROSS JOIN usap_city_object_relationship AS {alias}
+                ON {alias}.{from_column} = o.object_id
+            WHERE {alias}.graph_name = ?
+              AND {alias}.relationship_type_id IN ({placeholders})
+              AND {alias}.to_city_object_id IS NOT NULL
+        """
+
+    outward = step("from_city_object_id", "to_city_object_id", "r")
+    inward = step("to_city_object_id", "from_city_object_id", "r2")
+
+    if direction == "out":
+        recursive = outward
+    elif direction == "in":
+        recursive = inward
+    else:
+        recursive = f"{outward} UNION {inward}"
+
     return f"""
         WITH RECURSIVE objects(object_id) AS (
             SELECT ?
             UNION
-            SELECT r.child_city_object_id
-            FROM objects AS o
-            CROSS JOIN usap_city_object_relationship AS r
-                ON r.parent_city_object_id = o.object_id
-            WHERE r.graph_name = ?
-              AND r.relationship_type IN ({placeholders})
+            {recursive}
         )
     """
 
@@ -360,6 +397,11 @@ class USAPPackage:
         self.conn.execute("PRAGMA foreign_keys = ON;")
         self._transaction_depth = 0
 
+        # (local_name, code_space or '') -> relationship_type_id. An import
+        # resolves the same handful of types once per edge, and the lookup is
+        # otherwise a query each time. Cleared on rollback (see transaction).
+        self._relationship_type_cache: dict[tuple[str, str], int] = {}
+
     @contextmanager
     def transaction(self) -> Iterator[None]:
         """
@@ -398,6 +440,10 @@ class USAPPackage:
             yield
         except Exception:
             self.conn.rollback()
+            # A relationship type auto-registered inside the rolled-back
+            # transaction no longer exists, but the cache would still hand out
+            # its id and the next edge insert would die on the foreign key.
+            self._relationship_type_cache.clear()
             raise
         else:
             self.conn.commit()
@@ -1253,11 +1299,284 @@ class USAPPackage:
 
         return city_object_id
 
+    # ---------------------------------------------------------------------
+    # Relationship types (the link vocabulary)
+    # ---------------------------------------------------------------------
+
+    def register_relationship_type(
+        self,
+        local_name: str,
+        *,
+        code_space: str | None = None,
+        category: str | None = None,
+        metadata_json: str | None = None,
+    ) -> int:
+        """
+        Create or reuse one link type, keyed on (local_name, code_space).
+
+        Idempotent and enriching, like create_semantic_class: a category that
+        is still NULL is filled in by a later call, so a package can be
+        classified after the edges already exist. A *different* non-NULL
+        category is a contradiction and raises rather than being overwritten.
+
+        code_space is the namespace the property came from. Leaving it NULL is
+        allowed but weakens the package: 'boundedBy' with no namespace cannot
+        be resolved by a reader who did not build it.
+        """
+        if category is not None and category not in RELATIONSHIP_CATEGORIES:
+            raise USAPError(
+                f"Unknown relationship category {category!r}. "
+                f"Use one of: {', '.join(RELATIONSHIP_CATEGORIES)}."
+            )
+
+        cache_key = (local_name, code_space or "")
+
+        existing = self.conn.execute(
+            """
+            SELECT relationship_type_id, category
+            FROM usap_relationship_type
+            WHERE local_name = ?
+              AND COALESCE(code_space, '') = ?
+            """,
+            cache_key,
+        ).fetchone()
+
+        if existing is not None:
+            type_id = int(existing["relationship_type_id"])
+
+            if category is not None and existing["category"] != category:
+                if existing["category"] is not None:
+                    raise USAPError(
+                        f"Relationship type {local_name!r} is already "
+                        f"{existing['category']!r}, cannot re-register it as "
+                        f"{category!r}. Registering fills in a missing "
+                        "category; it does not overwrite one."
+                    )
+
+                with self.transaction():
+                    self.conn.execute(
+                        """
+                        UPDATE usap_relationship_type
+                        SET category = ?
+                        WHERE relationship_type_id = ?
+                        """,
+                        (category, type_id),
+                    )
+
+            self._relationship_type_cache[cache_key] = type_id
+
+            return type_id
+
+        with self.transaction():
+            cur = self.conn.execute(
+                """
+                INSERT INTO usap_relationship_type (
+                    local_name,
+                    code_space,
+                    category,
+                    metadata_json
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (local_name, code_space, category, metadata_json),
+            )
+            type_id = require_lastrowid(cur)
+
+            self.log_edit(
+                "register_relationship_type",
+                "usap_relationship_type",
+                type_id,
+            )
+
+        self._relationship_type_cache[cache_key] = type_id
+
+        return type_id
+
+    def resolve_relationship_type(
+        self,
+        relationship_type: int | str | tuple[str, str | None],
+        *,
+        code_space: str | None = None,
+    ) -> int:
+        """
+        Resolve a link type to its id.
+
+        Accepts an id, a local name, or a (local_name, code_space) pair. The
+        pair form exists because one query routinely spans modules — asking
+        for CityGML's `boundary` and `fillingSurface` together means asking
+        across the core and construction namespaces, which a single code_space
+        argument cannot express.
+
+        A name resolves only within its code space. There is deliberately no
+        fallback across code spaces: silently matching 'boundedBy' from some
+        other namespace is exactly the identity loss this table exists to stop.
+        """
+        if isinstance(relationship_type, tuple):
+            relationship_type, code_space = relationship_type
+
+        if isinstance(relationship_type, int):
+            row = self.conn.execute(
+                """
+                SELECT relationship_type_id
+                FROM usap_relationship_type
+                WHERE relationship_type_id = ?
+                """,
+                (relationship_type,),
+            ).fetchone()
+
+            if row is None:
+                raise USAPError(
+                    f"No relationship type with id {relationship_type}."
+                )
+
+            return int(row["relationship_type_id"])
+
+        cache_key = (relationship_type, code_space or "")
+        cached = self._relationship_type_cache.get(cache_key)
+
+        if cached is not None:
+            return cached
+
+        row = self.conn.execute(
+            """
+            SELECT relationship_type_id
+            FROM usap_relationship_type
+            WHERE local_name = ?
+              AND COALESCE(code_space, '') = ?
+            """,
+            cache_key,
+        ).fetchone()
+
+        if row is None:
+            raise USAPError(
+                f"Relationship type {relationship_type!r} is not registered"
+                + (f" in code space {code_space!r}" if code_space else "")
+                + ". Register it, or load the ontology that defines it."
+            )
+
+        type_id = int(row["relationship_type_id"])
+        self._relationship_type_cache[cache_key] = type_id
+
+        return type_id
+
+    def list_relationship_types(
+        self,
+        *,
+        category: str | None = None,
+        include_unused: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        The package's link vocabulary, with how many edges use each type.
+
+        category=None lists everything, including unclassified types — which
+        is how you find what an import registered but no ontology classified.
+        """
+        where = []
+        params: list[Any] = []
+
+        # Unqualified: this filters the wrapping SELECT, where the inner
+        # alias is out of scope. edge_count is only addressable there too.
+        if category is not None:
+            where.append("category = ?")
+            params.append(category)
+
+        if not include_unused:
+            where.append("edge_count > 0")
+
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM (
+                SELECT
+                    rt.relationship_type_id,
+                    rt.local_name,
+                    rt.code_space,
+                    rt.category,
+                    rt.metadata_json,
+                    CAST((
+                        SELECT COUNT(*)
+                        FROM usap_city_object_relationship AS r
+                        WHERE r.relationship_type_id = rt.relationship_type_id
+                    ) AS INTEGER) AS edge_count
+                FROM usap_relationship_type AS rt
+            )
+            {where_sql}
+            ORDER BY local_name, COALESCE(code_space, '')
+            """,
+            params,
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def _resolve_edge_type_ids(
+        self,
+        *,
+        relationship_types: Sequence[int | str | tuple[str, str | None]] | None,
+        relationship_categories: Sequence[str] | None,
+        code_space: str | None = None,
+        default_categories: Sequence[str] | None = None,
+    ) -> tuple[int, ...] | None:
+        """
+        Turn a type/category filter into the integer ids a query binds.
+
+        Deliberately resolved in Python, before the statement is built: the
+        recursive descendant CTE binds these as plain '?' placeholders, so its
+        CROSS JOIN body stays byte-for-byte what the planner was tuned against
+        (ACCELERATOR_ABLATION.md section 5 measures 400x on that join's plan).
+        Putting a subquery or a join inside the recursive term to look the
+        category up would undo that.
+
+        Returns None for "no type filter at all", () for "match nothing".
+        """
+        if relationship_types is None and relationship_categories is None:
+            if default_categories is None:
+                return None
+
+            relationship_categories = default_categories
+
+        ids: list[int] = []
+
+        for category in relationship_categories or ():
+            if category not in RELATIONSHIP_CATEGORIES:
+                raise USAPError(
+                    f"Unknown relationship category {category!r}. "
+                    f"Use one of: {', '.join(RELATIONSHIP_CATEGORIES)}."
+                )
+
+            ids.extend(
+                int(row["relationship_type_id"])
+                for row in self.conn.execute(
+                    """
+                    SELECT relationship_type_id
+                    FROM usap_relationship_type
+                    WHERE category = ?
+                    """,
+                    (category,),
+                ).fetchall()
+            )
+
+        # An unregistered *name* raises rather than matching nothing: a typo
+        # must not look like "this object has no parts".
+        for relationship_type in relationship_types or ():
+            ids.append(
+                self.resolve_relationship_type(
+                    relationship_type,
+                    code_space=code_space,
+                )
+            )
+
+        return tuple(dict.fromkeys(ids))
+
     def link_city_objects(
         self,
-        parent_city_object_id: int,
-        child_city_object_id: int,
-        relationship_type: str,
+        from_city_object_id: int,
+        to_city_object_id: int | None,
+        relationship_type: int | str | tuple[str, str | None],
+        *,
+        to_external_uri: str | None = None,
+        code_space: str | None = None,
+        category: str | None = None,
         role: str | None = None,
         graph_name: str = DEFAULT_GRAPH_NAME,
         source_asset_id: int | None = None,
@@ -1265,33 +1584,64 @@ class USAPPackage:
         metadata_json: str | None = None,
     ) -> int:
         """
-        Add one typed edge between two city objects.
+        Add one typed, directed edge between two city objects.
 
-        Idempotent: re-linking an identical edge (same graph, endpoints,
-        type, role, and source_relation_id) returns the existing
-        relationship_id instead of inserting a duplicate.
+        The edge is directed but not hierarchical: from_ -> to_ records which
+        way the source asserted it, and whether that makes the target a *part*
+        of the source is a property of the type's category, not of the columns.
 
-        The edge is the only representation: descendant queries walk these
-        rows directly (see elements_for_city_object), so nothing derived has
-        to be rebuilt afterwards. Only CONTAINMENT_RELATIONSHIP_TYPES edges
-        make the child part of the parent for those queries.
+        Exactly one of to_city_object_id / to_external_uri must be given. The
+        second is for an xlink that leaves the document: the link is real and
+        typed even though its target is not in this package, and dropping it is
+        how an xlink-serialized CityGML file used to import as unrelated roots.
+
+        relationship_type accepts an id or a local name. An unregistered name
+        is registered on the spot — with `category`, if the caller knows it —
+        so no document is refused for using a link USAP has not met. Without a
+        category the edge is stored and queryable by name, but stays outside
+        the default traversal and is reported by validate_report().
+
+        Idempotent: re-linking an identical edge (same graph, endpoints, type,
+        role and source_relation_id) returns the existing relationship_id.
         """
+        if (to_city_object_id is None) == (to_external_uri is None):
+            raise USAPError(
+                "Provide exactly one of to_city_object_id (a target in this "
+                "package) or to_external_uri (an xlink that leaves the "
+                "document); got "
+                f"to_city_object_id={to_city_object_id!r}, "
+                f"to_external_uri={to_external_uri!r}."
+            )
+
+        if isinstance(relationship_type, int):
+            relationship_type_id = self.resolve_relationship_type(
+                relationship_type
+            )
+        else:
+            relationship_type_id = self.register_relationship_type(
+                relationship_type,
+                code_space=code_space,
+                category=category,
+            )
+
         existing = self.conn.execute(
             """
             SELECT relationship_id
             FROM usap_city_object_relationship
             WHERE graph_name = ?
-              AND parent_city_object_id = ?
-              AND child_city_object_id = ?
-              AND relationship_type = ?
+              AND from_city_object_id = ?
+              AND to_city_object_id IS ?
+              AND to_external_uri IS ?
+              AND relationship_type_id = ?
               AND role IS ?
               AND source_relation_id IS ?
             """,
             (
                 graph_name,
-                parent_city_object_id,
-                child_city_object_id,
-                relationship_type,
+                from_city_object_id,
+                to_city_object_id,
+                to_external_uri,
+                relationship_type_id,
                 role,
                 source_relation_id,
             ),
@@ -1305,21 +1655,23 @@ class USAPPackage:
                 """
                 INSERT INTO usap_city_object_relationship (
                     graph_name,
-                    parent_city_object_id,
-                    child_city_object_id,
-                    relationship_type,
+                    from_city_object_id,
+                    to_city_object_id,
+                    to_external_uri,
+                    relationship_type_id,
                     role,
                     source_asset_id,
                     source_relation_id,
                     metadata_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     graph_name,
-                    parent_city_object_id,
-                    child_city_object_id,
-                    relationship_type,
+                    from_city_object_id,
+                    to_city_object_id,
+                    to_external_uri,
+                    relationship_type_id,
                     role,
                     source_asset_id,
                     source_relation_id,
@@ -1342,10 +1694,13 @@ class USAPPackage:
         object_status: str | None = None,
         semantic_class_id: int | None = None,
         search: str | None = None,
-        parent_object: int | str | None = None,
+        related_to: int | str | None = None,
         descendants_of: int | str | None = None,
+        direction: str = "out",
         graph_name: str = DEFAULT_GRAPH_NAME,
-        containment_types: Sequence[str] = CONTAINMENT_RELATIONSHIP_TYPES,
+        relationship_types: Sequence[int | str | tuple[str, str | None]] | None = None,
+        relationship_categories: Sequence[str] | None = None,
+        code_space: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         List city objects (the semantic identities annotations link to).
@@ -1355,15 +1710,22 @@ class USAPPackage:
           alignment with a real CityGML source.
         - semantic_class_id — objects of one class.
         - search — substring match on object_uid.
-        - parent_object — an object id or uid; returns only its DIRECT
-          children in graph_name (walk the object tree: list all, then expand
-          a node). Root objects are those returned with no parent_object that
-          never appear as someone's child.
-        - descendants_of — an object id or uid; returns that object AND every
-          object contained in it at any depth, which is the set
-          elements_for_city_object gathers annotations over. Only
-          containment_types edges are followed (see
-          CONTAINMENT_RELATIONSHIP_TYPES).
+        - related_to — an object id or uid; returns the objects ONE hop away
+          from it in graph_name (walk the graph: list all, then expand a node).
+          Defaults to every link type, because a one-hop "what is related to
+          this" that silently hid `relatedTo` would be a trap.
+        - descendants_of — an object id or uid; returns that object AND
+          everything reachable from it at any depth, which is the set
+          elements_for_city_object gathers annotations over. Defaults to
+          containment types only, so a neighbour is not reported as a part.
+
+        Both traversals take `direction` ('out', 'in', 'both') and the same
+        type filter: `relationship_categories` for a class of link,
+        `relationship_types` to name them exactly. An unregistered type name
+        raises — a typo must not look like "this object has no parts".
+
+        Root objects are those that `related_to=..., direction='in'` never
+        returns, i.e. nothing points at them.
         """
         where: list[str] = []
         params: list[Any] = []
@@ -1372,21 +1734,38 @@ class USAPPackage:
 
         if descendants_of is not None:
             root_id = self.resolve_city_object(descendants_of)
-            edge_types = tuple(containment_types)
+            edge_type_ids = self._resolve_edge_type_ids(
+                relationship_types=relationship_types,
+                relationship_categories=relationship_categories,
+                code_space=code_space,
+                default_categories=DEFAULT_TRAVERSAL_CATEGORIES,
+            ) or ()
 
-            with_sql = _descendants_cte(len(edge_types))
-            params.extend([root_id, graph_name, *edge_types])
+            with_sql = _descendants_cte(len(edge_type_ids), direction)
+
+            params.append(root_id)
+
+            if edge_type_ids:
+                params.extend([graph_name, *edge_type_ids])
+
+                if direction == "both":
+                    params.extend([graph_name, *edge_type_ids])
+
             where.append("co.city_object_id IN (SELECT object_id FROM objects)")
 
-        if parent_object is not None:
-            parent_id = self.resolve_city_object(parent_object)
-            join = (
-                "JOIN usap_city_object_relationship AS r "
-                "ON r.child_city_object_id = co.city_object_id "
-                "AND r.parent_city_object_id = ? "
-                "AND r.graph_name = ?"
+        if related_to is not None:
+            anchor_id = self.resolve_city_object(related_to)
+            neighbour_sql, neighbour_params = self._one_hop_neighbour_sql(
+                anchor_id=anchor_id,
+                direction=direction,
+                graph_name=graph_name,
+                relationship_types=relationship_types,
+                relationship_categories=relationship_categories,
+                code_space=code_space,
             )
-            params.extend([parent_id, graph_name])
+
+            where.append(f"co.city_object_id IN ({neighbour_sql})")
+            params.extend(neighbour_params)
 
         if object_status is not None:
             where.append("co.object_status = ?")
@@ -1424,6 +1803,184 @@ class USAPPackage:
             {where_sql}
             ORDER BY co.object_uid
             """,
+            params,
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def _one_hop_neighbour_sql(
+        self,
+        *,
+        anchor_id: int,
+        direction: str,
+        graph_name: str,
+        relationship_types: Sequence[int | str | tuple[str, str | None]] | None,
+        relationship_categories: Sequence[str] | None,
+        code_space: str | None,
+    ) -> tuple[str, list[Any]]:
+        """
+        A subquery yielding the city objects one edge away from anchor_id.
+
+        A UNION ALL of one indexed branch per direction, rather than a JOIN:
+        a JOIN cannot express direction='both' without either duplicating rows
+        or losing one side. Each branch hits its own covering index
+        (usap_rel_by_from_graph / usap_rel_by_to_graph).
+
+        No default category here: a one-hop question is "what is related to
+        this", and defaulting it to containment would silently hide exactly
+        the peer and grouping links this method exists to surface.
+        """
+        if direction not in RELATIONSHIP_DIRECTIONS:
+            raise USAPError(
+                f"Unknown direction {direction!r}. "
+                f"Use one of: {', '.join(RELATIONSHIP_DIRECTIONS)}."
+            )
+
+        edge_type_ids = self._resolve_edge_type_ids(
+            relationship_types=relationship_types,
+            relationship_categories=relationship_categories,
+            code_space=code_space,
+            default_categories=None,
+        )
+
+        type_clause = ""
+        type_params: list[Any] = []
+
+        if edge_type_ids is not None:
+            if not edge_type_ids:
+                # An explicit empty filter means "match nothing", and must not
+                # collapse to "no filter".
+                return "SELECT NULL WHERE 0", []
+
+            placeholders = ",".join("?" for _ in edge_type_ids)
+            type_clause = f"AND r.relationship_type_id IN ({placeholders})"
+            type_params = list(edge_type_ids)
+
+        branches: list[str] = []
+        params: list[Any] = []
+
+        def add_branch(anchor_column: str, target_column: str) -> None:
+            branches.append(
+                f"""
+                SELECT r.{target_column} AS object_id
+                FROM usap_city_object_relationship AS r
+                WHERE r.graph_name = ?
+                  AND r.{anchor_column} = ?
+                  AND r.{target_column} IS NOT NULL
+                  {type_clause}
+                """
+            )
+            params.extend([graph_name, anchor_id, *type_params])
+
+        if direction in ("out", "both"):
+            add_branch("from_city_object_id", "to_city_object_id")
+
+        if direction in ("in", "both"):
+            add_branch("to_city_object_id", "from_city_object_id")
+
+        return " UNION ALL ".join(branches), params
+
+    def related_city_objects(
+        self,
+        city_object: int | str,
+        *,
+        relationship_types: Sequence[int | str | tuple[str, str | None]] | None = None,
+        relationship_categories: Sequence[str] | None = None,
+        code_space: str | None = None,
+        direction: str = "out",
+        graph_name: str = DEFAULT_GRAPH_NAME,
+        include_external: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        The edges touching one city object, as edges rather than objects.
+
+        This is the only way to see an edge whose target is outside the
+        package: list_city_objects can return rows of usap_city_object and
+        nothing else, so an unresolved xlink has no object row to be. Without
+        this method to_external_uri would be write-only.
+
+        Each row carries both endpoints, the resolved link type with its
+        code space and category, the role, and the provenance columns.
+        `direction` decides which way edges are followed and is reported per
+        row, so 'both' stays readable.
+
+        include_external=False drops the edges that leave the document, for
+        callers that only want targets they can dereference locally.
+        """
+        if direction not in RELATIONSHIP_DIRECTIONS:
+            raise USAPError(
+                f"Unknown direction {direction!r}. "
+                f"Use one of: {', '.join(RELATIONSHIP_DIRECTIONS)}."
+            )
+
+        anchor_id = self.resolve_city_object(city_object)
+
+        edge_type_ids = self._resolve_edge_type_ids(
+            relationship_types=relationship_types,
+            relationship_categories=relationship_categories,
+            code_space=code_space,
+            default_categories=None,
+        )
+
+        type_clause = ""
+        type_params: list[Any] = []
+
+        if edge_type_ids is not None:
+            if not edge_type_ids:
+                return []
+
+            placeholders = ",".join("?" for _ in edge_type_ids)
+            type_clause = f"AND r.relationship_type_id IN ({placeholders})"
+            type_params = list(edge_type_ids)
+
+        external_clause = (
+            "" if include_external else "AND r.to_city_object_id IS NOT NULL"
+        )
+
+        branches: list[str] = []
+        params: list[Any] = []
+
+        def add_branch(anchor_column: str, label: str) -> None:
+            branches.append(
+                f"""
+                SELECT
+                    r.relationship_id,
+                    '{label}' AS direction,
+                    r.graph_name,
+                    r.from_city_object_id,
+                    src.object_uid AS from_object_uid,
+                    r.to_city_object_id,
+                    dst.object_uid AS to_object_uid,
+                    r.to_external_uri,
+                    rt.local_name AS relationship_type,
+                    rt.code_space,
+                    rt.category,
+                    r.role,
+                    r.source_relation_id,
+                    r.metadata_json
+                FROM usap_city_object_relationship AS r
+                JOIN usap_relationship_type AS rt
+                    ON rt.relationship_type_id = r.relationship_type_id
+                LEFT JOIN usap_city_object AS src
+                    ON src.city_object_id = r.from_city_object_id
+                LEFT JOIN usap_city_object AS dst
+                    ON dst.city_object_id = r.to_city_object_id
+                WHERE r.graph_name = ?
+                  AND r.{anchor_column} = ?
+                  {type_clause}
+                  {external_clause}
+                """
+            )
+            params.extend([graph_name, anchor_id, *type_params])
+
+        if direction in ("out", "both"):
+            add_branch("from_city_object_id", "out")
+
+        if direction in ("in", "both"):
+            add_branch("to_city_object_id", "in")
+
+        rows = self.conn.execute(
+            " UNION ALL ".join(branches) + " ORDER BY relationship_id",
             params,
         ).fetchall()
 
@@ -2400,7 +2957,10 @@ class USAPPackage:
         graph_name: str = DEFAULT_GRAPH_NAME,
         expand: bool = False,
         link_types: Sequence[str] = ("represents",),
-        containment_types: Sequence[str] = CONTAINMENT_RELATIONSHIP_TYPES,
+        relationship_types: Sequence[int | str | tuple[str, str | None]] | None = None,
+        relationship_categories: Sequence[str] = DEFAULT_TRAVERSAL_CATEGORIES,
+        direction: str = "out",
+        code_space: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Query a city object and optionally its descendants, then return
@@ -2420,16 +2980,17 @@ class USAPPackage:
         ('represents',) because other link types (concerns, derivedFrom, ...)
         say something *about* an object without claiming its elements. Pass
         more types to follow them too, or an empty sequence to match on
-        primary_city_object_id alone.
+        primary_city_object_id alone. This is the annotation->object axis and
+        is unrelated to the object->object one below.
 
-        containment_types selects which usap_city_object_relationship edges
-        count as "part of", i.e. which ones descendant expansion follows. The
-        graph is a typed graph, so a non-containment edge (adjacentTo,
-        connectedTo, ...) must NOT make its target's annotations answer for the
-        source object.
+        relationship_categories / relationship_types select which
+        usap_city_object_relationship edges count as "part of", i.e. which the
+        descendant expansion follows. The default is the containment category:
+        the graph is typed, so a peer edge (adjacentTo, predecessor, ...) must
+        NOT make its target's annotations answer for the source object. Name
+        types explicitly to override, or pass an empty sequence to walk none.
         """
         relation_types = tuple(link_types)
-        edge_types = tuple(containment_types)
 
         city_object = self.conn.execute(
             """
@@ -2445,14 +3006,24 @@ class USAPPackage:
 
         city_object_id = int(city_object["city_object_id"])
 
-        if not include_descendants:
-            edge_types = ()
+        edge_type_ids: tuple[int, ...] = ()
 
-        objects_cte = _descendants_cte(len(edge_types))
-        params: list[Any] = [city_object_id, graph_name, *edge_types]
+        if include_descendants:
+            edge_type_ids = self._resolve_edge_type_ids(
+                relationship_types=relationship_types,
+                relationship_categories=relationship_categories,
+                code_space=code_space,
+                default_categories=DEFAULT_TRAVERSAL_CATEGORIES,
+            ) or ()
 
-        if not edge_types:
-            params = [city_object_id]
+        objects_cte = _descendants_cte(len(edge_type_ids), direction)
+        params: list[Any] = [city_object_id]
+
+        if edge_type_ids:
+            params.extend([graph_name, *edge_type_ids])
+
+            if direction == "both":
+                params.extend([graph_name, *edge_type_ids])
 
         link_branch = ""
 
@@ -3109,7 +3680,9 @@ class USAPPackage:
         Examples:
         resolve_semantic_class(12)
         resolve_semantic_class("RoofSurface")
-        resolve_semantic_class("citygml-3.0:building:RoofSurface")
+        resolve_semantic_class(
+            "http://www.opengis.net/citygml/construction/3.0#RoofSurface"
+        )
         resolve_semantic_class("EnergyRoof")
         resolve_semantic_class("usap-ade-prototype:energy:EnergyRoof")
         """

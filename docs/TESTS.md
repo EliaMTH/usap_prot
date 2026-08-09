@@ -22,6 +22,13 @@ python -m pytest
 - `write_tiny_las(path, point_count)` / `write_tiny_mesh(path)` — minimal real
   LAS / 2-triangle mesh files for adapter and end-to-end tests.
 
+Two CityGML helpers stand in for what a package normally supplies itself:
+`seed_citygml_concepts()` loads `tests/fixtures/citygml_3_0_subset/` — a
+faithful subset of the OGC schemas, every name and `substitutionGroup` copied
+verbatim — and `seed_citygml_relationship_categories()` states which of its
+properties mean part-of. USAP ships neither, so the suite brings its own
+rather than depending on the full OGC distribution.
+
 ## Core data model — `test_core.py`
 
 - `test_selected_face_returns_roof_annotation` — the central promise: selecting
@@ -42,7 +49,8 @@ python -m pytest
   `include_descendants=True` (they used to disappear, silently and validly).
 - `test_descendants_follow_containment_edges_only` — the object graph is
   typed: an `adjacentTo` edge must not report the neighbour's elements as
-  parts of this object, while `containment_types=` can opt into it.
+  parts of this object, while `relationship_categories=`/`relationship_types=`
+  can opt into it.
 - `test_link_city_objects_is_idempotent` — re-linking an identical edge
   returns the existing `relationship_id` instead of inserting a duplicate,
   while a variant edge (different role) still inserts; CityGML re-imports in
@@ -146,7 +154,9 @@ python -m pytest
 
 `test_external_vocabulary.py`:
 
-- `test_seed_default_citygml_vocabulary` / `test_seed_default_ade_vocabulary`
+- `test_citygml_concepts_are_derived_from_the_schema` /
+  `test_relation_objects_are_concepts_but_not_city_objects` /
+  `test_seed_default_ade_vocabulary`
   — the bundled example registries load and expose their expected concepts.
 
 ## Concept-first annotation API — `test_concept_annotation_api.py`
@@ -222,7 +232,22 @@ rewrite.
 `test_citygml_adapter.py`:
 
 - `test_import_tiny_citygml_semantics` — the semantic-only import: objects by
-  `gml:id`, classes, nesting relationships, provenance — never geometry.
+  `gml:id`, classes matched on the exact QName, relationships typed by the
+  CityGML property they came through (`boundary`, not a renamed `boundedBy`)
+  and carrying that property's namespace — never geometry.
+- `test_import_without_concepts_fails_loud` — concepts are a precondition:
+  USAP ships no CityGML vocabulary, and importing zero objects would read as
+  "this file has no buildings".
+- `test_parts_are_reachable_at_every_depth` — both CityGML 3.0 containment
+  properties are followed, `core:boundary` and `con:fillingSurface`, so a
+  window nested under a wall is part of the building. The predecessor
+  hardcoded four CityGML *2.0* tokens, so `fillingSurface` was recorded and
+  then never traversed.
+- `test_uncategorised_links_are_recorded_but_not_traversed` — the accepted
+  consequence of shipping no link vocabulary: with no categories supplied
+  every edge is still stored and queryable by name, `descendants_of` returns
+  the root alone, and validation warns `UNCLASSIFIED_RELATIONSHIP_TYPE`. It
+  must be visible, never silent.
 - `test_malformed_citygml_fails_loud` — a truncated/invalid file must refuse
   to import (it used to be silently half-parsed with `recover=True`).
 - `test_non_citygml_namespace_is_refused` — matching on element local names
@@ -232,6 +257,99 @@ rewrite.
 - `test_foreign_id_attribute_is_not_a_gml_id` — only a real `gml:id` becomes
   object identity; an `id` attribute from another vocabulary must not be
   adopted as the uid annotations bind to.
+
+## Relationship serialization — `test_citygml_xlink.py`
+
+A CityGML relationship is the named *property element*; nesting and
+`xlink:href` are two ways to serialize the same thing. The adapter this
+replaces read nesting only, so a document written by reference imported as a
+pile of unrelated roots with no warning.
+
+- `test_inline_and_xlink_produce_the_same_graph` — the headline test. The same
+  semantics in both serializations must give identical edge sets, asserted
+  non-empty (two empty sets are also equal, which is the bug being guarded).
+  Before the two-pass rewrite this was 3 edges versus 0.
+- `test_xlink_only_properties_are_visible` — `generalizesTo` and `relatedTo`
+  accept no inline form at all, so a nesting-only reader could never see them
+  however the file was written. An objectified `CityObjectRelation` stores the
+  `relationType` code value with its `codeSpace`, so `adjacentTo` is queryable
+  in SQL rather than buried in JSON.
+- `test_group_role_populates_the_role_column` — `grp:Role.role` is the only
+  role qualifier in CityGML 3.0; it is read from the document, never derived
+  from the target's class as the old adapter did.
+- `test_target_outside_the_document_is_kept_and_warned` — a cross-document
+  href is a real typed statement: it is stored with `to_external_uri`, warns
+  at import, and reports as a warning rather than an error.
+- `test_appearance_hrefs_do_not_become_city_object_edges` — the appearance
+  module is also under `opengis.net/citygml`, so an unguarded xlink path would
+  mint a bogus edge and a bogus link type from `<app:target>`.
+- `test_import_writes_one_graph` — the import used to write every edge twice,
+  mirroring into `usap_default`; half the relationship table was a duplicate.
+
+## The typed object graph — `test_relationship_graph.py`
+
+- `test_category_is_a_default_not_a_policy` — the default follows containment,
+  a wider category reaches a peer, and naming a type exactly reaches it while
+  excluding the parts. That triple is what makes the default a choice.
+- `test_one_query_can_name_several_link_types` — a `(name, code_space)` pair
+  per entry, because one query routinely spans modules and a single
+  `code_space` argument cannot express that.
+- `test_empty_type_filter_matches_nothing` / `test_unknown_type_or_category_raises`
+  — an explicit empty filter is not "no filter", and a typo raises rather than
+  quietly answering "this object has no parts".
+- `test_traversal_direction` / `test_one_hop_direction_and_default_type_filter`
+  / `test_unknown_direction_raises` — edges are directed but not hierarchical,
+  so direction is a query argument. One-hop defaults to *every* type: a "what
+  is related to this" that hid peer links would be a trap.
+- `test_related_city_objects_returns_edges` /
+  `test_external_target_is_stored_and_only_visible_as_an_edge` — the only view
+  that can show a target outside the package, since such an edge has no object
+  row for `list_city_objects` to return.
+- `test_registering_is_idempotent_and_enriching` /
+  `test_same_name_in_two_code_spaces_stays_distinct` /
+  `test_list_relationship_types_counts_edges` — the registry: a category
+  arriving late is filled in, a contradicting one raises, and the same name
+  from two namespaces stays two types.
+- `test_type_cache_is_dropped_when_a_transaction_rolls_back` — an
+  auto-registration inside a failed transaction no longer exists, and a cache
+  still handing out its id would make the next insert die on the foreign key.
+- `test_exactly_one_endpoint_is_enforced` /
+  `test_duplicate_type_identity_is_rejected_by_the_database` — the `CHECK`,
+  and the COALESCE'd unique index (NULLs are distinct in a SQLite unique
+  index, so a plain constraint would admit `('boundary', NULL)` twice).
+- `test_descendant_walk_uses_its_index` — the 400x regression detector:
+  `EXPLAIN QUERY PLAN` over the recursive CTE must use the index and never
+  scan the relationship table.
+- `test_both_directions_terminate_and_do_not_duplicate` — `UNION` in the
+  recursive term both deduplicates and stops a two-way walk oscillating
+  across one edge.
+
+## Ontology loading — `test_ontology_loading.py`
+
+- `test_ontology_supplies_the_categories` — `usap:category` from an RDF/XML
+  ontology classifies the link types; a property declared without one stays
+  NULL, never assumed to be containment.
+- `test_iso_19150_class_property_names_are_split` — CityGML's published OWL
+  renderings name a property `Class.property`; keeping the class prefix would
+  give a type name no document writes, so the category would land on a type
+  nothing uses.
+- `test_ade_classes_and_their_parents_are_registered` — `owl:Class` +
+  `rdfs:subClassOf` become concepts and closure rows.
+- `test_the_ontology_classifies_a_real_import` — end to end: concepts from the
+  schema, edges from the document, and what counts as a part from the
+  ontology. The same stored edges answer differently before and after.
+- `test_swapping_the_ontology_swaps_the_vocabulary` — the governing
+  requirement as a test: two ontologies over one document, one of which does
+  not consider an opening part of the building.
+- `test_loading_is_idempotent_and_order_independent` /
+  `test_a_contradicting_category_raises` — classify before or after the edges
+  exist, re-load freely, but a category that contradicts one already recorded
+  raises rather than overwriting it.
+- `test_turtle_is_refused_with_a_usable_message` /
+  `test_xml_that_is_not_rdf_is_refused` — the reader is RDF/XML only so that
+  ontology support costs no dependency; refusing must say what to do instead.
+- `test_reads_a_real_world_ade` — runs against an actual ADE when one is in
+  the checkout, and skips otherwise (`*.owl` is gitignored).
 
 ## Ingestion procedures — `test_ingestion_procedures.py`
 

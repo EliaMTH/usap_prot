@@ -1,19 +1,28 @@
 -- ORDER MATTERS!
+-- SQLite accepts a forward FK reference at CREATE TABLE time and only
+-- resolves it at INSERT, so declaration order is not a validity constraint --
+-- but nothing may write a row before the table it points at is populated, and
+-- this file is read top to bottom by people. Keep referenced tables first.
+--
 -- Raw layout:
--- 1. profile / metadata tables
--- 2. usap_asset
--- 3. usap_asset_part
--- 4. usap_semantic_class
--- 5. usap_semantic_class_closure
--- 6. usap_city_object
--- 7. usap_city_object_relationship
--- 8. usap_annotation
--- 9. usap_annotation_object
--- 10. usap_membership_block
--- 11. usap_value_block
--- 13. optional indexes
--- 14. optional helper tables
--- 15. GIS-facing views (attributes + features layers for QGIS/GDAL)
+--  1. GeoPackage core metadata (spatial_ref_sys / contents / extensions / geometry_columns)
+--  2. usap_profile
+--  3. usap_asset
+--  4. usap_asset_part
+--  5. usap_asset_extent
+--  6. usap_semantic_class
+--  7. usap_semantic_class_closure
+--  8. usap_city_object
+--  9. usap_relationship_type          <- must precede the edge table
+-- 10. usap_city_object_relationship
+-- 11. usap_annotation
+-- 12. usap_annotation_object
+-- 13. usap_membership_block
+-- 14. usap_value_block
+-- 15. usap_edit_log
+-- 16. GIS-facing views (attributes + features layers for QGIS/GDAL)
+--
+-- Indexes are declared immediately after the table they serve.
 
 PRAGMA foreign_keys = ON; -- ensure key consistency between tables (i.e.: prevent operations that would break relationship between tables); need to be declare as it is off by default for backwards compatibility
 
@@ -238,21 +247,81 @@ CREATE TABLE usap_city_object (
     attributes_json    TEXT
 );
 
+-- The relationship vocabulary: one row per link *type*, not per spelling.
+--
+-- (local_name, code_space) is the identity, where code_space is the namespace
+-- the property came from -- so bldg/2.0 'boundedBy' and an ADE's 'boundedBy'
+-- are two rows and never collide. Populated from the ontology the package is
+-- initialized on; an unseen type auto-registers on write rather than being
+-- refused, so no document is ever rejected for using a link USAP has not met.
+--
+-- category is the ONLY interpretation stored, and it is a traversal *default*:
+-- every query may still name its own types or categories. It is a property of
+-- the vocabulary (a few hundred rows), never of an edge, so no edit to any
+-- edge can invalidate it -- which is what keeps it clear of the materialized
+-- state rejected in ACCELERATOR_ABLATION.md section 4.1. NULL means
+-- unclassified: the type is kept and reported, never silently treated as
+-- containment.
+CREATE TABLE usap_relationship_type (
+    relationship_type_id  INTEGER PRIMARY KEY,
+
+    local_name            TEXT NOT NULL,
+    code_space            TEXT,
+
+    category              TEXT
+        CHECK (category IS NULL OR category IN (
+            'containment', 'peer', 'generalization', 'grouping'
+        )),
+
+    metadata_json         TEXT
+);
+
+-- An expression index rather than a UNIQUE constraint, for two reasons.
+-- NULLs are distinct in a SQLite unique index, so UNIQUE(local_name,
+-- code_space) would admit ('boundedBy', NULL) twice; COALESCE folds the
+-- "no code space" case into one key. And a UNIQUE constraint would create an
+-- implicit autoindex that test_no_explicit_index_duplicates_a_unique_autoindex
+-- flags as duplicated by this one.
+CREATE UNIQUE INDEX usap_relationship_type_identity
+ON usap_relationship_type(
+    local_name,
+    COALESCE(code_space, '')
+);
+
+CREATE INDEX usap_relationship_type_by_category
+ON usap_relationship_type(
+    category
+);
+
 CREATE TABLE usap_city_object_relationship (
     relationship_id        INTEGER PRIMARY KEY,
 
     graph_name             TEXT NOT NULL DEFAULT 'usap_default',
 
-    parent_city_object_id  INTEGER NOT NULL
+    -- Directed, but not parent/child: 'generalizesTo' and 'adjacentTo' have a
+    -- direction without either end being a part of the other. "This object
+    -- and its parts" is a query over the containment category, not a shape
+    -- baked into these column names.
+    from_city_object_id    INTEGER NOT NULL
         REFERENCES usap_city_object(city_object_id)
         ON DELETE CASCADE,
 
-    child_city_object_id   INTEGER NOT NULL
+    -- Exactly one of the next two is set. CityGML permits an xlink:href that
+    -- points outside the document; such an edge is a real, directed, typed
+    -- statement, and dropping it is how an xlink-serialized file used to
+    -- import as a pile of unrelated roots.
+    to_city_object_id      INTEGER
         REFERENCES usap_city_object(city_object_id)
         ON DELETE CASCADE,
 
-    relationship_type      TEXT NOT NULL,
+    to_external_uri        TEXT,
 
+    relationship_type_id   INTEGER NOT NULL
+        REFERENCES usap_relationship_type(relationship_type_id),
+
+    -- grp:Role.role only -- the single role qualifier in all of CityGML 3.0.
+    -- Never derived from the target's class: that would just restate
+    -- usap_city_object.semantic_class_id.
     role                   TEXT,
 
     source_asset_id        INTEGER
@@ -261,22 +330,32 @@ CREATE TABLE usap_city_object_relationship (
 
     source_relation_id     TEXT,
 
-    metadata_json          TEXT
+    metadata_json          TEXT,
+
+    CHECK ((to_city_object_id IS NULL) <> (to_external_uri IS NULL))
 );
 
-CREATE INDEX usap_rel_by_parent_graph
+CREATE INDEX usap_rel_by_from_graph
 ON usap_city_object_relationship(
     graph_name,
-    parent_city_object_id,
-    relationship_type
+    from_city_object_id,
+    relationship_type_id
 );
 
-CREATE INDEX usap_rel_by_child_graph
+CREATE INDEX usap_rel_by_to_graph
 ON usap_city_object_relationship(
     graph_name,
-    child_city_object_id,
-    relationship_type
+    to_city_object_id,
+    relationship_type_id
 );
+
+-- Serves the unresolved-target validation report. Partial, so a package with
+-- no dangling xlinks pays nothing for it.
+CREATE INDEX usap_rel_unresolved
+ON usap_city_object_relationship(
+    to_external_uri
+)
+WHERE to_external_uri IS NOT NULL;
 
 CREATE TABLE usap_annotation (
     annotation_id          INTEGER PRIMARY KEY,

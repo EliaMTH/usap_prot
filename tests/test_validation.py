@@ -146,9 +146,10 @@ def test_validation_catches_containment_cycle(tmp_path: Path) -> None:
         child = pkg.resolve_city_object("building_000000_roof")
 
         pkg.link_city_objects(
-            parent_city_object_id=child,
-            child_city_object_id=parent,
-            relationship_type="contains",
+            child,
+            parent,
+            "contains",
+            category="containment",
         )
 
         report = pkg.validate_report()
@@ -170,9 +171,10 @@ def test_non_containment_cycle_is_not_an_error(tmp_path: Path) -> None:
 
         for parent, child in [(first, second), (second, first)]:
             pkg.link_city_objects(
-                parent_city_object_id=parent,
-                child_city_object_id=child,
-                relationship_type="adjacentTo",
+                parent,
+                child,
+                "adjacentTo",
+                category="peer",
             )
 
         report = pkg.validate_report()
@@ -213,24 +215,25 @@ def test_validation_warns_on_duplicate_relationship_edges(pkg: USAPPackage) -> N
     parent = pkg.create_city_object(object_uid="b1")
     child = pkg.create_city_object(object_uid="b1_roof")
 
-    pkg.link_city_objects(
-        parent_city_object_id=parent,
-        child_city_object_id=child,
-        relationship_type="boundedBy",
-        role="roof",
+    type_id = pkg.register_relationship_type(
+        "boundary",
+        code_space="http://www.opengis.net/citygml/3.0",
+        category="containment",
     )
 
-    # Simulate a legacy duplicate behind the API's back.
+    pkg.link_city_objects(parent, child, type_id, role="roof")
+
+    # Simulate a duplicate written behind the API's back.
     with pkg.transaction():
         pkg.conn.execute(
             """
             INSERT INTO usap_city_object_relationship (
-                graph_name, parent_city_object_id, child_city_object_id,
-                relationship_type, role
+                graph_name, from_city_object_id, to_city_object_id,
+                relationship_type_id, role
             )
-            VALUES ('usap_default', ?, ?, 'boundedBy', 'roof')
+            VALUES ('usap_default', ?, ?, ?, 'roof')
             """,
-            (parent, child),
+            (parent, child, type_id),
         )
 
     report = pkg.validate_report()
@@ -242,6 +245,11 @@ def test_validation_warns_on_duplicate_relationship_edges(pkg: USAPPackage) -> N
     assert len(duplicates) == 1
     assert duplicates[0].severity == "warning"
     assert report.is_ok  # a warning must not make the package invalid
+
+    # The report joins the type back to a readable name: the stored column is
+    # an id, and a report printing that would be useless to a human.
+    assert duplicates[0].details["relationship_type"] == "boundary"
+    assert duplicates[0].details["from_city_object_id"] == parent
 
 
 def test_validation_catches_unsupported_encoding(tmp_path: Path) -> None:

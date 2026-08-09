@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Test fixture: relief and city-furniture classes the suite touches.
+
+  Relief components substitute AbstractReliefComponent, NOT ReliefFeature —
+  ReliefFeature *aggregates* them via the reliefComponent property. The
+  deleted registry encoded that aggregation as inheritance.
+-->
+<schema xmlns="http://www.w3.org/2001/XMLSchema"
+        xmlns:core="http://www.opengis.net/citygml/3.0"
+        xmlns:dem="http://www.opengis.net/citygml/relief/3.0"
+        elementFormDefault="qualified"
+        targetNamespace="http://www.opengis.net/citygml/relief/3.0"
+        version="3.0.0">
+
+  <import namespace="http://www.opengis.net/citygml/3.0" schemaLocation="core.xsd"/>
+
+  <element name="ReliefFeature" substitutionGroup="core:AbstractSpaceBoundary" type="anyType"/>
+  <element abstract="true" name="AbstractReliefComponent" substitutionGroup="core:AbstractSpaceBoundary" type="anyType"/>
+  <element name="TINRelief" substitutionGroup="dem:AbstractReliefComponent" type="anyType"/>
+  <element name="MassPointRelief" substitutionGroup="dem:AbstractReliefComponent" type="anyType"/>
+  <element name="RasterRelief" substitutionGroup="dem:AbstractReliefComponent" type="anyType"/>
+</schema>

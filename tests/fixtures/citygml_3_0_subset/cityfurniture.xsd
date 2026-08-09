@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Test fixture: the city-furniture module. Note the real namespace is
+  all-lowercase 'cityfurniture', not the camelCase 'cityFurniture' the
+  deleted registry used as a module token.
+-->
+<schema xmlns="http://www.w3.org/2001/XMLSchema"
+        xmlns:core="http://www.opengis.net/citygml/3.0"
+        elementFormDefault="qualified"
+        targetNamespace="http://www.opengis.net/citygml/cityfurniture/3.0"
+        version="3.0.0">
+
+  <import namespace="http://www.opengis.net/citygml/3.0" schemaLocation="core.xsd"/>
+
+  <element name="CityFurniture" substitutionGroup="core:AbstractOccupiedSpace" type="anyType"/>
+</schema>

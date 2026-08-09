@@ -14,6 +14,12 @@
 from __future__ import annotations
 
 from usap import ELEMENT_KIND_FACE, USAPPackage
+from usap.constants import (
+    CITYGML_3_0_BUILDING_NS,
+    CITYGML_3_0_CONSTRUCTION_NS,
+    CITYGML_3_0_CORE_NS,
+    concept_uri,
+)
 
 def main() -> None:
     with USAPPackage.create(
@@ -47,18 +53,24 @@ def main() -> None:
         # ------------------------------------------------------------
         # 3. Semantic classes
         # ------------------------------------------------------------
+        # Created by hand here to keep the demo self-contained; a real package
+        # reads them from a schema with load_citygml_schema(). The identity
+        # must match either way — note RoofSurface is a *construction* concept
+        # in CityGML 3.0, not a building one.
         building_class_id = pkg.create_semantic_class(
             scheme="citygml",
             scheme_version="3.0",
-            class_uri="citygml-3.0:building:Building",
+            class_uri=concept_uri(CITYGML_3_0_BUILDING_NS, "Building"),
             local_name="Building",
+            source_namespace=CITYGML_3_0_BUILDING_NS,
         )
 
         roof_class_id = pkg.create_semantic_class(
             scheme="citygml",
             scheme_version="3.0",
-            class_uri="citygml-3.0:building:RoofSurface",
+            class_uri=concept_uri(CITYGML_3_0_CONSTRUCTION_NS, "RoofSurface"),
             local_name="RoofSurface",
+            source_namespace=CITYGML_3_0_CONSTRUCTION_NS,
         )
 
         # ------------------------------------------------------------
@@ -77,12 +89,17 @@ def main() -> None:
         # ------------------------------------------------------------
         # 5. usap_default object graph
         # ------------------------------------------------------------
+        # The link type is the CityGML property the edge stands for, with the
+        # namespace that gives it identity. `category` says what the link
+        # *means* for traversal — no CityGML artifact states that, so the
+        # builder does. Without it the edge is still recorded and queryable by
+        # name, but the roof is not reported as part of the building.
         pkg.link_city_objects(
-            parent_city_object_id=building_id,
-            child_city_object_id=roof_id,
-            relationship_type="boundedBy",
-            role="roof",
-            graph_name="usap_default",
+            building_id,
+            roof_id,
+            "boundary",
+            code_space=CITYGML_3_0_CORE_NS,
+            category="containment",
         )
 
         # ------------------------------------------------------------

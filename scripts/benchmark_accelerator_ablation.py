@@ -50,6 +50,7 @@ from statistics import mean
 
 import numpy as np
 
+from usap.constants import CITYGML_3_0_CORE_NS, DEFAULT_GRAPH_NAME
 from usap import (
     DEFAULT_SCHEMA_PATH,
     ELEMENT_KIND_FACE,
@@ -464,10 +465,12 @@ def deepen_package(pkg: USAPPackage, result, config: SyntheticConfig) -> dict:
             district_ids.append(district_id)
 
             pkg.link_city_objects(
-                parent_city_object_id=root_id,
-                child_city_object_id=district_id,
-                relationship_type="contains",
-                graph_name="usap_default",
+                root_id,
+                district_id,
+                "boundary",
+                code_space=CITYGML_3_0_CORE_NS,
+                category="containment",
+                graph_name=DEFAULT_GRAPH_NAME,
             )
 
         buildings = pkg.conn.execute(
@@ -482,10 +485,12 @@ def deepen_package(pkg: USAPPackage, result, config: SyntheticConfig) -> dict:
 
         for i, row in enumerate(buildings):
             pkg.link_city_objects(
-                parent_city_object_id=district_ids[i % district_count],
-                child_city_object_id=int(row["city_object_id"]),
-                relationship_type="contains",
-                graph_name="usap_default",
+                district_ids[i % district_count],
+                int(row["city_object_id"]),
+                "boundary",
+                code_space=CITYGML_3_0_CORE_NS,
+                category="containment",
+                graph_name=DEFAULT_GRAPH_NAME,
             )
 
     # 3. Two whole-part value fields (f4): a gradient the min/max pruning

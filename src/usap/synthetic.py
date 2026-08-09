@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .constants import ELEMENT_KIND_FACE
+from .constants import (
+    CITYGML_3_0_COMMON_CLASSES,
+    CITYGML_3_0_CORE_NS,
+    DEFAULT_GRAPH_NAME,
+    ELEMENT_KIND_FACE,
+    concept_uri,
+)
 from .core import DEFAULT_SCHEMA_PATH, USAPPackage
 
 
@@ -117,33 +123,26 @@ def create_synthetic_package(
             # ------------------------------------------------------------
             # 3. Semantic classes
             # ------------------------------------------------------------
-            building_class_id = pkg.create_semantic_class(
-                scheme="citygml",
-                scheme_version="3.0",
-                class_uri="citygml-3.0:building:Building",
-                local_name="Building",
-            )
+            # Created by hand rather than loaded from a schema: a synthetic
+            # package has no CityGML document behind it. The identity still
+            # has to match what load_citygml_schema would derive, or a package
+            # that later loads the real schema gets the same class twice under
+            # two URIs and resolve_semantic_class starts raising on the name.
+            def _citygml_class(local_name: str) -> int:
+                namespace = CITYGML_3_0_COMMON_CLASSES[local_name]
 
-            roof_class_id = pkg.create_semantic_class(
-                scheme="citygml",
-                scheme_version="3.0",
-                class_uri="citygml-3.0:building:RoofSurface",
-                local_name="RoofSurface",
-            )
+                return pkg.create_semantic_class(
+                    scheme="citygml",
+                    scheme_version="3.0",
+                    class_uri=concept_uri(namespace, local_name),
+                    local_name=local_name,
+                    source_namespace=namespace,
+                )
 
-            wall_class_id = pkg.create_semantic_class(
-                scheme="citygml",
-                scheme_version="3.0",
-                class_uri="citygml-3.0:building:WallSurface",
-                local_name="WallSurface",
-            )
-
-            ground_class_id = pkg.create_semantic_class(
-                scheme="citygml",
-                scheme_version="3.0",
-                class_uri="citygml-3.0:building:GroundSurface",
-                local_name="GroundSurface",
-            )
+            building_class_id = _citygml_class("Building")
+            roof_class_id = _citygml_class("RoofSurface")
+            wall_class_id = _citygml_class("WallSurface")
+            ground_class_id = _citygml_class("GroundSurface")
 
             annotation_count = 0
 
@@ -177,30 +176,20 @@ def create_synthetic_package(
                     semantic_class_id=ground_class_id,
                 )
 
-                # Avoid rebuilding closure after every edge.
-                pkg.link_city_objects(
-                    parent_city_object_id=building_id,
-                    child_city_object_id=roof_id,
-                    relationship_type="boundedBy",
-                    role="roof",
-                    graph_name="usap_default",
-                )
-
-                pkg.link_city_objects(
-                    parent_city_object_id=building_id,
-                    child_city_object_id=wall_id,
-                    relationship_type="boundedBy",
-                    role="wall",
-                    graph_name="usap_default",
-                )
-
-                pkg.link_city_objects(
-                    parent_city_object_id=building_id,
-                    child_city_object_id=ground_id,
-                    relationship_type="boundedBy",
-                    role="ground",
-                    graph_name="usap_default",
-                )
+                # core:boundary is the CityGML 3.0 property that makes a
+                # surface part of a space. The code space and category are
+                # given explicitly because a synthetic package has no ontology
+                # behind it: without a category these edges would register
+                # unclassified and the building would report no parts.
+                for surface_id in (roof_id, wall_id, ground_id):
+                    pkg.link_city_objects(
+                        building_id,
+                        surface_id,
+                        "boundary",
+                        code_space=CITYGML_3_0_CORE_NS,
+                        category="containment",
+                        graph_name=DEFAULT_GRAPH_NAME,
+                    )
 
                 base = i * faces_per_building
 

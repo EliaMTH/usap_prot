@@ -5,13 +5,17 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_mesh_part, make_pkg
+from conftest import make_mesh_part, make_pkg, seed_citygml_concepts
+from usap.constants import (
+    CITYGML_3_0_BUILDING_NS,
+    CITYGML_3_0_CONSTRUCTION_NS,
+    concept_uri,
+)
 from usap import (
     ELEMENT_KIND_FACE,
     ELEMENT_KIND_POINT,
     USAPError,
     USAPPackage,
-    seed_default_citygml_vocabulary,
 )
 from usap.constants import DEFAULT_BLOCK_SIZE, normalize_element_kind
 
@@ -51,14 +55,14 @@ def build_tiny_package(db_path: Path) -> tuple[USAPPackage, int, int, int]:
     building_class_id = pkg.create_semantic_class(
         scheme="citygml",
         scheme_version="3.0",
-        class_uri="citygml-3.0:building:Building",
+        class_uri=concept_uri(CITYGML_3_0_BUILDING_NS, "Building"),
         local_name="Building",
     )
 
     roof_class_id = pkg.create_semantic_class(
         scheme="citygml",
         scheme_version="3.0",
-        class_uri="citygml-3.0:building:RoofSurface",
+        class_uri=concept_uri(CITYGML_3_0_CONSTRUCTION_NS, "RoofSurface"),
         local_name="RoofSurface",
     )
 
@@ -73,9 +77,10 @@ def build_tiny_package(db_path: Path) -> tuple[USAPPackage, int, int, int]:
     )
 
     pkg.link_city_objects(
-        parent_city_object_id=building_id,
-        child_city_object_id=roof_id,
-        relationship_type="boundedBy",
+        building_id,
+        roof_id,
+        "boundedBy",
+        category="containment",
         role="roof",
         graph_name="usap_default",
     )
@@ -220,9 +225,10 @@ def test_descendants_follow_containment_edges_only(tmp_path: Path) -> None:
         )
 
         pkg.link_city_objects(
-            parent_city_object_id=pkg.resolve_city_object("building_1"),
-            child_city_object_id=neighbour_id,
-            relationship_type="adjacentTo",
+            pkg.resolve_city_object("building_1"),
+            neighbour_id,
+            "adjacentTo",
+            category="peer",
         )
 
         blocks = pkg.elements_for_city_object("building_1", expand=True)
@@ -237,7 +243,7 @@ def test_descendants_follow_containment_edges_only(tmp_path: Path) -> None:
         followed = pkg.elements_for_city_object(
             "building_1",
             expand=True,
-            containment_types=("boundedBy", "adjacentTo"),
+            relationship_types=("boundedBy", "adjacentTo"),
         )
 
         assert 500 in {index for block in followed for index in block["elements"]}
@@ -376,15 +382,17 @@ def test_link_city_objects_is_idempotent(pkg: USAPPackage) -> None:
     child = pkg.create_city_object(object_uid="b1_roof")
 
     first = pkg.link_city_objects(
-        parent_city_object_id=parent,
-        child_city_object_id=child,
-        relationship_type="boundedBy",
+        parent,
+        child,
+        "boundedBy",
+        category="containment",
         role="roof",
     )
     second = pkg.link_city_objects(
-        parent_city_object_id=parent,
-        child_city_object_id=child,
-        relationship_type="boundedBy",
+        parent,
+        child,
+        "boundedBy",
+        category="containment",
         role="roof",
     )
 
@@ -398,9 +406,10 @@ def test_link_city_objects_is_idempotent(pkg: USAPPackage) -> None:
 
     # A variant edge (different role) is a different claim and must insert.
     third = pkg.link_city_objects(
-        parent_city_object_id=parent,
-        child_city_object_id=child,
-        relationship_type="boundedBy",
+        parent,
+        child,
+        "boundedBy",
+        category="containment",
         role="wall",
     )
 
@@ -444,7 +453,7 @@ def test_default_paths_work_from_any_cwd(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
 
     with USAPPackage.create(tmp_path / "cwd.usap.gpkg", overwrite=True) as pkg:
-        vocab = seed_default_citygml_vocabulary(pkg)
+        vocab = seed_citygml_concepts(pkg)
 
         assert "Building" in vocab.by_name
 
@@ -506,9 +515,10 @@ def test_elements_for_city_object_survives_many_descendants(tmp_path: Path) -> N
                 child_id = pkg.create_city_object(object_uid=f"child_{i:04d}")
 
                 pkg.link_city_objects(
-                    parent_city_object_id=root_id,
-                    child_city_object_id=child_id,
-                    relationship_type="contains",
+                    root_id,
+                    child_id,
+                    "contains",
+                    category="containment",
                 )
 
                 child_ids.append(child_id)
@@ -620,9 +630,10 @@ def test_list_city_objects_and_children(pkg: USAPPackage) -> None:
 
     for child in (roof, wall):
         pkg.link_city_objects(
-            parent_city_object_id=building,
-            child_city_object_id=child,
-            relationship_type="boundedBy",
+            building,
+            child,
+            "boundedBy",
+            category="containment",
         )
 
     # all objects
@@ -637,15 +648,15 @@ def test_list_city_objects_and_children(pkg: USAPPackage) -> None:
     assert [o["object_uid"] for o in carriers] == ["building_1_roof_1"]
 
     # expand a node: direct children only (by id or by uid)
-    children = pkg.list_city_objects(parent_object="building_1")
+    children = pkg.list_city_objects(related_to="building_1")
     assert {o["object_uid"] for o in children} == {
         "building_1_roof_1",
         "building_1_wall_1",
     }
-    assert pkg.list_city_objects(parent_object=building) == children
+    assert pkg.list_city_objects(related_to=building) == children
 
     # a leaf has no children
-    assert pkg.list_city_objects(parent_object="building_1_roof_1") == []
+    assert pkg.list_city_objects(related_to="building_1_roof_1") == []
 
 
 def test_reregistering_an_asset_with_different_values_raises(pkg: USAPPackage) -> None:

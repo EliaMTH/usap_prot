@@ -63,12 +63,21 @@ CONFIDENCE_RANGE = (0.0, 1.0)
 
 # The version stamped on packages this build creates.
 #
+# 0.3.0 replaced the parent/child edge with a direction-neutral, typed one:
+# usap_relationship_type as the link vocabulary, from_/to_city_object_id,
+# to_external_uri for an xlink that leaves the document, and traversal driven
+# by a relationship category instead of a hardcoded CityGML 2.0 token list.
+# CityGML concepts stopped shipping with USAP at the same time; they are read
+# from the schema or ontology a package is initialized on.
+#
 # 0.2.0 added usap_profile.package_iri, the canonical 'algorithm:digest'
 # content hash, UTC ISO-8601 timestamps, concept provenance columns, and
-# usap_asset_part.indexing_profile. A 0.1.0 package has no package_iri at all,
-# so it cannot be read as a 0.2.0 one; packages were experimental and are
-# rebuilt rather than migrated.
-CURRENT_PROFILE_VERSION = "0.2.0"
+# usap_asset_part.indexing_profile.
+#
+# Neither step has a migration path: the endpoint columns are renamed and the
+# type is now a foreign key, so an older package cannot be read as a newer one.
+# Packages are experimental and are rebuilt rather than migrated.
+CURRENT_PROFILE_VERSION = "0.3.0"
 
 # Only packages written by a profile version this build understands can be
 # opened; there is no migration path yet, so opening a newer one would
@@ -77,18 +86,79 @@ SUPPORTED_PROFILE_VERSIONS = (CURRENT_PROFILE_VERSION,)
 
 DEFAULT_GRAPH_NAME = "usap_default"
 
-# usap_city_object_relationship is a *typed* graph, but "an object and its
-# parts" is a containment question. These are the edge types descendant
-# expansion follows: the four the CityGML adapter emits, each genuinely
-# part-of (a window is part of its wall surface, hence 'opening'). Anything
-# else (adjacentTo, connectedTo, ...) relates two objects without making one
-# part of the other. Callers with their own vocabulary pass containment_types.
-CONTAINMENT_RELATIONSHIP_TYPES = (
-    "contains",
-    "consistsOf",
-    "boundedBy",
-    "opening",
+# Every CityGML module namespace, in every version, sits under this host path.
+# An element outside it (gml:, xAL:, xs:) is not a CityGML concept, and is the
+# natural termination of a substitutionGroup chain.
+CITYGML_NAMESPACE_MARKER = "opengis.net/citygml"
+
+# The root of the city-object branch. A concept that reaches it by
+# substitution is something a .gml can instantiate as a city object; one that
+# does not — CityObjectRelation, Role, CityModel, Address, AbstractPointCloud,
+# the appearance and versioning classes — is a real CityGML class but never an
+# object, and creating one would put a relation object into usap_city_object.
+CITY_OBJECT_ROOT_LOCAL_NAME = "AbstractCityObject"
+
+# The real CityGML 3.0 module namespaces, for callers that create a concept by
+# hand instead of loading a schema. Spelled out because guessing them is how a
+# concept ends up filed under the wrong module: the thematic surfaces belong to
+# `construction`, not `building`, and the module tokens are all-lowercase.
+CITYGML_3_0_CORE_NS = "http://www.opengis.net/citygml/3.0"
+CITYGML_3_0_BUILDING_NS = "http://www.opengis.net/citygml/building/3.0"
+CITYGML_3_0_CONSTRUCTION_NS = "http://www.opengis.net/citygml/construction/3.0"
+
+# The handful of classes the synthetic generator and the examples create
+# directly. Same identity load_citygml_schema derives, so the two agree and
+# a package can hold both without the class arriving twice.
+CITYGML_3_0_COMMON_CLASSES = {
+    "Building": CITYGML_3_0_BUILDING_NS,
+    "BuildingPart": CITYGML_3_0_BUILDING_NS,
+    "RoofSurface": CITYGML_3_0_CONSTRUCTION_NS,
+    "WallSurface": CITYGML_3_0_CONSTRUCTION_NS,
+    "GroundSurface": CITYGML_3_0_CONSTRUCTION_NS,
+}
+
+
+def concept_uri(source_namespace: str, local_name: str) -> str:
+    """
+    The class_uri form load_citygml_schema derives, as a function.
+
+    A hand-created concept must agree with the schema-derived one, or the same
+    class arrives twice under two URIs and resolve_semantic_class starts
+    raising on the local name. Build the URI here rather than writing it out.
+    """
+    return f"{source_namespace}#{local_name}"
+
+# How a link type relates its two endpoints. Stored on usap_relationship_type,
+# not on the edge: it is a property of the vocabulary, and every query can
+# override it. NULL there means unclassified, which is why this tuple has no
+# "unknown" member -- absence is the unclassified state.
+#
+#   containment     the target is part of the source; what "and its parts"
+#                   follows (CityGML boundary, buildingPart, filling, ...)
+#   peer            related without either being part of the other
+#                   (adjacentTo, predecessor/successor)
+#   generalization  the same real-world thing at another level of detail
+#                   (generalizesTo)
+#   grouping        membership in a user-defined group (groupMember)
+#
+# This replaces CONTAINMENT_RELATIONSHIP_TYPES, which hardcoded four CityGML
+# *2.0* tokens: two of them ('contains', 'opening') are unreachable from any
+# CityGML 3.0 property, and the 3.0 properties that do mean part-of were
+# recorded and then never traversed.
+RELATIONSHIP_CATEGORIES = (
+    "containment",
+    "peer",
+    "generalization",
+    "grouping",
 )
+
+# What "this object and its parts" means when a query does not say otherwise.
+DEFAULT_TRAVERSAL_CATEGORIES = ("containment",)
+
+# Which way an edge is followed. Edges are directed but not hierarchical, so
+# the direction is a query argument rather than a property of the data:
+# 'out' from_ -> to_, 'in' the reverse, 'both' either way.
+RELATIONSHIP_DIRECTIONS = ("out", "in", "both")
 
 # Per-element value fields. Dtype tags are numpy-style and stored
 # little-endian on disk regardless of the host byte order.

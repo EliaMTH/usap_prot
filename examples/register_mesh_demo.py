@@ -6,7 +6,7 @@ from usap import (
     ELEMENT_KIND_FACE,
     USAPPackage,
     register_mesh_asset,
-    seed_default_citygml_vocabulary,
+    load_citygml_schema,
 )
 
 
@@ -38,13 +38,26 @@ def main() -> None:
         help="Optional LoD label, e.g. LoD1 or LoD2. Leave empty for generic meshes.",
     )
 
+    parser.add_argument(
+        "--citygml-schema",
+        required=True,
+        help=(
+            "Path to the OGC CityGML 3.0 XSDs (a directory or a single .xsd). "
+            "USAP ships no CityGML vocabulary: concepts are read from the "
+            "schema you supply. Get them from "
+            "schemas.opengis.net/citygml/citygml-3_0_0.zip."
+        ),
+    )
+
     args = parser.parse_args()
 
     with USAPPackage.create(
         args.db,
         overwrite=True,
     ) as pkg:
-        classes = seed_default_citygml_vocabulary(pkg)
+        classes = load_citygml_schema(
+            pkg, args.citygml_schema, scheme_version="3.0"
+        )
 
         mesh = register_mesh_asset(
             pkg,

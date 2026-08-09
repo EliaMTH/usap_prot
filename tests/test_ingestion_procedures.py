@@ -14,7 +14,12 @@ import json
 from pathlib import Path
 
 import pytest
-from conftest import assert_package_valid
+from conftest import (
+    CITYGML_CONTAINMENT_CONFIG,
+    CITYGML_SCHEMA_FIXTURE,
+    assert_package_valid,
+    seed_citygml_concepts,
+)
 from conftest import write_tiny_mesh as _write_tiny_mesh
 
 from usap import (
@@ -27,14 +32,15 @@ from usap import (
 
 TINY_CITYGML = """<?xml version="1.0" encoding="UTF-8"?>
 <core:CityModel
-    xmlns:core="http://www.opengis.net/citygml/2.0"
-    xmlns:gml="http://www.opengis.net/gml"
-    xmlns:bldg="http://www.opengis.net/citygml/building/2.0">
+    xmlns:core="http://www.opengis.net/citygml/3.0"
+    xmlns:gml="http://www.opengis.net/gml/3.2"
+    xmlns:con="http://www.opengis.net/citygml/construction/3.0"
+    xmlns:bldg="http://www.opengis.net/citygml/building/3.0">
   <core:cityObjectMember>
     <bldg:Building gml:id="building_1">
-      <bldg:boundedBy>
-        <bldg:RoofSurface gml:id="building_1_roof_1"/>
-      </bldg:boundedBy>
+      <core:boundary>
+        <con:RoofSurface gml:id="building_1_roof_1"/>
+      </core:boundary>
     </bldg:Building>
   </core:cityObjectMember>
 </core:CityModel>
@@ -84,6 +90,8 @@ def _procedure_1_files(tmp_path: Path) -> Path:
         {
             "db_path": "proc1.usap.gpkg",
             "manifest_path": "proc1_manifest.json",
+            "citygml_schema": str(CITYGML_SCHEMA_FIXTURE),
+            "relationship_types": CITYGML_CONTAINMENT_CONFIG,
             "citygml": {"path": "city.gml"},
             "meshes": [
                 {
@@ -276,6 +284,7 @@ def test_carriers_are_queryable_in_every_graph(tmp_path: Path) -> None:
     (tmp_path / "city.gml").write_text(TINY_CITYGML, encoding="utf-8")
 
     with _minimal_pkg(tmp_path) as pkg:
+        seed_citygml_concepts(pkg)
         import_citygml_semantics(pkg, tmp_path / "city.gml")
 
         apply_batch(

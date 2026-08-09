@@ -20,3 +20,13 @@ PHASE1_BASELINE.md
 USAP_report.md
 
 FW_*
+
+*.owl
+*.pdf
+
+# Local working copies of external authorities. Not vendored: the SDK takes a
+# path to these, it does not ship them.
+#   citygml-3.0-schemas/  OGC CityGML 3.0 XSDs (schemas.opengis.net/citygml/citygml-3_0_0.zip)
+#   ontologies-local/     LIRIS CityGML 3.0 OWL, served as Turtle
+citygml-3.0-schemas/
+ontologies-local/

@@ -179,7 +179,8 @@ def main() -> None:
         default="EnergyRoof",
         help=(
             "Accepted concept to annotate with. Examples: EnergyRoof, "
-            "RoofSurface, citygml-3.0:building:RoofSurface."
+            "RoofSurface, "
+            "http://www.opengis.net/citygml/construction/3.0#RoofSurface."
         ),
     )
 

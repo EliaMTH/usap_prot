@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Test fixture: the CityObjectGroup module.
+
+  Two things here matter to USAP. CityObjectGroup is a logical space, so it IS
+  a city object. Role is not — it substitutes gml:AbstractGML, exactly like
+  core:CityObjectRelation, because it is an objectified *relation* rather than
+  a thing in the city. Registering it as a concept is correct; instantiating
+  one as a city object would not be, which is what is_city_object_class
+  prevents.
+-->
+<schema xmlns="http://www.w3.org/2001/XMLSchema"
+        xmlns:core="http://www.opengis.net/citygml/3.0"
+        xmlns:grp="http://www.opengis.net/citygml/cityobjectgroup/3.0"
+        elementFormDefault="qualified"
+        targetNamespace="http://www.opengis.net/citygml/cityobjectgroup/3.0"
+        version="3.0.0">
+
+  <import namespace="http://www.opengis.net/citygml/3.0" schemaLocation="core.xsd"/>
+
+  <element name="CityObjectGroup" substitutionGroup="core:AbstractLogicalSpace" type="anyType"/>
+  <element name="Role" substitutionGroup="gml:AbstractGML" type="anyType"/>
+</schema>

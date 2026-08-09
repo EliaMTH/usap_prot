@@ -484,6 +484,14 @@ def _replace_field_blocks(
     Overwrite an annotation's value blocks via raw SQL with
     (block_start, values, dtype_tag) triples, keeping min/max consistent.
     """
+    # The blocks being replaced already belong to an assessment; reuse it, so
+    # the corruption under test stays the dtype/coverage one and does not
+    # accidentally become an orphaned-assessment error.
+    assessment_id = pkg.conn.execute(
+        "SELECT assessment_id FROM usap_value_block WHERE annotation_id = ?",
+        (annotation_id,),
+    ).fetchone()["assessment_id"]
+
     pkg.conn.execute(
         "DELETE FROM usap_value_block WHERE annotation_id = ?",
         (annotation_id,),
@@ -495,13 +503,14 @@ def _replace_field_blocks(
         pkg.conn.execute(
             """
             INSERT INTO usap_value_block (
-                annotation_id, asset_part_id, element_kind,
+                assessment_id, annotation_id, asset_part_id, element_kind,
                 block_start, element_count, value_dtype,
                 value_min, value_max, payload
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                assessment_id,
                 annotation_id,
                 asset_part_id,
                 ELEMENT_KIND_FACE,

@@ -48,6 +48,11 @@ def main() -> None:
             part_path="node=0/mesh=0/primitive=0",
             element_kind=ELEMENT_KIND_FACE,
             element_count=10000,
+            # State which convention numbered these faces. A part registered
+            # without one is reported by validate_report(): an index only means
+            # something relative to the reader that assigned it, and nothing can
+            # detect a mismatch after the fact.
+            indexing_profile="usap:demo-face-order-v1",
         )
 
         # ------------------------------------------------------------
@@ -109,7 +114,6 @@ def main() -> None:
             annotation_uid="ann_building_1_roof_mesh",
             semantic_class_id=roof_class_id,
             primary_city_object_id=roof_id,
-            label="Roof of building_1 in mesh",
             status="accepted",
             confidence=1.0,
         )
@@ -143,7 +147,7 @@ def main() -> None:
 
         for match in matches:
             print("Annotation:", match["annotation_uid"])
-            print("Label:", match["label"])
+            print("Assessed at:", match["assessed_at"] or "(undated)")
             print("Status:", match["status"])
             print("Semantic class:", match["semantic_class"])
             print("Primary city object:", match["primary_city_object_uid"])

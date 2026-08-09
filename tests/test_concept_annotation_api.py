@@ -42,7 +42,6 @@ def test_annotate_elements_with_citygml_concept(tmp_path: Path) -> None:
             asset_part_id=mesh.primary_asset_part_id,
             element_kind=ELEMENT_KIND_FACE,
             element_indices=[1],
-            label="RoofSurface annotation through generic API",
             status="accepted",
             confidence=1.0,
         )
@@ -97,7 +96,6 @@ def test_annotate_elements_with_ade_concept_and_city_object(tmp_path: Path) -> N
             element_kind=ELEMENT_KIND_FACE,
             element_indices=[0, 1],
             city_object_uid="building_1_roof_1",
-            label="EnergyRoof annotation through generic API",
             status="draft",
             attributes={
                 "domain": "energy_emissions",

@@ -152,6 +152,7 @@ def validate_connection(
         _validate_profile(conn, report)
         _validate_semantic_class_registry(conn, report)
         _validate_orphans(conn, report)
+        _validate_assessments(conn, report)
         _validate_annotation_object_links(conn, report)
         _validate_membership_blocks(conn, report, decode_payloads=deep)
         _validate_value_blocks(conn, report, decode_payloads=deep)
@@ -395,6 +396,136 @@ def _validate_city_object_relationships(
             },
         )
 
+def _validate_assessments(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    """
+    Check the assessment layer's two structural invariants.
+
+    Both are things the write path already refuses, checked again here because
+    a package can be written by anything: they are the invariants that make an
+    assessment's membership mean what it says.
+
+      1. A block's denormalised annotation_id agrees with its assessment's.
+         Disagreement attributes a claim to the wrong annotation, and since
+         forward queries read the denormalised column while the assessment
+         carries the date, the two would answer differently about the same
+         block.
+
+      2. A block sits in a part of the asset its assessment evaluates. This is
+         what asset-level binding buys: an assessment says "as measured on this
+         asset", so membership indexed against a different asset is a claim
+         about geometry nobody assessed.
+    """
+    for table, label in (
+        ("usap_membership_block", "Membership block"),
+        ("usap_value_block", "Value block"),
+    ):
+        mismatched = _count(
+            conn,
+            f"""
+            SELECT COUNT(*) AS n
+            FROM {table} AS b
+            JOIN usap_assessment AS asm
+                ON asm.assessment_id = b.assessment_id
+            WHERE b.annotation_id != asm.annotation_id
+            """,
+        )
+
+        if mismatched:
+            report.add(
+                severity="error",
+                code="ASSESSMENT_ANNOTATION_MISMATCH",
+                message=(
+                    f"{mismatched} {label.lower()}(s) name an annotation that "
+                    "differs from their assessment's annotation."
+                ),
+                table=table,
+            )
+
+        outside = _count(
+            conn,
+            f"""
+            SELECT COUNT(*) AS n
+            FROM {table} AS b
+            JOIN usap_assessment AS asm
+                ON asm.assessment_id = b.assessment_id
+            JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = b.asset_part_id
+            WHERE ap.asset_id != asm.asset_id
+            """,
+        )
+
+        if outside:
+            report.add(
+                severity="error",
+                code=(
+                    "MEMBERSHIP_OUTSIDE_ASSESSMENT_ASSET"
+                    if table == "usap_membership_block"
+                    else "VALUE_BLOCK_OUTSIDE_ASSESSMENT_ASSET"
+                ),
+                message=(
+                    f"{outside} {label.lower()}(s) index an asset part that "
+                    "does not belong to their assessment's asset."
+                ),
+                table=table,
+            )
+
+    unknown_status = _count(
+        conn,
+        f"""
+        SELECT COUNT(*) AS n
+        FROM usap_assessment
+        WHERE status NOT IN ({",".join("?" * len(ANNOTATION_STATUSES))})
+        """,
+        tuple(ANNOTATION_STATUSES),
+    )
+
+    if unknown_status:
+        report.add(
+            severity="error",
+            code="ASSESSMENT_UNKNOWN_STATUS",
+            message=(
+                f"{unknown_status} assessment(s) have a status outside "
+                f"{', '.join(ANNOTATION_STATUSES)}."
+            ),
+            table="usap_assessment",
+        )
+
+    # A warning, not an error: an assessment recorded before its geometry was
+    # selected is a normal intermediate state, but one that never gains
+    # membership is a claim that covers nothing.
+    empty = _count(
+        conn,
+        """
+        SELECT COUNT(*) AS n
+        FROM usap_assessment AS asm
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM usap_membership_block AS mb
+            WHERE mb.assessment_id = asm.assessment_id
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM usap_value_block AS vb
+            WHERE vb.assessment_id = asm.assessment_id
+        )
+        """,
+    )
+
+    if empty:
+        report.add(
+            severity="warning",
+            code="ASSESSMENT_WITHOUT_MEMBERSHIP",
+            message=(
+                f"{empty} assessment(s) carry neither membership nor value "
+                "blocks, so they cover no geometry."
+            ),
+            table="usap_assessment",
+        )
+
+
 def _validate_annotation_object_links(
     conn: sqlite3.Connection,
     report: ValidationReport,
@@ -496,6 +627,54 @@ def _validate_orphans(conn: sqlite3.Connection, report: ValidationReport) -> Non
             WHERE ap.asset_part_id IS NULL
             """,
             "Value block references a missing asset part.",
+        ),
+        (
+            "ORPHAN_MEMBERSHIP_ASSESSMENT",
+            "usap_membership_block",
+            """
+            SELECT COUNT(*) AS n
+            FROM usap_membership_block AS mb
+            LEFT JOIN usap_assessment AS asm
+                ON asm.assessment_id = mb.assessment_id
+            WHERE asm.assessment_id IS NULL
+            """,
+            "Membership block references a missing assessment.",
+        ),
+        (
+            "ORPHAN_VALUE_BLOCK_ASSESSMENT",
+            "usap_value_block",
+            """
+            SELECT COUNT(*) AS n
+            FROM usap_value_block AS vb
+            LEFT JOIN usap_assessment AS asm
+                ON asm.assessment_id = vb.assessment_id
+            WHERE asm.assessment_id IS NULL
+            """,
+            "Value block references a missing assessment.",
+        ),
+        (
+            "ORPHAN_ASSESSMENT_ANNOTATION",
+            "usap_assessment",
+            """
+            SELECT COUNT(*) AS n
+            FROM usap_assessment AS asm
+            LEFT JOIN usap_annotation AS a
+                ON a.annotation_id = asm.annotation_id
+            WHERE a.annotation_id IS NULL
+            """,
+            "Assessment references a missing annotation.",
+        ),
+        (
+            "ORPHAN_ASSESSMENT_ASSET",
+            "usap_assessment",
+            """
+            SELECT COUNT(*) AS n
+            FROM usap_assessment AS asm
+            LEFT JOIN usap_asset AS asset
+                ON asset.asset_id = asm.asset_id
+            WHERE asset.asset_id IS NULL
+            """,
+            "Assessment references a missing asset.",
         ),
         (
             "ORPHAN_ANNOTATION_CLASS",
@@ -842,6 +1021,7 @@ def _validate_value_blocks(
         f"""
         SELECT
             vb.value_block_id,
+            vb.assessment_id,
             vb.annotation_id,
             vb.asset_part_id,
             vb.element_kind,
@@ -858,24 +1038,29 @@ def _validate_value_blocks(
         LEFT JOIN usap_asset_part AS ap
             ON ap.asset_part_id = vb.asset_part_id
         ORDER BY
-            vb.annotation_id,
+            vb.assessment_id,
             vb.asset_part_id,
             vb.element_kind,
             vb.block_start
         """
     ).fetchall()
 
+    # Grouped by assessment, not annotation: one field measured at two dates is
+    # two complete fields over the same part. Keyed on the annotation, the
+    # second would look like the first tiled twice and be reported as
+    # overlapping blocks and broken coverage.
     groups: dict[tuple[int, int, int], list[sqlite3.Row]] = {}
 
     for row in rows:
         key = (
-            int(row["annotation_id"]),
+            int(row["assessment_id"]),
             int(row["asset_part_id"]),
             int(row["element_kind"]),
         )
         groups.setdefault(key, []).append(row)
 
-    for (annotation_id, asset_part_id, element_kind), block_rows in groups.items():
+    for (assessment_id, asset_part_id, element_kind), block_rows in groups.items():
+        annotation_id = int(block_rows[0]["annotation_id"])
         expected_next_start = 0
         has_gap = False
 
@@ -1613,6 +1798,41 @@ def _validate_asset_crs(
             ),
             table="usap_asset",
             details={"srs_ids": srs_ids},
+        )
+
+    # An element index only means anything relative to the convention that
+    # assigned it. A content hash proves the bytes are unchanged; it says
+    # nothing about how a reader turns those bytes into element 0, 1, 2 — two
+    # readers of one mesh can disagree on face order and both be
+    # self-consistent, silently repointing every membership. Nothing can detect
+    # that after the fact, so an unstated convention is reported here rather
+    # than assumed to be the one the writer had in mind.
+    unstated = _count(
+        conn,
+        """
+        SELECT COUNT(*) AS n
+        FROM usap_asset_part
+        WHERE indexing_profile IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM usap_membership_block AS mb
+              WHERE mb.asset_part_id = usap_asset_part.asset_part_id
+          )
+        """,
+    )
+
+    if unstated:
+        report.add(
+            severity="warning",
+            code="ASSET_PART_NO_INDEXING_PROFILE",
+            message=(
+                f"{unstated} annotated asset part(s) declare no "
+                "indexing_profile, so the convention that assigned their "
+                "element indices is unrecorded. A reader that numbers elements "
+                "differently would resolve every membership to the wrong "
+                "geometry, undetectably."
+            ),
+            table="usap_asset_part",
         )
 
 

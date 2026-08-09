@@ -118,6 +118,11 @@ def create_synthetic_package(
                 part_path=config.mesh_part_path,
                 element_kind=ELEMENT_KIND_FACE,
                 element_count=total_face_count,
+                # Stated rather than left NULL: this generator assigns face
+                # indices itself, in building order, so the convention is known
+                # exactly. A part that declares none is reported by
+                # validate_report (ASSET_PART_NO_INDEXING_PROFILE).
+                indexing_profile="usap:synthetic-face-order-v1",
             )
 
             # ------------------------------------------------------------
@@ -210,7 +215,6 @@ def create_synthetic_package(
                     annotation_uid=f"ann_{roof_uid}_mesh",
                     semantic_class_id=roof_class_id,
                     primary_city_object_id=roof_id,
-                    label=f"Roof annotation for {building_uid}",
                     status="accepted",
                     confidence=1.0,
                 )
@@ -228,7 +232,6 @@ def create_synthetic_package(
                     annotation_uid=f"ann_{wall_uid}_mesh",
                     semantic_class_id=wall_class_id,
                     primary_city_object_id=wall_id,
-                    label=f"Wall annotation for {building_uid}",
                     status="accepted",
                     confidence=1.0,
                 )
@@ -246,7 +249,6 @@ def create_synthetic_package(
                     annotation_uid=f"ann_{ground_uid}_mesh",
                     semantic_class_id=ground_class_id,
                     primary_city_object_id=ground_id,
-                    label=f"Ground annotation for {building_uid}",
                     status="accepted",
                     confidence=1.0,
                 )

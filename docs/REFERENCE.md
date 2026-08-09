@@ -28,11 +28,12 @@ The motivation and mental model are in [README.md](../README.md); this file is t
 
 This repository contains a working MVP. The file format, schema, and API may still change, and packages created with this version should be treated as experimental.
 
-The current schema is profile version **0.3.0**. There is no migration path
-from 0.2.0 — the relationship endpoints were renamed and its type became a
-foreign key into a new table — so `USAPPackage.open` refuses an older package
-with an explicit "unsupported profile version" error. Rebuild rather than
-migrate.
+The current schema is profile version **0.4.0**. There is no migration path from
+either older profile: 0.3.0 renamed the relationship endpoints and made the link
+type a foreign key into a new table, and 0.4.0 moved membership and value blocks
+under `usap_assessment` and dropped `usap_annotation.label`. `USAPPackage.open`
+refuses an older package with an explicit "unsupported profile version" error
+rather than misreading it. Rebuild rather than migrate.
 
 What the prototype can do, end to end:
 
@@ -61,7 +62,10 @@ USAP can:
 ```text
 usap_prot/
   pyproject.toml
-  README.md  INGESTION.md  REFERENCE.md  TESTS.md
+  README.md            motivation and mental model
+  US.md                the user stories this prototype is built against
+  docs/                INTEGRATION.md, REFERENCE.md, INGESTION.md, TESTS.md,
+                       SCHEMA_WIRING.md, and the design records
 
   src/usap/             the Python SDK: core, validation, geopackage,
                         domain_vocab, batch, project_builder, synthetic
@@ -89,15 +93,18 @@ mode:
 python -m pip install -e .
 ```
 
-LAS is supported by the base install; LAZ and CRS parsing each need a backend
-of their own, so they are optional extras:
+LAS is supported by the base install; LAZ, CRS parsing, and non-RDF/XML
+ontology syntaxes each need a backend of their own, so they are optional
+extras:
 
 ```bash
-python -m pip install -e ".[laz,crs]"
+python -m pip install -e ".[laz,crs,ttl]"
 ```
 
-Without them, a `.laz` file fails to open and reading a CRS raises a
-capability error — neither degrades silently into "this file has no CRS".
+`[ttl]` adds rdflib, needed only for Turtle/N3/JSON-LD ontologies; RDF/XML is
+read without it. Without an extra, a `.laz` file fails to open, reading a CRS
+raises a capability error, and a `.ttl` ontology reports that rdflib is missing
+— none of them degrades silently into "this file has no CRS" or "no concepts".
 
 Run the test suite (described in [TESTS.md](TESTS.md)):
 
@@ -242,24 +249,81 @@ Example:
 annotation_uid: ann_energy_roof_001
 concept: EnergyRoof
 primary city object: building_1_roof_1
-attributes: claim metadata (method, source, assessed_at)
+attributes: claim metadata (method, source)
 ```
+
+### Assessment
+
+One dated evaluation of an annotation against one 3D asset. The annotation is
+the *logical* claim ("this is a RoofSurface, and it is building_1_roof_1"); an
+assessment is one concrete evaluation of it — when it was made, which asset it
+was made against, and which elements of that asset it covers. Re-surveying the
+same roof next year is a second assessment of the same annotation, **not** a
+second annotation: that is what keeps the concept and the city-object link from
+being duplicated across evaluations and drifting apart.
+
+Every membership and value block belongs to an assessment, so an annotation
+that has any geometry has at least one. **You do not have to think about them
+until you want two.** A write that names none uses the annotation's single
+assessment on that part's asset, creating an undated one if there is none — so
+`annotate_elements(...)` and `attach_annotation_elements(...)` behave exactly as
+they did before assessments existed. Once a second assessment exists on the same
+asset, an unqualified write raises `USAPAmbiguityError` rather than guessing,
+because picking the newest would silently rewrite a historical evaluation.
+
+An assessment is bound to an **asset**, not an asset part: a mesh registers one
+part per geometry, so an evaluation of "that mesh" routinely spans several
+parts. The rule that every block of an assessment lives in a part of *its* asset
+is enforced on write and re-checked by `validate_report()`
+(`MEMBERSHIP_OUTSIDE_ASSESSMENT_ASSET`).
+
+```text
+annotation ann_energy_roof_001            (concept + city object, once)
+├── assessment asm_… assessed_at 2026-03-01, asset area_lod2 → faces [100..140]
+└── assessment asm_… assessed_at 2027-03-01, asset area_lod2 → faces [120..160]
+```
+
+`assessed_at` is free-form text, stored as given: the format is the caller's,
+and refusing an unfamiliar spelling would be worse than storing it. At most one
+*undated* assessment may exist per (annotation, asset) — enforced by a partial
+unique index, because SQLite treats NULLs as distinct and a plain `UNIQUE` would
+not have constrained them.
+
+| Call | Does |
+|---|---|
+| `pkg.create_assessment(annotation_id, asset, assessed_at=…)` | create or reuse one evaluation (idempotent on annotation + asset + date) |
+| `pkg.list_assessments(annotation_id=…)` | every evaluation, undated first then by date |
+| `pkg.get_assessment` / `update_assessment` / `delete_assessment` | read, edit metadata, remove one evaluation and its blocks |
+| `pkg.elements_for_annotation(id, assessment=…)` | the elements of one evaluation |
+| `pkg.annotations_for_elements(..., assessment=…)` | restrict a reverse lookup to one evaluation |
+
+`annotations_for_elements` returns **one entry per (annotation, assessment)**,
+each tagged with `assessment_id` and `assessed_at`. With one assessment per
+annotation that is one entry per annotation, as before; two entries appear only
+once the same asset really has been evaluated twice, which is exactly when they
+must be distinguishable. The two extents are never merged — a union would report
+a coverage no single evaluation ever claimed.
+
+The asset of an assessment cannot be changed after the fact: its membership is
+indexed against that asset's parts, so re-pointing it would silently make every
+stored index mean different geometry. Record a new assessment instead.
 
 ### Membership block
 
-A compressed set of selected element indices for one annotation, one asset part, and one element kind. Stored as a **roaring bitmap** in CRoaring's portable serialization (`encoding = 'roaring'`), so the payload is readable by any roaring implementation, not only this SDK. Indices are partitioned into blocks of `usap_profile.default_block_size` (16384) and held as within-block offsets; `block_start` is what the reverse element query prunes on.
+A compressed set of selected element indices for one **assessment**, one asset part, and one element kind (the owning annotation is carried alongside, so forward queries stay one indexed lookup). Stored as a **roaring bitmap** in CRoaring's portable serialization (`encoding = 'roaring'`), so the payload is readable by any roaring implementation, not only this SDK. Indices are partitioned into blocks of `usap_profile.default_block_size` (16384) and held as within-block offsets; `block_start` is what the reverse element query prunes on.
 
 Example:
 
 ```text
 annotation ann_energy_roof_001
+assessment assessed_at 2026-03-01
 asset part area.las points/all
 selected point indices [100, 101, 102]
 ```
 
 ### Value block (annotation on a whole 3D asset)
 
-A compressed dense array of per-element scalar values for one annotation and one asset part: element *i*'s value is `decoded[i - block_start]`. Membership stores *which* elements are a concept; value blocks store the *value* of a property at each element (e.g. shadow fraction per face). Rule of thumb: booleans and categories are **sets** (native membership, like "shadowed at 14:00", is just a concept plus the shadowed faces); reach for a value field only for genuinely **continuous** values. Value fields are bound to the geometry asset only, never to a city object, and must cover every element of the part (v1; NaN = "no value" in float fields). Stored little-endian, dtype per block (`f4` default; see `VALUE_DTYPES`), with per-block min/max for decode-free stats and query pruning.
+A compressed dense array of per-element scalar values for one assessment and one asset part: element *i*'s value is `decoded[i - block_start]`. Membership stores *which* elements are a concept; value blocks store the *value* of a property at each element (e.g. shadow fraction per face). Rule of thumb: booleans and categories are **sets** (native membership, like "shadowed at 14:00", is just a concept plus the shadowed faces); reach for a value field only for genuinely **continuous** values. Value fields are bound to the geometry asset only, never to a city object, and must cover every element of the part (v1; NaN = "no value" in float fields). Stored little-endian, dtype per block (`f4` default; see `VALUE_DTYPES`), with per-block min/max for decode-free stats and query pruning.
 
 Example:
 
@@ -347,12 +411,19 @@ is idempotent and order-independent — classify before or after the import, the
 result is the same, and a category that contradicts one already recorded raises
 rather than overwriting it.
 
-Two deliberate limits. **RDF/XML only**: parsing uses the `lxml` USAP already
-depends on, so ontology support adds no install. A Turtle file is refused with
-a message telling you to convert it, never half-read. And **`owl:imports` is
-not followed** — the imported IRIs are returned so you can load them yourself,
-but fetching over the network during a package build is not something the SDK
-does for you.
+Syntax is picked by suffix. `.owl` / `.rdf` / `.rdfs` / `.xml` go through a
+narrow built-in RDF/XML reader that uses the `lxml` USAP already depends on, so
+the common path adds no install. `.ttl` / `.n3` / `.nt` / `.trig` / `.jsonld`
+go through **rdflib**, an optional extra: without it the file is reported as a
+missing capability (`install usap[ttl]`), never as a broken file. Both readers
+produce the same intermediate facts, so the syntax never changes what gets
+registered.
+
+One deliberate limit remains: **`owl:imports` is not followed** — the imported
+IRIs are returned so you can load them yourself, but fetching over the network
+during a package build is not something the SDK does for you. To seed a whole
+configuration directory in one call — schemas, ontologies of either syntax, and
+JSON vocabularies — use `load_vocabulary_folder(pkg, path)`.
 
 A category only bites if the property's IRI namespace matches the namespace the
 source document writes; that pair *is* the type's identity. Mismatch it and the
@@ -718,14 +789,13 @@ Full-form example:
       "annotation_uid": "ann_energy_roof_001",
       "concept": "EnergyRoof",
       "city_object_uid": "building_1_roof_1",
-      "label": "Energy roof annotation",
       "status": "draft",
+      "assessed_at": "2026-06-30T14:00:00Z",
       "confidence": 0.8,
       "attributes": {
         "domain": "energy_emissions",
         "method": "roof_detector_v2",
-        "source": "survey_2026_06",
-        "assessed_at": "2026-06-30T14:00:00Z"
+        "source": "survey_2026_06"
       },
       "memberships": [
         {
@@ -864,7 +934,6 @@ annotation = pkg.annotate_elements(
     asset_part_id=mesh.primary_asset_part_id,
     element_kind=ELEMENT_KIND_FACE,
     element_indices=[10, 11, 12],
-    label="Roof faces",
     status="accepted",
 )
 ```
@@ -1146,6 +1215,14 @@ basic     GeoPackage metadata and registered layers
           USAP profile presence and package_iri (INVALID_PACKAGE_IRI)
           orphan references
           membership/value block structure (counts, bounds, element kinds)
+          assessment integrity:
+            block annotation matches its assessment's
+                                        (ASSESSMENT_ANNOTATION_MISMATCH)
+            block stays inside its assessment's asset
+                                        (MEMBERSHIP_OUTSIDE_ASSESSMENT_ASSET,
+                                         VALUE_BLOCK_OUTSIDE_ASSESSMENT_ASSET)
+            assessment status domain     (ASSESSMENT_UNKNOWN_STATUS)
+            assessment covering nothing  (ASSESSMENT_WITHOUT_MEMBERSHIP, warning)
           semantic class closure
           concept registry duplicates
           annotation primary object / 'represents' link agreement
@@ -1157,6 +1234,8 @@ deep      + membership payload decoding, offsets, stored min/max agreement
           + value payload decoding and stored min/max agreement
           + asset extent recomputation
           + content hash canonical form  (NON_CANONICAL_CONTENT_HASH, warning)
+          + annotated asset part with no declared indexing convention
+                                         (ASSET_PART_NO_INDEXING_PROFILE, warning)
           + city object containment cycles (containment category only)
           + annotation status / confidence / attributes-JSON domain values
 

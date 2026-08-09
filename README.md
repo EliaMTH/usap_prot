@@ -28,7 +28,7 @@ A `*.usap.gpkg` file stores, for one study area:
 - the exact **element indices** covered by each annotation;
 - the **semantic concept** asserted by each annotation, drawn from a registered external or local vocabulary;
 - an optional link to the authoritative **city-object instance** represented or concerned by the claim;
-- editable **annotation records** with label, status, confidence, and claim-level attributes such as method, source, and timestamps;
+- editable **annotation records** with status, confidence, and claim-level attributes such as method and source, each carrying one or more dated **assessments** (one evaluation of the claim against one 3D asset);
 - optional **per-element value fields**, stored as compressed typed blocks and queryable by value;
 - a lightweight mirror of **city-object identity** and a typed, directed **relationship graph** used to retrieve annotations across an object and its parts, or across whatever else the source says it relates to.
 
@@ -64,17 +64,28 @@ operational asset         operational asset
         [100,101,102]             [40,41,42]
 ```
 
-One annotation, multiple asset memberships:
+One annotation, multiple asset memberships — grouped by the evaluation that
+made them:
 
 ```text
 annotation: ann_energy_roof_001
   concept: EnergyRoof
   primary city object: building_1_roof_1
-  memberships:
+  assessment (2026-06-30, area.las):
     LAS points:        [100, 101, 102]
+  assessment (2026-06-30, area.obj):
     LoD2 mesh faces:   [40, 41, 42]
     triangulation:     [800, 801]
+  assessment (2027-05-14, area.obj):
+    LoD2 mesh faces:   [40, 41, 42, 43]
 ```
+
+An **assessment** is one dated evaluation of the claim against one 3D asset. The
+concept and the city object are stated once, on the annotation; what varies
+between evaluations — the date, the asset, the extent, the method — lives on the
+assessment. Re-surveying does not fork the claim into a second annotation that
+can drift from the first. Applications that only ever evaluate once never have
+to mention assessments: one is created implicitly.
 
 ---
 ## Concepts & vocabularies
@@ -91,7 +102,7 @@ The same holds for **link types**. Which CityGML property means "part of" is sta
 
 Besides membership sets ("these faces are a `RoofSurface`"), an annotation can carry a **value field**: one scalar per element of an asset part. For example, the shadow fraction of every mesh face at 14:00 is stored as compressed typed blocks and queried with `elements_where`. Sets cover booleans and categories; value fields are for genuinely continuous values.
 
-**Where the metadata lives:** the concept definition remains in the semantic source or vocabulary. The claim's own tags (`validAt`, `unit`, `method`) remain in the annotation attributes. For time-varying fields, use one annotation per field and timestep so the package remains self-describing. An external application schema may also catalog the analysis; that complements rather than replaces the in-package claim metadata.
+**Where the metadata lives:** the concept definition remains in the semantic source or vocabulary. The claim's own tags (`unit`, `method`) remain in the annotation or assessment attributes. A field measured again at a later date is a second **assessment** of the same annotation — one claim, one concept, one city object, several dated evaluations — not a second annotation per timestep. An external application schema may also catalog the analysis; that complements rather than replaces the in-package claim metadata.
 
 ---
 ## How it relates to existing work
@@ -125,7 +136,7 @@ What is already in place are the parts that could not be added afterwards withou
 - **Once processed, 3D assets are supposed to be immutable.** An annotation is bound to one immutable version of an external file. LAS point order and mesh face order are not guaranteed to survive reprojection, re-tiling, thinning, remeshing, re-export, or conversion to COPC, which reorders points by design. USAP records a content hash to detect that a file changed, but it cannot rebind annotations.
 - **Membership is stored as roaring bitmaps**, in blocks of 16384 elements, using CRoaring's portable serialization. The payload is therefore readable by Java, Go, C++, Rust, and other compatible roaring implementations rather than being a private Python blob. Block width is a deliberate compromise: wider blocks usually compress better, while narrower blocks give the reverse query more precise pruning.
 - **Trusted inputs only.** Nothing here is hardened against hostile files. A CityGML document is parsed as a full tree in memory and walked twice, and an arbitrary SQLite file is refused only by a profile check. Compressed payloads are bounded on decode, but treat a `.usap.gpkg` from a third party as you would any other untrusted file.
-- **GIS tools see a summary, not the complete annotation model.** A `.usap.gpkg` opens in QGIS/GDAL as a real GeoPackage: three read-only attribute layers (annotations, concepts, city objects) and one feature layer drawing a derived 2D bounding box per registered asset. Fine-grained memberships and value fields still require the SDK, and USAP is not a registered OGC extension.
+- **GIS tools see a summary, not the complete annotation model.** A `.usap.gpkg` opens in QGIS/GDAL as a real GeoPackage: four read-only attribute layers (annotations, assessments, concepts, city objects) and one feature layer drawing a derived 2D bounding box per registered asset. Fine-grained memberships and value fields still require the SDK, and USAP is not a registered OGC extension.
 
 ---
 

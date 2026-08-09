@@ -271,7 +271,7 @@ def main() -> None:
                     "annotation_uid": args.annotation_uid,
                     "concept": args.concept,
                     "city_object_uid": city_object["object_uid"],
-                    "label": "USAP real-project smoke test annotation",
+                    "assessed_at": "2026-06-30T14:00:00Z",
                     "status": "draft",
                     "confidence": 1.0,
                     "attributes": {

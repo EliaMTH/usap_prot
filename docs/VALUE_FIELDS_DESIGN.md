@@ -130,3 +130,20 @@ A new table that mirrors the membership block exactly, carrying *values* instead
   occasionally. This is the primary edit mechanism (matches write-once-read-many).
 - Optionally a **sparse overlay** of `(index → corrected value)` layered on the base block, if
   you want to avoid rewriting large fields. Defer unless needed.
+
+---
+
+> **Profile 0.4.0 note.** The column list in section 4.1 is the one in force
+> when this was written. `usap_value_block` now carries an `assessment_id` as
+> well, and its `UNIQUE` is scoped to that rather than to `annotation_id`: a
+> field measured again at a later date is a second *assessment* of the same
+> annotation, so the same part legitimately carries two complete fields.
+> `annotation_id` stays on the block, denormalised, so value readers remain a
+> single indexed lookup.
+>
+> The advice in this document to model a time series as "one annotation per
+> field and timestep" is superseded: the timestep is now the assessment's
+> `assessed_at`, and the annotation is stated once. The full-coverage v1
+> contract is unchanged — it is enforced per assessment, which is why
+> `_validate_value_blocks` groups on `(assessment_id, asset_part_id,
+> element_kind)`.

@@ -2,7 +2,7 @@
 
 How the objects in [`src/usap/data/schema.sql`](../src/usap/data/schema.sql) connect: which foreign keys wire the tables together, and which tables each view reads from.
 
-**Object counts:** 14 USAP tables + 4 GeoPackage plumbing tables = 18 base tables, plus 4 views and 9 indexes.
+**Object counts:** 15 USAP tables + 4 GeoPackage plumbing tables = 19 base tables, plus 5 views and 13 indexes.
 
 In every diagram, an arrow `A ──▶ B` means **"A has a foreign key pointing to B"** (A references B; the arrow points at the thing being referenced).
 
@@ -21,6 +21,7 @@ flowchart TB
     RTYPE[usap_relationship_type]
     ANN[usap_annotation]
     ANNO[usap_annotation_object]
+    ASM[usap_assessment]
     MB[usap_membership_block]
     VB[usap_value_block]
     PROF[usap_profile]
@@ -38,8 +39,12 @@ flowchart TB
     ANN -->|primary_city_object_id| CO
     ANNO -->|annotation_id| ANN
     ANNO -->|city_object_id| CO
+    ASM -->|annotation_id| ANN
+    ASM -->|asset_id| ASSET
+    MB -->|assessment_id| ASM
     MB -->|annotation_id| ANN
     MB -->|asset_part_id| APART
+    VB -->|assessment_id| ASM
     VB -->|annotation_id| ANN
     VB -->|asset_part_id| APART
     classDef hub fill:#f2b134,stroke:#7a5a12,color:#1a1200,stroke-width:2px;
@@ -48,9 +53,13 @@ flowchart TB
     class PROF,LOG standalone
 ```
 
-**The shape to notice:** `usap_annotation` (highlighted) is the hub of the claim model. It points "up" to the registered concept (`usap_semantic_class`) and, when present, to the authoritative city-object instance the claim represents or concerns (`usap_city_object`). `usap_annotation_object` adds further authority-side object links. Separately, `usap_membership_block` and `usap_value_block` point "down" to indexed parts of operational 3D assets (`usap_asset_part`).
+**The shape to notice:** `usap_annotation` (highlighted) is the hub of the claim model. It points "up" to the registered concept (`usap_semantic_class`) and, when present, to the authoritative city-object instance the claim represents or concerns (`usap_city_object`). `usap_annotation_object` adds further authority-side object links. Going "down", `usap_assessment` records one dated evaluation of the claim against one registered asset, and `usap_membership_block` / `usap_value_block` hang off *that*, pointing at indexed parts of operational 3D assets (`usap_asset_part`).
 
 This distinction is important: a city-object link identifies the semantic referent of a claim, whereas a membership or value block identifies concrete points, faces, or other indexed elements in a registered geometry asset. The schema connects the two through the annotation without treating the city object itself as another geometry membership.
+
+**Why the blocks hang off an assessment, not the annotation.** Re-surveying the same roof next year produces a second set of elements for the *same* claim. Without a level in between, recording it means either overwriting last year's extent or minting a second annotation that duplicates the concept and the city-object link — and can then drift from it. The assessment holds what varies between evaluations (the date, the asset, the extent, the method) so the annotation can hold what does not.
+
+Note the two arrows from each block table. `assessment_id` is the owner; `annotation_id` is denormalised from it, so forward queries (`elements_for_annotation`, the delete cascade) stay a single indexed lookup instead of a join — the plan `docs/ACCELERATOR_ABLATION.md` measures. `validate_report()` re-checks that the two agree (`ASSESSMENT_ANNOTATION_MISMATCH`), because a denormalised column is only safe while something enforces it.
 
 `usap_semantic_class_closure` is a precomputed shortcut hanging off the class hierarchy; the object graph has no such table — "an object and its parts" is walked from `usap_city_object_relationship` with a recursive CTE, because those edges are typed and edited one at a time (see `elements_for_city_object`).
 
@@ -77,9 +86,13 @@ Note the object graph is a *graph*, not a tree. `from`/`to` record the direction
 | `usap_annotation` | `primary_city_object_id` | `usap_city_object(city_object_id)` |
 | `usap_annotation_object` | `annotation_id` | `usap_annotation(annotation_id)` |
 | `usap_annotation_object` | `city_object_id` | `usap_city_object(city_object_id)` |
-| `usap_membership_block` | `annotation_id` | `usap_annotation(annotation_id)` |
+| `usap_assessment` | `annotation_id` | `usap_annotation(annotation_id)` |
+| `usap_assessment` | `asset_id` | `usap_asset(asset_id)` |
+| `usap_membership_block` | `assessment_id` | `usap_assessment(assessment_id)` |
+| `usap_membership_block` | `annotation_id` | `usap_annotation(annotation_id)` (denormalised) |
 | `usap_membership_block` | `asset_part_id` | `usap_asset_part(asset_part_id)` |
-| `usap_value_block` | `annotation_id` | `usap_annotation(annotation_id)` |
+| `usap_value_block` | `assessment_id` | `usap_assessment(assessment_id)` |
+| `usap_value_block` | `annotation_id` | `usap_annotation(annotation_id)` (denormalised) |
 | `usap_value_block` | `asset_part_id` | `usap_asset_part(asset_part_id)` |
 
 `usap_profile`, `usap_edit_log` and `usap_relationship_type` have no foreign keys.
@@ -96,6 +109,7 @@ something that cannot be reconstructed later from the rest of the package:
 | `usap_asset_part` | `indexing_profile` | which convention assigned the element indices — a hash proves the bytes, not the ordering |
 | `usap_semantic_class` | `source_namespace`, `concept_iri` | where a concept came from in its authority; `class_uri` stays the internal key |
 | `usap_value_block` | `encoding` | payload compression, mirroring `usap_membership_block.encoding` |
+| `usap_assessment` | `assessed_at` | when this evaluation was made. Free-form text, stored as given: the format belongs to the caller, and refusing an unfamiliar spelling would be worse than storing it. NULL means *undated*, of which there can be at most one per (annotation, asset) — enforced by a partial unique index, because SQLite treats NULLs as distinct and the plain `UNIQUE` would not constrain them |
 | `usap_relationship_type` | `code_space` | the namespace the link property came from; with `local_name` it is the QName the source document wrote, and the only way a reader resolves a link type back to its definition |
 | `usap_relationship_type` | `category` | whether the link means part-of. No CityGML artifact states this — not the XSD, not the conceptual model, not an OWL rendering — so it is asserted by whoever builds the package. NULL is a real value meaning *unclassified*, reported by `validate_report()` |
 | `usap_city_object_relationship` | `to_external_uri` | an xlink target outside the package. The link is a genuine typed statement even though its target is not here; dropping it is how an xlink-serialized CityGML file used to import as unrelated roots |
@@ -106,12 +120,13 @@ something that cannot be reconstructed later from the rest of the package:
 ---
 ## 2. Which tables each view reads from
 
-The four views are read-only overlays — none stores data; each is a `JOIN` across the tables above. Here an arrow `V ──▶ T` means **"view V SELECTs from table T"**. All four alias their primary key to **`OGC_FID`** and are registered in `gpkg_contents` so QGIS/GDAL can browse them. Not `fid`: SQLite views have no rowid, and `OGC_FID` is the alias GDAL's GeoPackage driver documents for a view's feature id — a column merely *called* `fid` is carried as an ordinary attribute and GDAL substitutes its own row numbers instead of USAP ids.
+The five views are read-only overlays — none stores data; each is a `JOIN` across the tables above. Here an arrow `V ──▶ T` means **"view V SELECTs from table T"**. All five alias their primary key to **`OGC_FID`** and are registered in `gpkg_contents` so QGIS/GDAL can browse them. Not `fid`: SQLite views have no rowid, and `OGC_FID` is the alias GDAL's GeoPackage driver documents for a view's feature id — a column merely *called* `fid` is carried as an ordinary attribute and GDAL substitutes its own row numbers instead of USAP ids.
 
 ```mermaid
 flowchart LR
     AEXTV["usap_asset_extents (features)"]:::view
     ANNV["usap_annotations_view"]:::view
+    ASMV["usap_assessments_view"]:::view
     CONV["usap_concepts_view"]:::view
     COV["usap_city_objects_view"]:::view
     AEXTV --> AEXT[usap_asset_extent]
@@ -122,6 +137,13 @@ flowchart LR
     ANNV --> CO[usap_city_object]
     ANNV --> MB[usap_membership_block]
     ANNV --> VB[usap_value_block]
+    ANNV --> ASM[usap_assessment]
+    ASMV --> ASM
+    ASMV --> ANN
+    ASMV --> SCLASS
+    ASMV --> CO
+    ASMV --> ASSET
+    ASMV --> MB
     CONV --> SCLASS
     CONV --> ANN
     COV --> CO
@@ -131,7 +153,9 @@ flowchart LR
     classDef view fill:#bfe3d6,stroke:#2f6b57,color:#0e2a20,stroke-width:2px;
 ```
 
-Each view flattens a little "star" of tables into one browsable layer for GIS tools. `usap_asset_extents` is the only **features** (mappable) layer because it is the only view with a geometry column; the other three are **attributes** (non-spatial) layers.
+Each view flattens a little "star" of tables into one browsable layer for GIS tools. `usap_asset_extents` is the only **features** (mappable) layer because it is the only view with a geometry column; the other four are **attributes** (non-spatial) layers.
+
+`usap_annotations_view` counts an annotation's assessments and sums element coverage across all of them; `usap_assessments_view` is where that total breaks down per evaluation — one row per (annotation, date, asset), which is the listing US-ANN-08 asks for.
 
 ---
 ## 3. The GeoPackage plumbing (separate, standard, not USAP data)
@@ -164,5 +188,11 @@ Fast-lookup structures on non-primary-key columns:
 | `usap_relationship_type_identity` | `usap_relationship_type` | `local_name, COALESCE(code_space, '')` **(unique, expression)** |
 | `usap_relationship_type_by_category` | `usap_relationship_type` | `category` |
 | `usap_annotation_by_class` | `usap_annotation` | `semantic_class_id` |
+| `usap_assessment_by_annotation` | `usap_assessment` | `annotation_id, assessed_at` |
+| `usap_assessment_one_undated` | `usap_assessment` | `annotation_id, asset_id` **(unique, partial:** `WHERE assessed_at IS NULL`**)** |
+| `usap_mb_by_annotation` | `usap_membership_block` | `annotation_id, asset_part_id, element_kind, block_start` |
 | `usap_mb_by_element_block` | `usap_membership_block` | `asset_part_id, element_kind, block_start` |
+| `usap_vb_by_annotation` | `usap_value_block` | `annotation_id, asset_part_id, element_kind, block_start` |
 | `usap_vb_by_part` | `usap_value_block` | `asset_part_id, element_kind` |
+
+The two `*_by_annotation` block indexes are not decoration. Before 0.4.0 the `UNIQUE(annotation_id, ...)` constraint on each block table supplied an annotation-first index for free; that constraint is now scoped to `assessment_id` (two evaluations of one annotation may cover the same part), so the annotation-first lookup every forward query and delete cascade depends on has to be declared explicitly.

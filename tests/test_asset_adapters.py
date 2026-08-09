@@ -96,7 +96,6 @@ def test_register_asset_and_annotate_elements(
         annotation_id = pkg.create_annotation(
             annotation_uid="ann_adapter_roof",
             semantic_class_id=classes.by_name["RoofSurface"],
-            label="Adapter roof elements",
             status="accepted",
             confidence=1.0,
         )

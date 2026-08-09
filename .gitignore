@@ -33,3 +33,5 @@ FW_*
 #   ontologies-local/     LIRIS CityGML 3.0 OWL, served as Turtle
 citygml-3.0-schemas/
 ontologies-local/
+
+US.md

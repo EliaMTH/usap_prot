@@ -368,7 +368,6 @@ CREATE TABLE usap_annotation (
         REFERENCES usap_city_object(city_object_id)
         ON DELETE SET NULL,
 
-    label                  TEXT,
     status                 TEXT NOT NULL DEFAULT 'accepted',
     confidence             REAL,
     attributes_json        TEXT,
@@ -404,9 +403,80 @@ CREATE TABLE usap_annotation_object (
     PRIMARY KEY(annotation_id, city_object_id, relation_type)
 ) WITHOUT ROWID;
 
+-- One dated evaluation of an annotation against one 3D asset.
+--
+-- The annotation is the *logical* claim ("this is a RoofSurface, and it is
+-- building_1_roof_1"); an assessment is one concrete evaluation of it: when it
+-- was made, which asset it was made against, and which elements of that asset
+-- it covers. Re-surveying the same roof next year is a second assessment of the
+-- same annotation, not a second annotation -- that is what keeps the concept
+-- and the city-object link from being duplicated and drifting apart.
+--
+-- Bound to asset_id, not asset_part_id: a mesh registers one part per geometry,
+-- so an evaluation of "that mesh" routinely spans several parts. The rule that
+-- every block of an assessment lives in a part of *this* asset is enforced by
+-- validation (MEMBERSHIP_OUTSIDE_ASSESSMENT_ASSET), not by the column.
+--
+-- assessed_at is nullable because an annotation always has an assessment, and
+-- the one created implicitly on first membership write has no date to give.
+-- SQLite treats NULLs as distinct, so the UNIQUE below does NOT constrain those
+-- rows; the partial index after it does, keeping "at most one undated
+-- assessment per (annotation, asset)" a schema fact rather than a convention
+-- the write path happens to honour.
+CREATE TABLE usap_assessment (
+    assessment_id    INTEGER PRIMARY KEY,
+    assessment_uid   TEXT NOT NULL UNIQUE,
+
+    annotation_id    INTEGER NOT NULL
+        REFERENCES usap_annotation(annotation_id)
+        ON DELETE CASCADE,
+
+    asset_id         INTEGER NOT NULL
+        REFERENCES usap_asset(asset_id)
+        ON DELETE CASCADE,
+
+    assessed_at      TEXT,
+
+    status           TEXT NOT NULL DEFAULT 'accepted',
+    confidence       REAL,
+    attributes_json  TEXT,
+
+    created_at       TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at       TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+
+    UNIQUE(annotation_id, asset_id, assessed_at)
+);
+
+CREATE UNIQUE INDEX usap_assessment_one_undated
+ON usap_assessment(
+    annotation_id,
+    asset_id
+)
+WHERE assessed_at IS NULL;
+
+-- Serves "the assessments of this annotation, oldest first", which is the
+-- listing US-ANN-08 asks for, and the ON DELETE CASCADE scan from
+-- usap_annotation.
+CREATE INDEX usap_assessment_by_annotation
+ON usap_assessment(
+    annotation_id,
+    assessed_at
+);
+
 CREATE TABLE usap_membership_block (
     membership_block_id INTEGER PRIMARY KEY,
 
+    assessment_id       INTEGER NOT NULL
+        REFERENCES usap_assessment(assessment_id)
+        ON DELETE CASCADE,
+
+    -- Denormalised from the assessment, and deliberately kept: the annotation
+    -- -first lookup index below is the plan every forward query was tuned
+    -- against (docs/ACCELERATOR_ABLATION.md), and reaching it through a join on
+    -- usap_assessment would change that plan. Validation enforces that this
+    -- column agrees with the assessment's (ASSESSMENT_ANNOTATION_MISMATCH).
     annotation_id       INTEGER NOT NULL
         REFERENCES usap_annotation(annotation_id)
         ON DELETE CASCADE,
@@ -427,10 +497,20 @@ CREATE TABLE usap_membership_block (
 
     payload             BLOB NOT NULL,
 
-    -- The auto-index behind this constraint doubles as the annotation-first
-    -- lookup index (forward queries, annotation-delete cascade); do not add
-    -- an explicit index on the same columns.
-    UNIQUE(annotation_id, asset_part_id, element_kind, block_start)
+    -- Scoped to the assessment, not the annotation: two assessments of one
+    -- annotation covering the same part would otherwise collide here.
+    UNIQUE(assessment_id, asset_part_id, element_kind, block_start)
+);
+
+-- What the annotation-scoped UNIQUE used to provide implicitly. Forward
+-- queries (elements_for_annotation) and the annotation-delete cascade both
+-- start from annotation_id, so this must stay an index in its own right.
+CREATE INDEX usap_mb_by_annotation
+ON usap_membership_block(
+    annotation_id,
+    asset_part_id,
+    element_kind,
+    block_start
 );
 
 -- Serves the reverse element query (annotations_for_elements) and the
@@ -450,6 +530,14 @@ ON usap_membership_block(
 CREATE TABLE usap_value_block (
     value_block_id      INTEGER PRIMARY KEY,
 
+    -- Assessment-scoped for the same reason membership is: a measured value has
+    -- a date and an asset. Re-measuring shadow fraction next year is a second
+    -- assessment's value field, not a rewrite of the first.
+    assessment_id       INTEGER NOT NULL
+        REFERENCES usap_assessment(assessment_id)
+        ON DELETE CASCADE,
+
+    -- Denormalised, as on usap_membership_block; same rationale, same check.
     annotation_id       INTEGER NOT NULL
         REFERENCES usap_annotation(annotation_id)
         ON DELETE CASCADE,
@@ -475,10 +563,19 @@ CREATE TABLE usap_value_block (
 
     payload             BLOB NOT NULL,   -- encoding(values.tobytes())
 
-    -- The auto-index behind this constraint doubles as the annotation-first
-    -- lookup index (value readers, annotation-delete cascade); do not add
-    -- an explicit index on the same columns.
-    UNIQUE(annotation_id, asset_part_id, element_kind, block_start)
+    -- Assessment-scoped, mirroring usap_membership_block: a field measured
+    -- twice at two dates is two fields, not one field written twice.
+    UNIQUE(assessment_id, asset_part_id, element_kind, block_start)
+);
+
+-- What the annotation-scoped UNIQUE used to provide implicitly: value readers
+-- and the annotation-delete cascade both start from annotation_id.
+CREATE INDEX usap_vb_by_annotation
+ON usap_value_block(
+    annotation_id,
+    asset_part_id,
+    element_kind,
+    block_start
 );
 
 -- Serves the ON DELETE CASCADE scan from usap_asset_part (no part-level
@@ -501,7 +598,7 @@ CREATE TABLE usap_edit_log (
 
 -- -------------------------------------------------------------------------
 -- GIS-facing views. Registered in gpkg_contents (see geopackage.py) so
--- QGIS/GDAL can browse USAP content: three read-only 'attributes' layers
+-- QGIS/GDAL can browse USAP content: four read-only 'attributes' layers
 -- plus one 'features' layer of derived per-asset extent boxes. Internal
 -- tables (blocks, closures, edit log) are deliberately not exposed.
 -- -------------------------------------------------------------------------
@@ -522,9 +619,13 @@ SELECT
     sc.class_uri AS concept_uri,
     sc.scheme,
     co.object_uid AS city_object_uid,
-    a.label,
     a.status,
     a.confidence,
+    CAST((
+        SELECT COUNT(*)
+        FROM usap_assessment AS asm
+        WHERE asm.annotation_id = a.annotation_id
+    ) AS INTEGER) AS assessment_count,
     CAST((
         SELECT COALESCE(SUM(mb.element_count), 0)
         FROM usap_membership_block AS mb
@@ -541,6 +642,39 @@ SELECT
 FROM usap_annotation AS a
 JOIN usap_semantic_class AS sc
     ON sc.semantic_class_id = a.semantic_class_id
+LEFT JOIN usap_city_object AS co
+    ON co.city_object_id = a.primary_city_object_id;
+
+-- selected_element_count is summed across the annotation's assessments above;
+-- this view is where a reader sees the per-assessment breakdown US-ANN-08 asks
+-- for ("distinguish them at least by date and 3D asset").
+CREATE VIEW usap_assessments_view AS
+SELECT
+    asm.assessment_id AS OGC_FID,
+    asm.assessment_uid,
+    a.annotation_uid,
+    sc.local_name AS concept,
+    co.object_uid AS city_object_uid,
+    asm.assessed_at,
+    asset.uri AS asset_uri,
+    asset.asset_kind,
+    asm.status,
+    asm.confidence,
+    CAST((
+        SELECT COALESCE(SUM(mb.element_count), 0)
+        FROM usap_membership_block AS mb
+        WHERE mb.assessment_id = asm.assessment_id
+    ) AS INTEGER) AS selected_element_count,
+    asm.attributes_json,
+    asm.created_at,
+    asm.updated_at
+FROM usap_assessment AS asm
+JOIN usap_annotation AS a
+    ON a.annotation_id = asm.annotation_id
+JOIN usap_semantic_class AS sc
+    ON sc.semantic_class_id = a.semantic_class_id
+JOIN usap_asset AS asset
+    ON asset.asset_id = asm.asset_id
 LEFT JOIN usap_city_object AS co
     ON co.city_object_id = a.primary_city_object_id;
 

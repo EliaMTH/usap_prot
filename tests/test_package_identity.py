@@ -250,7 +250,7 @@ def test_annotation_timestamps_are_utc_iso8601(tmp_path: Path) -> None:
         # update_annotation writes its own timestamp; it has to use the same
         # spelling as the schema default or edited rows drift into a second
         # format.
-        pkg.update_annotation(annotation_id, label="touched")
+        pkg.update_annotation(annotation_id, status="accepted")
 
         updated = pkg.conn.execute(
             """

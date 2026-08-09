@@ -260,3 +260,13 @@ Any naive/accelerated result mismatch aborts the run, so a completed run
 establishes that the accelerators and the base tables answer the tested
 queries equivalently over the tested fixtures. That is an equivalence check,
 not a proof of functional completeness in general.
+
+> **Profile 0.4.0 note.** Membership and value blocks gained an `assessment_id`
+> owner, and the `UNIQUE(annotation_id, ...)` constraint whose auto-index
+> served the annotation-first lookups measured here is now scoped to the
+> assessment. That index did not disappear: it is declared explicitly as
+> `usap_mb_by_annotation` / `usap_vb_by_annotation` over the same columns in the
+> same order, and `annotation_id` stays denormalised on the block so no forward
+> query has to join `usap_assessment` to reach it. The reverse-query index
+> (`usap_mb_by_element_block`) and the recursive-CTE `CROSS JOIN` — the two
+> things this document actually measures — are untouched.

@@ -57,7 +57,6 @@ def main() -> None:
         roof_annotation_id = pkg.create_annotation(
             annotation_uid="ann_demo_roof_las_points",
             semantic_class_id=citygml_classes.by_name["RoofSurface"],
-            label="Demo roof LAS point annotation",
             status="accepted",
             confidence=1.0,
         )
@@ -86,7 +85,6 @@ def main() -> None:
         energy_annotation_id = pkg.create_annotation(
             annotation_uid="ann_demo_energy_roof_las_points",
             semantic_class_id=ade_classes.by_name["EnergyRoof"],
-            label="Demo EnergyRoof ADE annotation",
             status="draft",
             confidence=None,
             attributes_json=json.dumps(energy_attributes),

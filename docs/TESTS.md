@@ -87,7 +87,7 @@ rather than depending on the full OGC distribution.
 ## Annotation CRUD — `test_annotation_crud.py`
 
 - `test_get_and_update_annotation` — read/update round-trip of the editable
-  claim fields (label, status, confidence, attributes).
+  claim fields (status, confidence, attributes).
 - `test_list_annotations_with_filters` — listing filters (status, concept,
   city object) return exactly the matching annotations.
 - `test_delete_annotation_cascades_membership` — deleting an annotation must
@@ -345,9 +345,8 @@ pile of unrelated roots with no warning.
   `test_a_contradicting_category_raises` — classify before or after the edges
   exist, re-load freely, but a category that contradicts one already recorded
   raises rather than overwriting it.
-- `test_turtle_is_refused_with_a_usable_message` /
-  `test_xml_that_is_not_rdf_is_refused` — the reader is RDF/XML only so that
-  ontology support costs no dependency; refusing must say what to do instead.
+- `test_xml_that_is_not_rdf_is_refused` — XML that is not RDF is refused by the
+  built-in reader with a message naming what it expected.
 - `test_reads_a_real_world_ade` — runs against an actual ADE when one is in
   the checkout, and skips otherwise (`*.owl` is gitignored).
 
@@ -470,7 +469,7 @@ Conformance additions:
 - `test_extension_definition_is_a_uri` — the standard asks for a reference to
   the defining document, not a prose description.
 
-- `test_attribute_layers_are_registered` — the three read-only attribute
+- `test_attribute_layers_are_registered` — the four read-only attribute
   layers exist in `gpkg_contents` so QGIS/GDAL can browse the package.
 - `test_annotations_view_is_readable` / `test_city_objects_view_shows_temporary_carriers`
   — the views expose annotations/concepts/carriers as documented.
@@ -575,8 +574,74 @@ Each test corrupts one invariant and asserts `validate_report()` names it:
 - `test_selected_faces_across_multiple_blocks_return_annotations` — selections
   spanning block boundaries merge matches correctly.
 
+## Assessments — `test_assessments.py`
+
+US-ANN-08's two-level model: a logical annotation carrying N dated evaluations,
+each bound to one 3D asset with its own membership. Written against the story's
+acceptance criteria rather than the implementation.
+
+- `test_annotating_without_mentioning_assessments_still_works` /
+  `test_repeated_writes_reuse_the_one_assessment` — the compatibility claim the
+  design rests on: a caller that never heard of assessments behaves exactly as
+  before, and editing a lasso ten times is one evaluation, not ten.
+- `test_second_assessment_keeps_the_same_annotation_and_city_object` — the
+  point of the level existing: concept and city-object link are stored once.
+- `test_each_assessment_has_a_unique_identifier` /
+  `test_new_assessment_does_not_modify_the_previous_one` — the criteria the
+  one-annotation-per-assessment workaround could not satisfy.
+- `test_assessments_are_listed_distinguished_by_date_and_asset` — the listing
+  US-ANN-08 asks for, across two dates and two assets.
+- `test_selecting_an_assessment_highlights_only_its_elements` /
+  `test_lasso_reports_each_assessment_separately` — a selection touching two
+  evaluations answers twice, tagged; the extents are never merged into a
+  coverage no single evaluation claimed.
+- `test_deleting_one_assessment_leaves_the_others` /
+  `test_deleting_the_annotation_removes_every_assessment` — cascade in both
+  directions.
+- `test_membership_outside_the_assessments_asset_is_refused` /
+  `test_assessment_of_another_annotation_is_refused` /
+  `test_validation_catches_a_block_pointing_at_a_foreign_asset` /
+  `test_validation_catches_a_block_naming_the_wrong_annotation` — the two
+  structural invariants, refused on write and re-checked by validation against
+  a package corrupted underneath the API.
+- `test_ambiguous_write_raises_rather_than_guessing` — once a second evaluation
+  exists, an unqualified write has no right answer; picking the newest would
+  silently rewrite history.
+- `test_only_one_undated_assessment_per_annotation_and_asset` — the partial
+  unique index, not just the write path's good manners: SQLite treats NULLs as
+  distinct, so the plain UNIQUE would not have caught this.
+- `test_create_assessment_is_idempotent_on_date` — re-running an import does not
+  fork a claim's history; two evaluations of one asset on one date are one
+  assessment.
+- `test_assessment_carries_its_own_metadata` /
+  `test_assessment_asset_cannot_be_repointed` — method and operator differ per
+  evaluation; the asset cannot, because membership is indexed against it.
+- `test_empty_assessment_is_a_warning_not_an_error` — recorded before its
+  geometry is selected is a normal intermediate state.
+- `test_value_fields_are_scoped_to_their_assessment` — a field measured at two
+  dates is two fields, not one tiled twice.
+
 ## End-to-end — `test_integrated_prototype.py`
 
 - `test_integrated_citygml_las_mesh_ade_annotation` — the full MVP story in
   one test: CityGML import + LAS + mesh + ADE concept + one annotation
   spanning all three representations, queried back from each.
+
+## Ontology syntax dispatch and the configuration folder
+
+Appended to `test_ontology_loading.py`:
+
+- `test_turtle_is_read_when_rdflib_is_available` — the same facts as the
+  RDF/XML path, from a different syntax. The reader split exists so both agree
+  by construction; skipped when `rdflib` is absent.
+- `test_turtle_without_rdflib_reports_a_missing_capability` — a missing
+  optional parser is reported as `install usap[ttl]`, never as a broken file:
+  the rule `pyproject.toml` states for laspy/pyproj, applied to rdflib.
+- `test_unknown_ontology_suffix_is_refused` — an unrecognised suffix names both
+  reader families rather than guessing one.
+- `test_vocabulary_folder_loads_schemas_and_ontologies_together` — US-DATA-04's
+  "reads the configured file(s) at startup" as one call over a directory
+  holding XSDs, an ontology, and a JSON vocabulary; re-running is a no-op, so
+  re-seeding on every package open is safe.
+- `test_vocabulary_folder_needs_a_directory_with_something_in_it` — an empty
+  configuration folder is an error, not a silently empty vocabulary.

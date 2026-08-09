@@ -50,7 +50,6 @@ def test_get_and_update_annotation(tmp_path: Path) -> None:
             annotation_uid="ann_crud_roof",
             semantic_class_id=classes.by_name["RoofSurface"],
             primary_city_object_id=roof_id,
-            label="Original roof annotation",
             status="draft",
             confidence=0.25,
             attributes_json=json.dumps({"version": 1}),
@@ -62,19 +61,16 @@ def test_get_and_update_annotation(tmp_path: Path) -> None:
         assert annotation["annotation_uid"] == "ann_crud_roof"
         assert annotation["semantic_class"] == "RoofSurface"
         assert annotation["primary_city_object_uid"] == "building_1_roof_1"
-        assert annotation["label"] == "Original roof annotation"
         assert annotation["status"] == "draft"
         assert annotation["confidence"] == 0.25
 
         updated = pkg.update_annotation(
             annotation_id,
-            label="Updated roof annotation",
             status="accepted",
             confidence=None,
             attributes_json=json.dumps({"version": 2}),
         )
 
-        assert updated["label"] == "Updated roof annotation"
         assert updated["status"] == "accepted"
         assert updated["confidence"] is None
         assert json.loads(updated["attributes_json"]) == {"version": 2}
@@ -97,7 +93,7 @@ def test_get_and_update_annotation(tmp_path: Path) -> None:
                 (backdated, backdated, annotation_id),
             )
 
-        pkg.update_annotation(annotation_id, label="Touched roof annotation")
+        pkg.update_annotation(annotation_id, status="accepted")
 
         timestamps = pkg.conn.execute(
             """
@@ -133,7 +129,6 @@ def test_list_annotations_with_filters(tmp_path: Path) -> None:
             annotation_uid="ann_citygml_roof",
             semantic_class_id=classes.by_name["RoofSurface"],
             primary_city_object_id=roof_object_id,
-            label="CityGML roof annotation",
             status="accepted",
         )
 
@@ -141,7 +136,6 @@ def test_list_annotations_with_filters(tmp_path: Path) -> None:
             annotation_uid="ann_energy_roof",
             semantic_class_id=ade.by_name["EnergyRoof"],
             primary_city_object_id=roof_object_id,
-            label="Energy roof annotation",
             status="draft",
         )
 
@@ -194,7 +188,6 @@ def test_delete_annotation_cascades_membership(tmp_path: Path) -> None:
         annotation_id = pkg.create_annotation(
             annotation_uid="ann_delete_me",
             semantic_class_id=classes.by_name["RoofSurface"],
-            label="Delete me",
             status="draft",
         )
 

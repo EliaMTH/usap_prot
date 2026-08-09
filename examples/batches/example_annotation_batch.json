@@ -4,15 +4,14 @@
       "annotation_uid": "ann_batch_energy_roof_001",
       "concept": "EnergyRoof",
       "city_object_uid": "building_1_roof_1",
-      "label": "Batch EnergyRoof annotation",
       "status": "draft",
       "confidence": 0.8,
+      "assessed_at": "2026-06-30T14:00:00Z",
       "attributes": {
         "domain": "energy_emissions",
         "method": "roof_detector_v2",
         "source": "survey_2026_06",
-        "assessed_at": "2026-06-30T14:00:00Z",
-        "note": "Attributes hold claim-level metadata only (how/when/by what this annotation was made). Object properties such as roof slope, use, or construction era live in the CityGML/ADE source, reachable through city_object_uid - never duplicated into USAP."
+        "note": "Attributes hold claim-level metadata only (how this annotation was made). WHEN it was made is 'assessed_at', which is a column: an annotation re-evaluated at another date is a second assessment of the same claim, not a second annotation. Object properties such as roof slope, use, or construction era live in the CityGML/ADE source, reachable through city_object_uid - never duplicated into USAP."
       },
       "memberships": [
         {
@@ -24,6 +23,27 @@
           "asset_uri": "area_lod2",
           "part_path": "geometry/0:default",
           "element_indices": [0, 1]
+        }
+      ]
+    },
+    {
+      "annotation_uid": "ann_batch_energy_roof_001",
+      "concept": "EnergyRoof",
+      "city_object_uid": "building_1_roof_1",
+      "status": "accepted",
+      "confidence": 0.95,
+      "assessed_at": "2027-05-14T09:30:00Z",
+      "attributes": {
+        "domain": "energy_emissions",
+        "method": "roof_detector_v3",
+        "source": "survey_2027_05",
+        "note": "Same annotation_uid, later date: this entry adds a second assessment rather than overwriting the first. Its membership is the re-surveyed extent; the 2026 assessment keeps its own. Requires replace_existing=True, since the annotation already exists."
+      },
+      "memberships": [
+        {
+          "asset_uri": "area_lod2",
+          "part_path": "geometry/0:default",
+          "element_indices": [0, 1, 2]
         }
       ]
     }

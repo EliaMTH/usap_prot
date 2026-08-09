@@ -90,7 +90,6 @@ def main() -> None:
         annotation_id = pkg.create_annotation(
             annotation_uid="ann_demo_mesh_roof_faces",
             semantic_class_id=classes.by_name["RoofSurface"],
-            label="Demo mesh roof face annotation",
             status="accepted",
             confidence=1.0,
         )

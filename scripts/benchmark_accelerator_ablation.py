@@ -200,7 +200,6 @@ def naive_annotations_for_elements(
             mb.block_start,
             mb.payload,
             a.annotation_uid,
-            a.label,
             a.status,
             sc.local_name AS semantic_class,
             sc.class_uri AS semantic_class_uri,
@@ -237,7 +236,6 @@ def naive_annotations_for_elements(
             matches_by_annotation[annotation_id] = {
                 "annotation_id": annotation_id,
                 "annotation_uid": row["annotation_uid"],
-                "label": row["label"],
                 "status": row["status"],
                 "semantic_class": row["semantic_class"],
                 "semantic_class_uri": row["semantic_class_uri"],
@@ -365,7 +363,6 @@ def canon_reverse_result(results: list[dict]) -> dict:
     return {
         item["annotation_id"]: (
             item["annotation_uid"],
-            item["label"],
             item["status"],
             item["semantic_class"],
             item["semantic_class_uri"],
@@ -519,7 +516,6 @@ def deepen_package(pkg: USAPPackage, result, config: SyntheticConfig) -> dict:
             element_kind="face",
             values=gradient,
             status="accepted",
-            label="gradient value field (pruning-friendly)",
         )
 
         noise_annotation = pkg.annotate_value_field(
@@ -528,7 +524,6 @@ def deepen_package(pkg: USAPPackage, result, config: SyntheticConfig) -> dict:
             element_kind="face",
             values=noise,
             status="accepted",
-            label="uniform-noise value field (pruning-hostile)",
         )
 
     return {

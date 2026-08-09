@@ -76,9 +76,18 @@ What is derived when omitted:
   stable logical URIs in the config); add `"part_path"` only when the asset
   has several parts. Numeric `"asset_part_id"` from the manifest still works.
 
-Optional per entry: `label`, `status`, `confidence`, `attributes`
-(claim-level metadata only — method, source, timestamps), `value_fields`
-(dense per-element values, see REFERENCE.md).
+Optional per entry: `status`, `confidence`, `attributes` (claim-level metadata
+only — method, source), `value_fields` (dense per-element values, see
+REFERENCE.md), and `assessed_at`.
+
+**`assessed_at` dates the evaluation**, and is what makes a re-survey importable.
+An entry without it writes into the annotation's undated assessment, so a
+single-pass batch needs to know nothing about assessments. Re-applying a file
+with the *same* `annotation_uid` and a *different* `assessed_at` records a second
+assessment beside the first — the concept and the city-object link are stated
+once, on the annotation, while each dated evaluation keeps its own extent. That
+is the one case where re-applying does **not** edit in place. Memberships and
+value fields in one entry share its date, because they are one evaluation of it.
 
 ## Procedure 2 — init from 3D assets + minimal vocabulary + linking JSON
 
@@ -187,7 +196,7 @@ Keeping the annotations in USAP also means that creating, accepting, rejecting, 
 
 ## GIS interoperability
 
-Every package built by these procedures opens in QGIS/GDAL: three read-only
+Every package built by these procedures opens in QGIS/GDAL: four read-only
 attribute layers (annotations, concepts, city objects) plus a features layer
 drawing one **derived 2D bounding box per asset** — written automatically at
 registration from the stored part bounds (for LAS, literally the header box;

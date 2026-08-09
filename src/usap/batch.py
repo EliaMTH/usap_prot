@@ -78,10 +78,11 @@ def apply_annotation_batch(
           "concept": "EnergyRoof",              # optional when the linked
                                                 # object already has a class
           "city_object_uid": "building_1_roof_1",
-          "label": "Energy roof annotation",
           "status": "draft",
           "confidence": 0.8,
           "attributes": {...},
+          "assessed_at": "2026-06-30T14:00:00Z",  # optional: dates this
+                                                  # evaluation (US-ANN-08)
           "memberships": [
             {
               "asset_part_id": 1,               # or "asset_uri" (+ optional
@@ -93,6 +94,12 @@ def apply_annotation_batch(
         }
       ]
     }
+
+    An entry without "assessed_at" writes into the annotation's undated
+    assessment, so a single-pass batch needs to know nothing about assessments.
+    Re-running the same file with a *different* "assessed_at" on the same
+    annotation_uid records a second evaluation beside the first rather than
+    overwriting it — which is how a re-survey is imported.
 
     With "create_missing_city_objects": true (the minimal-vocabulary
     procedure), an unknown city_object_uid creates a carrier city object on
@@ -298,7 +305,6 @@ def _apply_one_annotation(
             concept=semantic_class_id,
             annotation_uid=annotation_uid,
             city_object_id=resolved_city_object_id,
-            label=item.get("label"),
             status=item.get("status", "draft"),
             confidence=item.get("confidence"),
             attributes=attributes,
@@ -314,9 +320,6 @@ def _apply_one_annotation(
         update_kwargs: dict[str, Any] = {
             "semantic_class_id": semantic_class_id,
         }
-
-        if "label" in item:
-            update_kwargs["label"] = item.get("label")
 
         if "status" in item:
             update_kwargs["status"] = item.get("status")
@@ -368,6 +371,10 @@ def _apply_one_annotation(
             "or 'value_fields'."
         )
 
+    # One date for the whole entry: memberships and value fields written by the
+    # same entry are one evaluation of it, so they must land in one assessment.
+    assessed_at = item.get("assessed_at")
+
     membership_count = 0
 
     for membership in memberships or []:
@@ -376,6 +383,7 @@ def _apply_one_annotation(
             annotation_id=annotation_id,
             annotation_uid=annotation_uid,
             membership=membership,
+            assessed_at=assessed_at,
         )
 
         membership_count += 1
@@ -388,6 +396,7 @@ def _apply_one_annotation(
             annotation_id=annotation_id,
             annotation_uid=annotation_uid,
             value_field=value_field,
+            assessed_at=assessed_at,
         )
 
         value_field_count += 1
@@ -469,6 +478,7 @@ def _apply_one_membership(
     annotation_id: int,
     annotation_uid: str,
     membership: dict[str, Any],
+    assessed_at: str | None = None,
 ) -> None:
     if not isinstance(membership, dict):
         raise ValueError(
@@ -502,7 +512,48 @@ def _apply_one_membership(
         asset_part_id=asset_part_id,
         element_kind=element_kind,
         element_indices=element_indices,
+        assessment=_assessment_for_entry(
+            pkg,
+            annotation_id=annotation_id,
+            asset_part_id=asset_part_id,
+            assessed_at=assessed_at,
+        ),
     )
+
+
+def _assessment_for_entry(
+    pkg: USAPPackage,
+    *,
+    annotation_id: int,
+    asset_part_id: int,
+    assessed_at: str | None,
+) -> int | None:
+    """
+    The assessment a batch entry writes into, or None for the default.
+
+    Resolved per (annotation, asset) rather than once per entry: one entry may
+    carry memberships on several assets, and each asset is evaluated by its own
+    assessment.
+    """
+    if assessed_at is None:
+        return None
+
+    part = pkg.list_asset_parts()
+    asset_id = next(
+        (p["asset_id"] for p in part if p["asset_part_id"] == asset_part_id),
+        None,
+    )
+
+    if asset_id is None:
+        raise USAPError(f"Unknown asset_part_id: {asset_part_id}")
+
+    assessment = pkg.create_assessment(
+        annotation_id,
+        int(asset_id),
+        assessed_at=assessed_at,
+    )
+
+    return int(assessment["assessment_id"])
 
 
 def _apply_one_value_field(
@@ -511,6 +562,7 @@ def _apply_one_value_field(
     annotation_id: int,
     annotation_uid: str,
     value_field: dict[str, Any],
+    assessed_at: str | None = None,
 ) -> None:
     if not isinstance(value_field, dict):
         raise ValueError(
@@ -545,5 +597,11 @@ def _apply_one_value_field(
         element_kind=element_kind,
         values=[float("nan") if v is None else v for v in values],
         value_dtype=value_field.get("value_dtype"),
+        assessment=_assessment_for_entry(
+            pkg,
+            annotation_id=annotation_id,
+            asset_part_id=asset_part_id,
+            assessed_at=assessed_at,
+        ),
     )
 

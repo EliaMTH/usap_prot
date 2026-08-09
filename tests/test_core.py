@@ -89,7 +89,6 @@ def build_tiny_package(db_path: Path) -> tuple[USAPPackage, int, int, int]:
         annotation_uid="ann_building_1_roof_mesh",
         semantic_class_id=roof_class_id,
         primary_city_object_id=roof_id,
-        label="Roof of building_1 in mesh",
         status="accepted",
         confidence=1.0,
     )
@@ -319,10 +318,13 @@ def test_city_object_query_finds_annotation_without_object_link(tmp_path: Path) 
         # validation must say so rather than let it pass silently.
         report = pkg.validate_report()
 
-        assert [issue.code for issue in report.issues] == [
+        # Errors only: this fixture registers its asset part by hand without an
+        # indexing_profile, which validation warns about separately and which
+        # has nothing to do with the invariant under test.
+        assert [issue.code for issue in report.errors] == [
             "ANNOTATION_PRIMARY_OBJECT_LINK_MISSING"
         ], [i.format() for i in report.issues]
-        assert report.issues[0].details["annotation_id"] == unlinked_id
+        assert report.errors[0].details["annotation_id"] == unlinked_id
 
     finally:
         pkg.close()

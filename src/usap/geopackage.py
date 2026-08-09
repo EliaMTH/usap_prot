@@ -48,6 +48,7 @@ USAP_EXTENSION_TABLES = [
     "usap_city_object_relationship",
     "usap_annotation",
     "usap_annotation_object",
+    "usap_assessment",
     "usap_membership_block",
     "usap_value_block",
     "usap_edit_log",
@@ -59,6 +60,8 @@ USAP_EXTENSION_TABLES = [
 USAP_ATTRIBUTE_LAYERS = [
     ("usap_annotations_view", "USAP annotations",
      "Annotations with concept, city object, and element counts."),
+    ("usap_assessments_view", "USAP assessments",
+     "Dated evaluations of each annotation, per 3D asset."),
     ("usap_concepts_view", "USAP concepts",
      "Accepted concept registry with usage counts."),
     ("usap_city_objects_view", "USAP city objects",
@@ -84,7 +87,7 @@ def initialize_geopackage_metadata(
     1. Sets SQLite header pragmas so the file identifies as GeoPackage-like.
     2. Inserts required/default spatial reference rows.
     3. Registers USAP tables as a package extension in gpkg_extensions.
-    4. Registers the GIS-facing views in gpkg_contents: three 'attributes'
+    4. Registers the GIS-facing views in gpkg_contents: four 'attributes'
        layers plus the derived asset-extent 'features' layer, so generic
        GIS tools (QGIS/GDAL) can browse and map the package.
 

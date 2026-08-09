@@ -8,12 +8,20 @@ vocabulary and asserts no category of its own.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
-from conftest import make_pkg, seed_citygml_concepts
-from usap import USAPError, USAPPackage, import_citygml_semantics, load_ontology
+from conftest import CITYGML_SCHEMA_FIXTURE, make_pkg, seed_citygml_concepts
+from usap import (
+    USAPError,
+    USAPPackage,
+    city_object_classes,
+    import_citygml_semantics,
+    load_ontology,
+    load_vocabulary_folder,
+)
 
 CATEGORY_ONTOLOGY = Path(__file__).parent / "fixtures" / "citygml_3_0_categories.owl"
 
@@ -150,21 +158,6 @@ def test_a_contradicting_category_raises(pkg: USAPPackage) -> None:
         load_ontology(pkg, CATEGORY_ONTOLOGY)
 
 
-def test_turtle_is_refused_with_a_usable_message(tmp_path: Path) -> None:
-    # The built-in reader is RDF/XML only, on purpose: ontology support costs
-    # no extra dependency. Refusing has to say what to do about it.
-    turtle = tmp_path / "ont.ttl"
-    turtle.write_text(
-        '@prefix owl: <http://www.w3.org/2002/07/owl#> .\n'
-        '<http://example.org#boundary> a owl:ObjectProperty .\n',
-        encoding="utf-8",
-    )
-
-    with make_pkg(tmp_path) as pkg:
-        with pytest.raises(USAPError, match="RDF/XML only"):
-            load_ontology(pkg, turtle)
-
-
 def test_xml_that_is_not_rdf_is_refused(tmp_path: Path) -> None:
     other = tmp_path / "not_rdf.xml"
     other.write_text("<catalogue><entry/></catalogue>", encoding="utf-8")
@@ -233,3 +226,134 @@ def test_reads_a_real_world_ade(tmp_path: Path) -> None:
 
         assert pkg.resolve_semantic_class("BuildingQuality")
         assert pkg.validate_report().is_ok
+
+
+# ---------------------------------------------------------------------------
+# Syntax dispatch and the configuration-folder loader
+# ---------------------------------------------------------------------------
+
+TURTLE_ONTOLOGY = """
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix usap: <urn:usap:> .
+@prefix ex:   <http://example.org/onto#> .
+
+ex:boundary a owl:ObjectProperty ;
+    usap:category "containment" .
+
+ex:Surface a owl:Class .
+ex:RoofPanel a owl:Class ;
+    rdfs:subClassOf ex:Surface .
+"""
+
+
+def test_turtle_is_read_when_rdflib_is_available(tmp_path):
+    """
+    Same facts as the RDF/XML path, from a different syntax: the reader split
+    exists so both agree by construction.
+    """
+    pytest.importorskip("rdflib")
+
+    ontology = tmp_path / "domain.ttl"
+    ontology.write_text(TURTLE_ONTOLOGY)
+
+    with make_pkg(tmp_path, "ttl.usap.gpkg") as pkg:
+        result = load_ontology(pkg, ontology)
+
+        assert result.categorised == 1
+        assert len(result.concepts) == 2
+
+        types = {t["local_name"]: t for t in pkg.list_relationship_types()}
+        assert types["boundary"]["category"] == "containment"
+
+        # The subClassOf survived the syntax change.
+        panel = pkg.resolve_semantic_class("RoofPanel")
+        surface = pkg.resolve_semantic_class("Surface")
+        blocks = pkg.conn.execute(
+            "SELECT parent_class_id FROM usap_semantic_class WHERE semantic_class_id = ?",
+            (panel,),
+        ).fetchone()
+        assert blocks["parent_class_id"] == surface
+
+
+def test_turtle_without_rdflib_reports_a_missing_capability(tmp_path, monkeypatch):
+    """
+    A missing optional parser must never be reported as a broken file — the
+    rule pyproject.toml states for laspy/pyproj, applied to rdflib.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_rdflib(name, *args, **kwargs):
+        if name == "rdflib":
+            raise ImportError("no rdflib")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_rdflib)
+
+    ontology = tmp_path / "domain.ttl"
+    ontology.write_text(TURTLE_ONTOLOGY)
+
+    with make_pkg(tmp_path, "nottl.usap.gpkg") as pkg:
+        with pytest.raises(USAPError, match=r"install usap\[ttl\]"):
+            load_ontology(pkg, ontology)
+
+
+def test_unknown_ontology_suffix_is_refused(tmp_path):
+    other = tmp_path / "vocab.yaml"
+    other.write_text("nope")
+
+    with make_pkg(tmp_path, "suffix.usap.gpkg") as pkg:
+        with pytest.raises(USAPError, match="Unsupported ontology suffix"):
+            load_ontology(pkg, other)
+
+
+def test_vocabulary_folder_loads_schemas_and_ontologies_together(tmp_path):
+    """
+    US-DATA-04's "reads the configured file(s) at startup", as one call over a
+    configuration directory holding more than one kind of source.
+    """
+    config = tmp_path / "vocabulary"
+    config.mkdir()
+
+    for xsd in CITYGML_SCHEMA_FIXTURE.rglob("*.xsd"):
+        (config / xsd.name).write_bytes(xsd.read_bytes())
+
+    (config / "domain.owl").write_bytes(CATEGORY_ONTOLOGY.read_bytes())
+    (config / "local.json").write_text(
+        json.dumps(
+            {
+                "scheme": "local",
+                "concepts": [{"local_name": "SolarPanel"}],
+            }
+        )
+    )
+
+    with make_pkg(tmp_path, "folder.usap.gpkg") as pkg:
+        results = load_vocabulary_folder(pkg, config)
+
+        assert "domain.owl" in results
+        assert "local.json" in results
+
+        # All three sources landed in one registry.
+        names = {c["local_name"] for c in pkg.list_accepted_concepts()}
+        assert "Building" in names        # from the XSDs
+        assert "SolarPanel" in names      # from the JSON vocabulary
+
+        # And the CityGML hierarchy came with them, which is what the XSDs are
+        # for: an ontology alone would not carry it.
+        assert city_object_classes(pkg)
+
+        # Re-seeding on open is the intended usage, so it must be a no-op.
+        load_vocabulary_folder(pkg, config)
+        assert {c["local_name"] for c in pkg.list_accepted_concepts()} == names
+
+
+def test_vocabulary_folder_needs_a_directory_with_something_in_it(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    with make_pkg(tmp_path, "empty.usap.gpkg") as pkg:
+        with pytest.raises(USAPError, match="No vocabulary files"):
+            load_vocabulary_folder(pkg, empty)

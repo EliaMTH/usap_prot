@@ -93,7 +93,6 @@ def test_integrated_citygml_las_mesh_ade_annotation(tmp_path: Path) -> None:
             annotation_uid="ann_integrated_energy_roof",
             semantic_class_id=ade_classes.by_name["EnergyRoof"],
             primary_city_object_id=int(roof_row["city_object_id"]),
-            label="Integrated EnergyRoof annotation",
             status="draft",
             confidence=None,
             attributes_json=json.dumps(attributes),

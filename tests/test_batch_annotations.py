@@ -54,7 +54,6 @@ def test_apply_annotation_batch_with_las_and_mesh(tmp_path: Path) -> None:
                     "annotation_uid": "ann_batch_energy_roof",
                     "concept": "EnergyRoof",
                     "city_object_uid": "building_1_roof_1",
-                    "label": "Batch EnergyRoof",
                     "status": "draft",
                     "attributes": {
                         "domain": "energy_emissions"
@@ -192,7 +191,6 @@ def test_batch_replace_existing(tmp_path: Path) -> None:
                 {
                     "annotation_uid": "ann_replace",
                     "concept": "RoofSurface",
-                    "label": "First",
                     "memberships": [
                         {
                             "asset_part_id": las.asset_part_id,
@@ -209,7 +207,7 @@ def test_batch_replace_existing(tmp_path: Path) -> None:
                 {
                     "annotation_uid": "ann_replace",
                     "concept": "RoofSurface",
-                    "label": "Second",
+                    "status": "accepted",
                     "memberships": [
                         {
                             "asset_part_id": las.asset_part_id,
@@ -238,7 +236,7 @@ def test_batch_replace_existing(tmp_path: Path) -> None:
         )
 
         assert annotation is not None
-        assert annotation["label"] == "Second"
+        assert annotation["status"] == "accepted"
 
         matches_old = pkg.annotations_for_elements(
             asset_part_id=las.asset_part_id,
@@ -287,7 +285,6 @@ def test_batch_replace_preserves_omitted_fields(tmp_path: Path) -> None:
                     "annotation_uid": "ann_preserve",
                     "concept": "EnergyRoof",
                     "city_object_uid": "building_1_roof_1",
-                    "label": "Keep me",
                     "confidence": 0.75,
                     "attributes": {"domain": "energy_emissions"},
                     "memberships": [
@@ -325,7 +322,6 @@ def test_batch_replace_preserves_omitted_fields(tmp_path: Path) -> None:
 
         assert annotation is not None
         # Omitted fields are preserved, not cleared to NULL:
-        assert annotation["label"] == "Keep me"
         assert annotation["confidence"] == 0.75
         assert annotation["attributes_json"] is not None
         assert json.loads(annotation["attributes_json"]) == {

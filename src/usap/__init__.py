@@ -40,11 +40,13 @@ from .adapters import (
     register_mesh_asset,
 )
 from .domain_vocab import (
+    OntologyResult,
     VocabularyResult,
     city_object_classes,
     is_city_object_class,
     load_citygml_schema,
     load_ontology,
+    load_vocabulary_folder,
     seed_default_ade_vocabulary,
     seed_vocabulary_file,
 )
@@ -91,6 +93,8 @@ __all__ = [
     "LASRegistrationResult",
     "register_las_asset",
     "VocabularyResult",
+    "OntologyResult",
+    "load_vocabulary_folder",
     "CityGMLImportResult",
     "ImportedCityObject",
     "ImportedRelationship",

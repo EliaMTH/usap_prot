@@ -529,6 +529,246 @@ def _split_iri(iri: str) -> tuple[str, str] | None:
     return None
 
 
+# Which reader handles which syntax. RDF/XML stays on the built-in lxml reader
+# so the common path needs no extra dependency and its behaviour does not
+# change; the rest need rdflib, which is an optional extra ([ttl]).
+_RDFXML_SUFFIXES = frozenset({".owl", ".rdf", ".rdfs", ".xml"})
+_RDFLIB_SUFFIXES = frozenset({".ttl", ".n3", ".nt", ".trig", ".jsonld"})
+
+
+@dataclass(frozen=True)
+class _OntologyFacts:
+    """
+    What a reader extracts, independent of the file's syntax.
+
+    Readers produce this; _register_ontology_facts writes it. Splitting them is
+    what lets Turtle and RDF/XML share every downstream decision (identity,
+    parent resolution, category handling) instead of each re-deriving it.
+
+        properties  (iri, usap:category or None)
+        classes     (iri, [named parent iri, ...])
+        imports     owl:imports targets — reported, never followed
+    """
+
+    properties: list[tuple[str, str | None]]
+    classes: list[tuple[str, list[str]]]
+    imports: list[str]
+
+
+def _read_ontology_rdfxml(path: Path) -> _OntologyFacts:
+    """
+    Read RDF/XML with lxml: flat declarations, no extra dependency.
+    """
+    from lxml import etree
+
+    try:
+        root = etree.parse(str(path)).getroot()
+    except etree.XMLSyntaxError as exc:
+        raise USAPError(
+            f"{path} is not readable as RDF/XML: {exc}. Files with a .ttl, "
+            ".n3, .nt, .trig or .jsonld suffix are read with rdflib instead — "
+            "rename the file if it is really Turtle, or install usap[ttl]."
+        ) from exc
+
+    if root.tag != f"{_RDF}RDF":
+        raise USAPError(
+            f"{path} is XML but not RDF/XML: the root element is "
+            f"{root.tag!r}, expected rdf:RDF."
+        )
+
+    properties: list[tuple[str, str | None]] = []
+
+    for node in root.iter(f"{_OWL}ObjectProperty"):
+        iri = node.get(f"{_RDF}about")
+
+        if not iri:
+            # A property defined inline with no IRI cannot be referred to from
+            # anywhere else, so it can never match a stored edge.
+            continue
+
+        category_node = node.find(f"{_USAP}category")
+        category = None
+
+        if category_node is not None and category_node.text:
+            category = category_node.text.strip() or None
+
+        properties.append((iri, category))
+
+    classes: list[tuple[str, list[str]]] = []
+
+    for node in root.iter(f"{_OWL}Class"):
+        iri = node.get(f"{_RDF}about")
+
+        if not iri:
+            continue
+
+        parents = [
+            parent_iri
+            for parent_node in node.findall(f"{_RDFS}subClassOf")
+            if (parent_iri := parent_node.get(f"{_RDF}resource"))
+        ]
+
+        classes.append((iri, parents))
+
+    imports = [
+        value
+        for node in root.iter(f"{_OWL}imports")
+        if (value := node.get(f"{_RDF}resource"))
+    ]
+
+    return _OntologyFacts(
+        properties=properties,
+        classes=classes,
+        imports=imports,
+    )
+
+
+def _read_ontology_rdflib(path: Path) -> _OntologyFacts:
+    """
+    Read any RDF syntax rdflib understands (Turtle, N-Triples, JSON-LD, ...).
+
+    Deliberately *not* implemented by serializing to RDF/XML and re-feeding the
+    lxml reader: rdflib may write a typed node as rdf:Description + rdf:type,
+    which that reader does not look for, so classes would silently go
+    unregistered. Reading the graph directly also makes the syntax irrelevant,
+    which is the point.
+    """
+    try:
+        from rdflib import OWL, RDF, RDFS, Graph, URIRef
+    except ImportError as exc:
+        raise USAPError(
+            f"Reading {path.name} needs rdflib, which is not installed: "
+            "install usap[ttl]. Alternatively convert the file to RDF/XML "
+            "(Protégé: 'Save as' → RDF/XML), which the built-in reader handles."
+        ) from exc
+
+    graph = Graph()
+
+    try:
+        graph.parse(str(path))
+    except Exception as exc:  # rdflib raises a parser-specific zoo
+        raise USAPError(f"{path} is not readable as RDF: {exc}") from exc
+
+    category_predicate = URIRef(f"{USAP_ONTOLOGY_NAMESPACE}category")
+
+    properties: list[tuple[str, str | None]] = []
+
+    for subject in graph.subjects(RDF.type, OWL.ObjectProperty):
+        if not isinstance(subject, URIRef):
+            continue  # a blank node cannot be referred to from a document
+
+        category = graph.value(subject, category_predicate)
+        properties.append(
+            (str(subject), str(category).strip() or None if category else None)
+        )
+
+    classes: list[tuple[str, list[str]]] = []
+
+    for subject in graph.subjects(RDF.type, OWL.Class):
+        if not isinstance(subject, URIRef):
+            continue
+
+        parents = [
+            str(parent)
+            for parent in graph.objects(subject, RDFS.subClassOf)
+            if isinstance(parent, URIRef)
+        ]
+
+        classes.append((str(subject), parents))
+
+    imports = [str(target) for target in graph.objects(None, OWL.imports)]
+
+    # Sorted for a stable result: rdflib's graph iteration order is not the
+    # file's, and two runs over one file must register the same things.
+    return _OntologyFacts(
+        properties=sorted(properties),
+        classes=sorted(classes),
+        imports=sorted(imports),
+    )
+
+
+def _register_ontology_facts(
+    pkg: USAPPackage,
+    facts: _OntologyFacts,
+    *,
+    scheme: str,
+    scheme_version: str | None,
+) -> OntologyResult:
+    """
+    Write what a reader found. Syntax-neutral: every decision about identity,
+    parents and categories lives here, so all readers agree by construction.
+    """
+    relationship_types: dict[str, int] = {}
+    concepts: dict[str, int] = {}
+    categorised = 0
+
+    with pkg.transaction():
+        for iri, category in facts.properties:
+            split = _split_iri(iri)
+
+            if split is None:
+                continue
+
+            code_space, local_name = split
+
+            relationship_types[iri] = pkg.register_relationship_type(
+                local_name,
+                code_space=code_space,
+                category=category,
+            )
+
+            if category is not None:
+                categorised += 1
+
+        # Two passes over classes so a parent declared after its child still
+        # resolves, mirroring load_citygml_schema's parents-first ordering.
+        for iri, _parents in facts.classes:
+            split = _split_iri(iri)
+
+            if split is None:
+                continue
+
+            source_namespace, local_name = split
+
+            concepts[iri] = pkg.create_semantic_class(
+                scheme=scheme,
+                scheme_version=scheme_version,
+                class_uri=iri,
+                local_name=local_name,
+                source_namespace=source_namespace,
+                concept_iri=iri,
+            )
+
+        for iri, parents in facts.classes:
+            if iri not in concepts:
+                continue
+
+            for parent_iri in parents:
+                # Only a named parent declared in this same file. A parent
+                # elsewhere (an anonymous owl:Restriction, or a class from an
+                # import) is not a hierarchy USAP can resolve, and guessing
+                # one would be worse than leaving the concept a root.
+                if parent_iri not in concepts:
+                    continue
+
+                pkg.create_semantic_class(
+                    scheme=scheme,
+                    scheme_version=scheme_version,
+                    class_uri=iri,
+                    local_name=_split_iri(iri)[1],
+                    parent_class_id=concepts[parent_iri],
+                )
+
+                break
+
+    return OntologyResult(
+        relationship_types=relationship_types,
+        concepts=concepts,
+        categorised=categorised,
+        imports=facts.imports,
+    )
+
+
 def load_ontology(
     pkg: USAPPackage,
     path: str | Path,
@@ -537,7 +777,7 @@ def load_ontology(
     scheme_version: str | None = None,
 ) -> OntologyResult:
     """
-    Read link types, their categories, and ADE concepts from an RDF/XML file.
+    Read link types, their categories, and ADE concepts from an ontology file.
 
     This is how a package is initialised on an ontology: supply a different
     one, or extend the one you have, and the package's link vocabulary changes
@@ -556,11 +796,14 @@ def load_ontology(
                              classes; CityGML's own come from the XSD, which is
                              the only artifact carrying their hierarchy.
 
-    **RDF/XML only.** Parsing is deliberately narrow — flat declarations, read
-    with the lxml USAP already depends on, so ontology support costs no extra
-    install. A Turtle file is refused with a clear message rather than
-    half-read. Anything the reader does not recognise is left alone: this adds
-    facts, it never removes or overrides them.
+    Syntax is chosen by suffix. ``.owl`` / ``.rdf`` / ``.rdfs`` / ``.xml`` are
+    read by a narrow built-in RDF/XML reader, so the common path costs no extra
+    install. ``.ttl`` / ``.n3`` / ``.nt`` / ``.trig`` / ``.jsonld`` are read
+    through **rdflib**, an optional extra: without it the file is reported as a
+    missing capability (``install usap[ttl]``), never as a broken file.
+
+    Anything a reader does not recognise is left alone: this adds facts, it
+    never removes or overrides them.
 
     ``owl:imports`` is **not** followed; the imported IRIs are returned so a
     caller can load them too if it wants. Following them would mean fetching
@@ -572,123 +815,125 @@ def load_ontology(
     import did register stays unclassified and is reported as
     UNCLASSIFIED_RELATIONSHIP_TYPE.
     """
-    from lxml import etree
-
     ontology_path = Path(path)
 
     if not ontology_path.exists():
         raise FileNotFoundError(f"Ontology file not found: {ontology_path}")
 
-    try:
-        root = etree.parse(str(ontology_path)).getroot()
-    except etree.XMLSyntaxError as exc:
-        raise USAPError(
-            f"{ontology_path} is not readable as RDF/XML: {exc}. The built-in "
-            "reader handles RDF/XML only — convert a Turtle or N-Triples file "
-            "first (for example with rdflib or Protégé)."
-        ) from exc
+    suffix = ontology_path.suffix.lower()
 
-    if root.tag != f"{_RDF}RDF":
+    if suffix in _RDFLIB_SUFFIXES:
+        facts = _read_ontology_rdflib(ontology_path)
+    elif suffix in _RDFXML_SUFFIXES:
+        facts = _read_ontology_rdfxml(ontology_path)
+    else:
         raise USAPError(
-            f"{ontology_path} is XML but not RDF/XML: the root element is "
-            f"{root.tag!r}, expected rdf:RDF."
+            f"Unsupported ontology suffix {suffix!r}: {ontology_path.name}. "
+            f"RDF/XML {sorted(_RDFXML_SUFFIXES)} is read directly; "
+            f"{sorted(_RDFLIB_SUFFIXES)} need rdflib (install usap[ttl])."
         )
 
-    imports = [
-        value
-        for node in root.iter(f"{_OWL}imports")
-        if (value := node.get(f"{_RDF}resource"))
-    ]
-
-    relationship_types: dict[str, int] = {}
-    concepts: dict[str, int] = {}
-    categorised = 0
-
-    with pkg.transaction():
-        for node in root.iter(f"{_OWL}ObjectProperty"):
-            iri = node.get(f"{_RDF}about")
-
-            if not iri:
-                # A property defined inline with no IRI cannot be referred to
-                # from anywhere else, so it can never match a stored edge.
-                continue
-
-            split = _split_iri(iri)
-
-            if split is None:
-                continue
-
-            code_space, local_name = split
-            category_node = node.find(f"{_USAP}category")
-            category = None
-
-            if category_node is not None and category_node.text:
-                category = category_node.text.strip() or None
-
-            relationship_types[iri] = pkg.register_relationship_type(
-                local_name,
-                code_space=code_space,
-                category=category,
-            )
-
-            if category is not None:
-                categorised += 1
-
-        # Two passes over classes so a parent declared after its child still
-        # resolves, mirroring load_citygml_schema's parents-first ordering.
-        class_nodes = [
-            node
-            for node in root.iter(f"{_OWL}Class")
-            if node.get(f"{_RDF}about")
-        ]
-
-        for node in class_nodes:
-            iri = node.get(f"{_RDF}about")
-            split = _split_iri(iri)
-
-            if split is None:
-                continue
-
-            source_namespace, local_name = split
-
-            concepts[iri] = pkg.create_semantic_class(
-                scheme=scheme,
-                scheme_version=scheme_version,
-                class_uri=iri,
-                local_name=local_name,
-                source_namespace=source_namespace,
-                concept_iri=iri,
-            )
-
-        for node in class_nodes:
-            iri = node.get(f"{_RDF}about")
-
-            if iri not in concepts:
-                continue
-
-            for parent_node in node.findall(f"{_RDFS}subClassOf"):
-                parent_iri = parent_node.get(f"{_RDF}resource")
-
-                # Only a named parent declared in this same file. A parent
-                # elsewhere (an anonymous owl:Restriction, or a class from an
-                # import) is not a hierarchy USAP can resolve, and guessing
-                # one would be worse than leaving the concept a root.
-                if parent_iri is None or parent_iri not in concepts:
-                    continue
-
-                pkg.create_semantic_class(
-                    scheme=scheme,
-                    scheme_version=scheme_version,
-                    class_uri=iri,
-                    local_name=_split_iri(iri)[1],
-                    parent_class_id=concepts[parent_iri],
-                )
-
-                break
-
-    return OntologyResult(
-        relationship_types=relationship_types,
-        concepts=concepts,
-        categorised=categorised,
-        imports=imports,
+    return _register_ontology_facts(
+        pkg,
+        facts,
+        scheme=scheme,
+        scheme_version=scheme_version,
     )
+
+
+# What each suffix in a configuration folder means. .xsd is a CityGML schema
+# (concepts + hierarchy), .json a vocabulary file, the rest an ontology.
+_VOCABULARY_SUFFIXES = (
+    frozenset({".xsd"})
+    | frozenset({".json"})
+    | _RDFXML_SUFFIXES
+    | _RDFLIB_SUFFIXES
+)
+
+
+def load_vocabulary_folder(
+    pkg: USAPPackage,
+    path: str | Path,
+    *,
+    scheme_version: str | None = None,
+) -> dict[str, VocabularyResult | OntologyResult]:
+    """
+    Seed a package from a configuration folder, in one call.
+
+    An application configured with "the vocabulary lives in this directory"
+    (US-DATA-04) should not have to know which file is a CityGML schema, which
+    is an ontology, and which syntax each ontology happens to use. This walks
+    the folder and dispatches by suffix:
+
+        .xsd                     load_citygml_schema  (concepts + hierarchy)
+        .owl .rdf .rdfs .xml     load_ontology        (RDF/XML reader)
+        .ttl .n3 .nt .trig .jsonld
+                                 load_ontology        (rdflib, usap[ttl])
+        .json                    seed_vocabulary_file
+
+    Returns what each file contributed, keyed by its name — so a caller can
+    show "these concepts came from that file" rather than one opaque total.
+
+    Schemas are loaded before ontologies, and ontologies before JSON
+    vocabularies: CityGML's hierarchy has to exist before an ADE class can name
+    a CityGML parent. Within a group, files are sorted for a repeatable result.
+
+    All .xsd files are passed to load_citygml_schema as one directory, because
+    it resolves substitutionGroup across modules and would otherwise see each
+    module's parents as missing.
+
+    Seeding is idempotent and enriching, so calling this again on every package
+    open is the intended usage: it fills in what a package is missing and
+    raises only on a genuine contradiction.
+    """
+    folder = Path(path)
+
+    if not folder.exists():
+        raise FileNotFoundError(f"Vocabulary folder not found: {folder}")
+
+    if not folder.is_dir():
+        raise USAPError(
+            f"{folder} is not a directory. Load a single file with "
+            "load_citygml_schema / load_ontology / seed_vocabulary_file."
+        )
+
+    files = sorted(
+        item
+        for item in folder.rglob("*")
+        if item.is_file() and item.suffix.lower() in _VOCABULARY_SUFFIXES
+    )
+
+    if not files:
+        raise USAPError(
+            f"No vocabulary files found under {folder}. Expected one or more "
+            f"of: {', '.join(sorted(_VOCABULARY_SUFFIXES))}."
+        )
+
+    results: dict[str, VocabularyResult | OntologyResult] = {}
+
+    schemas = [item for item in files if item.suffix.lower() == ".xsd"]
+
+    if schemas:
+        # One call for the whole tree: see the docstring on cross-module
+        # substitutionGroup resolution.
+        results[str(folder)] = load_citygml_schema(
+            pkg,
+            folder,
+            scheme_version=scheme_version,
+        )
+
+    for item in files:
+        suffix = item.suffix.lower()
+
+        if suffix in _RDFXML_SUFFIXES or suffix in _RDFLIB_SUFFIXES:
+            results[item.name] = load_ontology(
+                pkg,
+                item,
+                scheme_version=scheme_version,
+            )
+
+    for item in files:
+        if item.suffix.lower() == ".json":
+            results[item.name] = seed_vocabulary_file(pkg, item)
+
+    return results

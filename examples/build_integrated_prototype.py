@@ -182,7 +182,6 @@ def main() -> None:
             annotation_uid=f"ann_energy_{city_object['object_uid']}",
             semantic_class_id=ade_classes.by_name["EnergyRoof"],
             primary_city_object_id=int(city_object["city_object_id"]),
-            label=f"Energy annotation for {city_object['object_uid']}",
             status="draft",
             confidence=None,
             attributes_json=json.dumps(energy_attributes),

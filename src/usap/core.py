@@ -13,11 +13,19 @@ Data model (each level references — never copies — the one above it)::
       asset_part     a stable region whose element indices are valid
                      (all LAS points; one mesh geometry)           → usap_asset_part
         elements     individual point / face indices inside a part
-          membership the exact indices an annotation covers, stored
+          membership the exact indices one assessment covers, stored
                      as roaring bitmap blocks                       → usap_membership_block
-            annotation  an editable claim: concept + status + attrs → usap_annotation
-              semantic_class  what kind of thing it is (RoofSurface) → usap_semantic_class
-              city_object     which object it is (building_1_roof_1) → usap_city_object
+            assessment  one dated evaluation, against one asset     → usap_assessment
+              annotation  an editable claim: concept + status + attrs → usap_annotation
+                semantic_class  what kind of thing it is (RoofSurface) → usap_semantic_class
+                city_object     which object it is (building_1_roof_1) → usap_city_object
+
+An annotation is the logical claim; an assessment is one evaluation of it at a
+date, against one asset. Re-surveying the same roof next year is a second
+assessment of the same annotation, not a second annotation — which is what keeps
+the concept and city-object link from being duplicated and drifting apart.
+Callers that never mention assessments get one implicitly (see
+_default_assessment_for) and behave exactly as they did before 0.4.0.
 
 "This class and its subclasses" is a single indexed lookup into a stored
 transitive closure, maintained as vocabularies are seeded:
@@ -51,7 +59,9 @@ Method map (matches the ``# ---`` section banners below):
     Opening / creating ......... create, open, close, context manager
     Small internal helpers ..... get_default_block_size, log_edit
     Assets ..................... register_asset, register_asset_part,
-                                  list_assets, list_asset_parts
+                                  update_asset, list_assets, list_asset_parts
+    Assessments ................ create/get/list/update/delete_assessment,
+                                  resolve_asset, resolve_assessment
     Semantic classes ........... create_semantic_class (+ closure maintenance)
     City objects and graph ..... create_city_object, link_city_objects,
                                   list_city_objects
@@ -873,6 +883,104 @@ class USAPPackage:
             )
 
         return asset_part_id
+
+    def update_asset(
+        self,
+        asset_id: int,
+        *,
+        uri: object = _UNSET,
+        content_hash: object = _UNSET,
+        srs_id: object = _UNSET,
+        media_type: object = _UNSET,
+        metadata_json: object = _UNSET,
+    ) -> dict[str, Any]:
+        """
+        Repair an asset record in place. Omitted fields are preserved.
+
+        register_asset is deliberately unforgiving — re-registering the same uri
+        with a different kind or count raises — but that left no way to fix a
+        record that has become *wrong about the same file*: the usual case is a
+        project moved on disk, so the stored uri no longer resolves and
+        verify_assets reports it missing.
+
+        This does not re-index anything: element counts, parts and memberships
+        are untouched, because the file is the same file. Changing content_hash
+        is how you record a re-hash after moving or re-exporting a byte-identical
+        asset; it is NOT a way to adopt a changed file, which would leave every
+        stored index pointing at different geometry. asset_kind cannot be changed
+        at all — a mesh does not become a point cloud.
+
+        Returns the updated row.
+        """
+        updates: list[str] = []
+        params: list[Any] = []
+
+        for column, value in (
+            ("uri", uri),
+            ("content_hash", content_hash),
+            ("srs_id", srs_id),
+            ("media_type", media_type),
+            ("metadata_json", metadata_json),
+        ):
+            if value is _UNSET:
+                continue
+
+            updates.append(f"{column} = ?")
+            params.append(value)
+
+        if not updates:
+            row = self.conn.execute(
+                """
+                SELECT asset_id, uri, asset_kind, media_type, content_hash,
+                       srs_id, metadata_json
+                FROM usap_asset
+                WHERE asset_id = ?
+                """,
+                (asset_id,),
+            ).fetchone()
+
+            if row is None:
+                raise USAPError(f"Asset not found: {asset_id}")
+
+            return dict(row)
+
+        params.append(asset_id)
+
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    f"""
+                    UPDATE usap_asset
+                    SET {", ".join(updates)}
+                    WHERE asset_id = ?
+                    """,
+                    params,
+                )
+            except sqlite3.IntegrityError as exc:
+                raise USAPError(
+                    f"Asset update violates a constraint: {exc}. An asset is "
+                    "unique on (uri, content_hash)."
+                ) from exc
+
+            if cur.rowcount != 1:
+                raise USAPError(f"Asset not found: {asset_id}")
+
+            self.log_edit(
+                "update_asset",
+                "usap_asset",
+                asset_id,
+                details_json=json.dumps(sorted(
+                    column for column, value in (
+                        ("uri", uri),
+                        ("content_hash", content_hash),
+                        ("srs_id", srs_id),
+                        ("media_type", media_type),
+                        ("metadata_json", metadata_json),
+                    ) if value is not _UNSET
+                )),
+            )
+
+        return self.update_asset(asset_id)
 
     def _refresh_asset_extent(self, asset_id: int) -> None:
         """
@@ -2032,10 +2140,11 @@ class USAPPackage:
                 a.primary_city_object_id,
                 co.object_uid AS primary_city_object_uid,
                 co.gml_id AS primary_city_object_gml_id,
-                a.label,
                 a.status,
                 a.confidence,
-                a.attributes_json
+                a.attributes_json,
+                a.created_at,
+                a.updated_at
             FROM usap_annotation AS a
             JOIN usap_semantic_class AS sc
                 ON sc.semantic_class_id = a.semantic_class_id
@@ -2065,6 +2174,8 @@ class USAPPackage:
         semantic_class_local_name: str | None = None,
         city_object_id: int | None = None,
         city_object_uid: str | None = None,
+        asset_id: int | None = None,
+        asset_part_id: int | None = None,
         include_membership_summary: bool = False,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -2077,11 +2188,44 @@ class USAPPackage:
         - annotation.primary_city_object_id
         - usap_annotation_object links
 
+        asset_id / asset_part_id keep only annotations with membership in that
+        asset (or one of its parts). This is how an application loads the
+        annotations belonging to the 3D asset it has just opened: without it the
+        only way to ask was to walk every annotation's membership.
+
         include_membership_summary=True also attaches value_field_summary
         (both are per-asset-part payload rollups).
         """
         where: list[str] = []
         params: list[Any] = []
+
+        if asset_id is not None:
+            where.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM usap_membership_block AS mb
+                    JOIN usap_asset_part AS ap
+                        ON ap.asset_part_id = mb.asset_part_id
+                    WHERE mb.annotation_id = a.annotation_id
+                      AND ap.asset_id = ?
+                )
+                """
+            )
+            params.append(asset_id)
+
+        if asset_part_id is not None:
+            where.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM usap_membership_block AS mb
+                    WHERE mb.annotation_id = a.annotation_id
+                      AND mb.asset_part_id = ?
+                )
+                """
+            )
+            params.append(asset_part_id)
 
         if status is not None:
             where.append("a.status = ?")
@@ -2157,10 +2301,11 @@ class USAPPackage:
                 a.primary_city_object_id,
                 primary_co.object_uid AS primary_city_object_uid,
                 primary_co.gml_id AS primary_city_object_gml_id,
-                a.label,
                 a.status,
                 a.confidence,
-                a.attributes_json
+                a.attributes_json,
+                a.created_at,
+                a.updated_at
             FROM usap_annotation AS a
             JOIN usap_semantic_class AS sc
                 ON sc.semantic_class_id = a.semantic_class_id
@@ -2189,7 +2334,6 @@ class USAPPackage:
         annotation_uid: object = _UNSET,
         semantic_class_id: object = _UNSET,
         primary_city_object_id: object = _UNSET,
-        label: object = _UNSET,
         status: object = _UNSET,
         confidence: object = _UNSET,
         attributes_json: object = _UNSET,
@@ -2227,7 +2371,6 @@ class USAPPackage:
         add_update("annotation_uid", annotation_uid)
         add_update("semantic_class_id", semantic_class_id)
         add_update("primary_city_object_id", primary_city_object_id)
-        add_update("label", label)
         add_update("status", status)
         add_update("confidence", confidence)
         add_update("attributes_json", attributes_json)
@@ -2375,6 +2518,7 @@ class USAPPackage:
 
     def _attach_annotation_summaries(self, item: dict[str, Any]) -> None:
         annotation_id = int(item["annotation_id"])
+        item["assessment_summary"] = self._assessment_summary(annotation_id)
         item["membership_summary"] = self._annotation_membership_summary(
             annotation_id
         )
@@ -2388,7 +2532,6 @@ class USAPPackage:
         annotation_uid: str,
         semantic_class_id: int,
         primary_city_object_id: int | None = None,
-        label: str | None = None,
         status: str = "accepted",
         confidence: float | None = None,
         attributes_json: str | None = None,
@@ -2429,18 +2572,16 @@ class USAPPackage:
                     annotation_uid,
                     semantic_class_id,
                     primary_city_object_id,
-                    label,
                     status,
                     confidence,
                     attributes_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     annotation_uid,
                     semantic_class_id,
                     primary_city_object_id,
-                    label,
                     status,
                     confidence,
                     attributes_json,
@@ -2473,6 +2614,676 @@ class USAPPackage:
                 "usap_annotation_object",
                 annotation_id,
             )
+
+    # ---------------------------------------------------------------------
+    # Assessments
+    # ---------------------------------------------------------------------
+    #
+    # An annotation is the logical claim; an assessment is one dated evaluation
+    # of it against one asset. Every membership and value block belongs to an
+    # assessment, so an annotation that has membership always has at least one.
+    #
+    # Callers that never mention assessments keep working: the write paths
+    # resolve one through _default_assessment_for, creating an undated
+    # assessment on first use. Assessments only become visible once a second
+    # one exists on the same asset, which is exactly when they are meaningful.
+
+    def resolve_asset(self, asset: int | str) -> int:
+        """
+        Resolve an asset reference to asset_id.
+
+        Accepted forms:
+        - asset_id as int
+        - uri as str
+
+        A uri is not unique on its own — usap_asset is keyed on
+        (uri, content_hash), so the same path registered at two versions is two
+        assets. That case raises rather than picking one: choosing silently is
+        how a claim ends up attached to the wrong version of a file.
+        """
+        if isinstance(asset, int):
+            row = self.conn.execute(
+                """
+                SELECT asset_id
+                FROM usap_asset
+                WHERE asset_id = ?
+                """,
+                (asset,),
+            ).fetchone()
+
+            if row is None:
+                raise USAPError(f"Asset not found: {asset}")
+
+            return int(row["asset_id"])
+
+        rows = self.conn.execute(
+            """
+            SELECT asset_id, uri, content_hash
+            FROM usap_asset
+            WHERE uri = ?
+            ORDER BY asset_id
+            """,
+            (asset,),
+        ).fetchall()
+
+        if not rows:
+            raise USAPError(f"Asset not found: {asset!r}")
+
+        if len(rows) > 1:
+            options = [
+                {
+                    "asset_id": int(row["asset_id"]),
+                    "uri": row["uri"],
+                    "content_hash": row["content_hash"],
+                }
+                for row in rows
+            ]
+
+            raise USAPAmbiguityError(
+                "Asset reference is ambiguous — the same uri is registered at "
+                f"several content hashes. Use asset_id. Reference: {asset!r}. "
+                f"Options: {options}"
+            )
+
+        return int(rows[0]["asset_id"])
+
+    def resolve_assessment(self, assessment: int | str) -> int:
+        """
+        Resolve an assessment reference (assessment_id or assessment_uid).
+        """
+        column = "assessment_id" if isinstance(assessment, int) else "assessment_uid"
+
+        row = self.conn.execute(
+            f"""
+            SELECT assessment_id
+            FROM usap_assessment
+            WHERE {column} = ?
+            """,
+            (assessment,),
+        ).fetchone()
+
+        if row is None:
+            raise USAPError(f"Assessment not found: {assessment!r}")
+
+        return int(row["assessment_id"])
+
+    def create_assessment(
+        self,
+        annotation_id: int,
+        asset: int | str,
+        *,
+        assessed_at: str | None = None,
+        assessment_uid: str | None = None,
+        status: str = "accepted",
+        confidence: float | None = None,
+        attributes: dict[str, Any] | None = None,
+        attributes_json: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Create (or reuse) one dated evaluation of an annotation on one asset.
+
+        Idempotent on (annotation_id, asset_id, assessed_at): re-running an
+        import does not fork a claim's history. Two evaluations of the same
+        asset on the same date are the same assessment; to record a genuinely
+        separate one, give it its own date.
+
+        assessed_at is free-form text, stored as given. USAP does not parse it:
+        the format is the caller's (US-ANN-08 only requires "a specific date"),
+        and rejecting an unfamiliar spelling would be worse than storing it.
+        Leaving it None means "undated", of which there can be at most one per
+        (annotation, asset) — see the partial unique index in the schema.
+        """
+        _check_annotation_fields(
+            status=status,
+            confidence=confidence,
+            attributes_json=attributes_json,
+        )
+
+        if attributes is not None and attributes_json is not None:
+            raise USAPError("Provide attributes or attributes_json, not both.")
+
+        if attributes is not None:
+            attributes_json = json.dumps(attributes)
+
+        asset_id = self.resolve_asset(asset)
+
+        existing = self.conn.execute(
+            """
+            SELECT assessment_id
+            FROM usap_assessment
+            WHERE annotation_id = ?
+              AND asset_id = ?
+              AND assessed_at IS ?
+            """,
+            (annotation_id, asset_id, assessed_at),
+        ).fetchone()
+
+        if existing is not None:
+            assessment = self.get_assessment(int(existing["assessment_id"]))
+
+            if assessment is None:  # pragma: no cover - just read above
+                raise USAPError("Assessment disappeared after lookup.")
+
+            return assessment
+
+        annotation = self.conn.execute(
+            """
+            SELECT annotation_id
+            FROM usap_annotation
+            WHERE annotation_id = ?
+            """,
+            (annotation_id,),
+        ).fetchone()
+
+        if annotation is None:
+            raise USAPError(f"Annotation not found: {annotation_id}")
+
+        with self.transaction():
+            cur = self.conn.execute(
+                """
+                INSERT INTO usap_assessment (
+                    assessment_uid,
+                    annotation_id,
+                    asset_id,
+                    assessed_at,
+                    status,
+                    confidence,
+                    attributes_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    assessment_uid or f"asm_{uuid.uuid4().hex}",
+                    annotation_id,
+                    asset_id,
+                    assessed_at,
+                    status,
+                    confidence,
+                    attributes_json,
+                ),
+            )
+            assessment_id = require_lastrowid(cur)
+            self.log_edit(
+                "create_assessment",
+                "usap_assessment",
+                assessment_id,
+            )
+
+        assessment = self.get_assessment(assessment_id)
+
+        if assessment is None:  # pragma: no cover - just inserted
+            raise USAPError(
+                f"Assessment disappeared after creation: {assessment_id}"
+            )
+
+        return assessment
+
+    def get_assessment(
+        self,
+        assessment_id: int | None = None,
+        *,
+        assessment_uid: str | None = None,
+        include_membership_summary: bool = True,
+    ) -> dict[str, Any] | None:
+        """
+        Read one assessment by id or uid. Returns None if not found.
+        """
+        if (assessment_id is None) == (assessment_uid is None):
+            raise USAPError(
+                "Provide exactly one of assessment_id or assessment_uid."
+            )
+
+        if assessment_uid is not None:
+            where_sql = "asm.assessment_uid = ?"
+            params: list[Any] = [assessment_uid]
+        else:
+            where_sql = "asm.assessment_id = ?"
+            params = [assessment_id]
+
+        row = self.conn.execute(
+            f"""
+            SELECT
+                asm.assessment_id,
+                asm.assessment_uid,
+                asm.annotation_id,
+                a.annotation_uid,
+                asm.asset_id,
+                asset.uri AS asset_uri,
+                asset.asset_kind,
+                asset.content_hash AS asset_content_hash,
+                asm.assessed_at,
+                asm.status,
+                asm.confidence,
+                asm.attributes_json,
+                asm.created_at,
+                asm.updated_at
+            FROM usap_assessment AS asm
+            JOIN usap_annotation AS a
+                ON a.annotation_id = asm.annotation_id
+            JOIN usap_asset AS asset
+                ON asset.asset_id = asm.asset_id
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        result = dict(row)
+
+        if include_membership_summary:
+            result["membership_summary"] = self._assessment_membership_summary(
+                int(result["assessment_id"])
+            )
+
+        return result
+
+    def list_assessments(
+        self,
+        *,
+        annotation_id: int | None = None,
+        asset_id: int | None = None,
+        include_membership_summary: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        List assessments, newest date last.
+
+        This is US-ANN-08's "view the list of all assessments associated with
+        the same annotation, distinguishing them at least by date and 3D
+        asset": both are columns here, and the membership summary says how much
+        of the asset each one covers.
+
+        Undated assessments sort first: they are the implicitly created ones,
+        which predate any deliberate dating of the claim.
+        """
+        where: list[str] = []
+        params: list[Any] = []
+
+        if annotation_id is not None:
+            where.append("asm.annotation_id = ?")
+            params.append(annotation_id)
+
+        if asset_id is not None:
+            where.append("asm.asset_id = ?")
+            params.append(asset_id)
+
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                asm.assessment_id,
+                asm.assessment_uid,
+                asm.annotation_id,
+                a.annotation_uid,
+                asm.asset_id,
+                asset.uri AS asset_uri,
+                asset.asset_kind,
+                asm.assessed_at,
+                asm.status,
+                asm.confidence,
+                asm.attributes_json,
+                asm.created_at,
+                asm.updated_at
+            FROM usap_assessment AS asm
+            JOIN usap_annotation AS a
+                ON a.annotation_id = asm.annotation_id
+            JOIN usap_asset AS asset
+                ON asset.asset_id = asm.asset_id
+            {where_sql}
+            ORDER BY
+                asm.annotation_id,
+                asm.assessed_at IS NOT NULL,
+                asm.assessed_at,
+                asm.assessment_id
+            """,
+            params,
+        ).fetchall()
+
+        result = [dict(row) for row in rows]
+
+        if include_membership_summary:
+            for item in result:
+                item["membership_summary"] = self._assessment_membership_summary(
+                    int(item["assessment_id"])
+                )
+
+        return result
+
+    def update_assessment(
+        self,
+        assessment_id: int,
+        *,
+        assessed_at: object = _UNSET,
+        status: object = _UNSET,
+        confidence: object = _UNSET,
+        attributes_json: object = _UNSET,
+    ) -> dict[str, Any]:
+        """
+        Update assessment metadata. Omitted fields are preserved; passing None
+        explicitly stores NULL.
+
+        The asset is deliberately not updatable: an assessment's membership is
+        indexed against that asset's parts, so re-pointing it would silently
+        make every stored index refer to different geometry. Record a new
+        assessment on the other asset instead.
+        """
+        _check_annotation_fields(
+            status=status,
+            confidence=confidence,
+            attributes_json=attributes_json,
+        )
+
+        updates: list[str] = []
+        params: list[Any] = []
+
+        for column, value in (
+            ("assessed_at", assessed_at),
+            ("status", status),
+            ("confidence", confidence),
+            ("attributes_json", attributes_json),
+        ):
+            if value is _UNSET:
+                continue
+
+            updates.append(f"{column} = ?")
+            params.append(value)
+
+        if not updates:
+            existing = self.get_assessment(assessment_id)
+
+            if existing is None:
+                raise USAPError(f"Assessment not found: {assessment_id}")
+
+            return existing
+
+        updates.append("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')")
+        params.append(assessment_id)
+
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    f"""
+                    UPDATE usap_assessment
+                    SET {", ".join(updates)}
+                    WHERE assessment_id = ?
+                    """,
+                    params,
+                )
+            except sqlite3.IntegrityError as exc:
+                raise USAPError(
+                    f"Assessment update violates a constraint: {exc}. An "
+                    "assessment is unique per (annotation, asset, date)."
+                ) from exc
+
+            if cur.rowcount != 1:
+                raise USAPError(f"Assessment not found: {assessment_id}")
+
+            self.log_edit(
+                "update_assessment",
+                "usap_assessment",
+                assessment_id,
+            )
+
+        updated = self.get_assessment(assessment_id)
+
+        if updated is None:  # pragma: no cover - just updated
+            raise USAPError(
+                f"Assessment disappeared after update: {assessment_id}"
+            )
+
+        return updated
+
+    def delete_assessment(
+        self,
+        assessment_id: int,
+        *,
+        missing_ok: bool = False,
+    ) -> bool:
+        """
+        Delete one assessment and its membership/value blocks (ON DELETE
+        CASCADE). The annotation and every other assessment of it survive.
+
+        Returns True if an assessment was deleted, False only when
+        missing_ok=True and it did not exist.
+        """
+        with self.transaction():
+            cur = self.conn.execute(
+                """
+                DELETE FROM usap_assessment
+                WHERE assessment_id = ?
+                """,
+                (assessment_id,),
+            )
+
+            if cur.rowcount == 0:
+                if missing_ok:
+                    return False
+
+                raise USAPError(f"Assessment not found: {assessment_id}")
+
+            self.log_edit(
+                "delete_assessment",
+                "usap_assessment",
+                assessment_id,
+            )
+
+        return True
+
+    def _assessment_membership_summary(
+        self,
+        assessment_id: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Which asset parts one assessment touches, and how much of each.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT
+                mb.asset_part_id,
+                ap.part_path,
+                ap.element_kind,
+                SUM(mb.element_count) AS selected_count,
+                COUNT(*) AS block_count
+            FROM usap_membership_block AS mb
+            JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = mb.asset_part_id
+            WHERE mb.assessment_id = ?
+            GROUP BY mb.asset_part_id, ap.part_path, ap.element_kind
+            ORDER BY mb.asset_part_id
+            """,
+            (assessment_id,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def _assessment_summary(self, annotation_id: int) -> list[dict[str, Any]]:
+        """
+        One compact row per assessment of an annotation, for get_annotation.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT
+                asm.assessment_id,
+                asm.assessment_uid,
+                asm.asset_id,
+                asset.uri AS asset_uri,
+                asm.assessed_at,
+                asm.status,
+                CAST(COALESCE((
+                    SELECT SUM(mb.element_count)
+                    FROM usap_membership_block AS mb
+                    WHERE mb.assessment_id = asm.assessment_id
+                ), 0) AS INTEGER) AS selected_count
+            FROM usap_assessment AS asm
+            JOIN usap_asset AS asset
+                ON asset.asset_id = asm.asset_id
+            WHERE asm.annotation_id = ?
+            ORDER BY
+                asm.assessed_at IS NOT NULL,
+                asm.assessed_at,
+                asm.assessment_id
+            """,
+            (annotation_id,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def _default_assessment_for(
+        self,
+        annotation_id: int,
+        asset_part_id: int,
+    ) -> int:
+        """
+        The assessment a write means when the caller named none.
+
+        Resolves the part's asset, then: exactly one assessment of this
+        annotation on that asset is the answer; none means create an undated
+        one; several is ambiguous and raises, because picking the newest (or
+        the oldest) would silently rewrite a historical evaluation.
+
+        This is what keeps every pre-assessment call site working unchanged.
+        """
+        asset_row = self.conn.execute(
+            """
+            SELECT asset_id
+            FROM usap_asset_part
+            WHERE asset_part_id = ?
+            """,
+            (asset_part_id,),
+        ).fetchone()
+
+        if asset_row is None:
+            raise USAPError(f"Unknown asset_part_id: {asset_part_id}")
+
+        asset_id = int(asset_row["asset_id"])
+
+        rows = self.conn.execute(
+            """
+            SELECT assessment_id, assessment_uid, assessed_at
+            FROM usap_assessment
+            WHERE annotation_id = ?
+              AND asset_id = ?
+            ORDER BY assessment_id
+            """,
+            (annotation_id, asset_id),
+        ).fetchall()
+
+        if len(rows) == 1:
+            return int(rows[0]["assessment_id"])
+
+        if not rows:
+            created = self.create_assessment(annotation_id, asset_id)
+
+            return int(created["assessment_id"])
+
+        options = [
+            {
+                "assessment_id": int(row["assessment_id"]),
+                "assessment_uid": row["assessment_uid"],
+                "assessed_at": row["assessed_at"],
+            }
+            for row in rows
+        ]
+
+        raise USAPAmbiguityError(
+            f"Annotation {annotation_id} has {len(rows)} assessments on this "
+            "asset, so the target of this write is ambiguous. Pass "
+            f"assessment=... to say which. Options: {options}"
+        )
+
+    def _assessment_for_new_claim(
+        self,
+        *,
+        annotation_id: int,
+        asset_part_id: int,
+        assessed_at: str | None,
+    ) -> int | None:
+        """
+        Turn an `assessed_at` on a create-and-attach call into an assessment.
+
+        None means "let the write path pick the default", which is the
+        single-evaluation case and stays exactly as it was before assessments
+        existed. A date creates (or reuses) that dated evaluation here, so the
+        caller does not have to create an assessment first just to name it.
+        """
+        if assessed_at is None:
+            return None
+
+        asset_row = self.conn.execute(
+            """
+            SELECT asset_id
+            FROM usap_asset_part
+            WHERE asset_part_id = ?
+            """,
+            (asset_part_id,),
+        ).fetchone()
+
+        if asset_row is None:
+            raise USAPError(f"Unknown asset_part_id: {asset_part_id}")
+
+        assessment = self.create_assessment(
+            annotation_id,
+            int(asset_row["asset_id"]),
+            assessed_at=assessed_at,
+        )
+
+        return int(assessment["assessment_id"])
+
+    def _resolve_write_assessment(
+        self,
+        *,
+        annotation_id: int,
+        asset_part_id: int,
+        assessment: int | str | None,
+    ) -> int:
+        """
+        Resolve an explicit assessment for a write, or fall back to the
+        default, checking that it belongs to this annotation and to the asset
+        the part lives in.
+
+        Checked here rather than only in validate_report(): a block written
+        under another annotation's assessment is not a report-later problem,
+        it is a claim attributed to the wrong annotation.
+        """
+        if assessment is None:
+            return self._default_assessment_for(annotation_id, asset_part_id)
+
+        assessment_id = self.resolve_assessment(assessment)
+
+        row = self.conn.execute(
+            """
+            SELECT
+                asm.annotation_id,
+                asm.asset_id,
+                ap.asset_id AS part_asset_id
+            FROM usap_assessment AS asm
+            CROSS JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = ?
+            WHERE asm.assessment_id = ?
+            """,
+            (asset_part_id, assessment_id),
+        ).fetchone()
+
+        if row is None:
+            raise USAPError(f"Unknown asset_part_id: {asset_part_id}")
+
+        if int(row["annotation_id"]) != annotation_id:
+            raise USAPError(
+                f"Assessment {assessment!r} belongs to annotation "
+                f"{int(row['annotation_id'])}, not {annotation_id}."
+            )
+
+        if int(row["asset_id"]) != int(row["part_asset_id"]):
+            raise USAPError(
+                f"Assessment {assessment!r} evaluates asset "
+                f"{int(row['asset_id'])}, but asset part {asset_part_id} "
+                f"belongs to asset {int(row['part_asset_id'])}. An "
+                "assessment's membership must stay within its own asset."
+            )
+
+        return assessment_id
 
     # ---------------------------------------------------------------------
     # Membership editing
@@ -2531,11 +3342,19 @@ class USAPPackage:
         element_kind: int,
         element_indices: IndexArray,
         encoding: str = DEFAULT_ENCODING,
+        *,
+        assessment: int | str | None = None,
     ) -> None:
         """
-        Replace all membership blocks for one annotation in one asset part.
+        Replace all membership blocks for one assessment in one asset part.
 
         This is an edit operation, so we validate first and write in a transaction.
+
+        `assessment` names which evaluation of the annotation is being edited.
+        Omitting it means the annotation's only assessment on this part's asset,
+        created (undated) if there is none — so a caller that never heard of
+        assessments keeps the pre-0.4.0 behaviour. It raises rather than guessing
+        once a second assessment exists on that asset.
 
         Blocks are always sized at the package default
         (usap_profile.default_block_size). The reverse query
@@ -2568,15 +3387,23 @@ class USAPPackage:
         blocks = split_indices_into_blocks(unique_indices, block_size)
 
         with self.transaction():
+            # Inside the transaction: resolving may *create* the default
+            # assessment, which must roll back with the blocks it was made for.
+            assessment_id = self._resolve_write_assessment(
+                annotation_id=annotation_id,
+                asset_part_id=asset_part_id,
+                assessment=assessment,
+            )
+
             self.conn.execute(
                 """
                 DELETE FROM usap_membership_block
-                WHERE annotation_id = ?
+                WHERE assessment_id = ?
                 AND asset_part_id = ?
                 AND element_kind = ?
                 """,
                 (
-                    annotation_id,
+                    assessment_id,
                     asset_part_id,
                     element_kind,
                 ),
@@ -2593,6 +3420,7 @@ class USAPPackage:
                 self.conn.execute(
                     """
                     INSERT INTO usap_membership_block (
+                        assessment_id,
                         annotation_id,
                         asset_part_id,
                         element_kind,
@@ -2604,9 +3432,10 @@ class USAPPackage:
                         max_element_index,
                         payload
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        assessment_id,
                         annotation_id,
                         asset_part_id,
                         element_kind,
@@ -2624,7 +3453,8 @@ class USAPPackage:
                 "replace_annotation_membership",
                 "usap_annotation",
                 annotation_id,
-                f'{{"asset_part_id": {asset_part_id}, '
+                f'{{"assessment_id": {assessment_id}, '
+                f'"asset_part_id": {asset_part_id}, '
                 f'"element_kind": {element_kind}, '
                 f'"element_count": {len(unique_indices)}}}',
             )
@@ -2709,6 +3539,7 @@ class USAPPackage:
         item = {
             "membership_block_id": int(row["membership_block_id"]),
             "annotation_id": int(row["annotation_id"]),
+            "assessment_id": int(row["assessment_id"]),
             "asset_part_id": int(row["asset_part_id"]),
             "element_kind": int(row["element_kind"]),
             "block_start": int(row["block_start"]),
@@ -2735,11 +3566,22 @@ class USAPPackage:
         asset_part_id: int,
         element_kind: int,
         selected_indices: list[int],
+        *,
+        assessment: int | str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Core reverse query:
 
             selected faces/points -> annotations
+
+        One entry per (annotation, assessment): an annotation evaluated twice on
+        this asset answers twice, each tagged with assessment_id and
+        assessed_at, because the two cover different elements and collapsing
+        them would report an extent no single evaluation ever claimed. While an
+        annotation has one assessment — the default — this is one entry per
+        annotation, as before.
+
+        Pass `assessment` to restrict the search to a single evaluation.
 
         Optimized version:
         - groups selected indices by block_start
@@ -2747,6 +3589,9 @@ class USAPPackage:
         - decodes only candidate membership blocks
         """
         element_kind = normalize_element_kind(element_kind)
+        assessment_id = (
+            None if assessment is None else self.resolve_assessment(assessment)
+        )
 
         selected = as_index_array(selected_indices)
 
@@ -2775,6 +3620,13 @@ class USAPPackage:
         # exactly once and the merge below is unaffected.
         rows: list[sqlite3.Row] = []
 
+        assessment_clause = ""
+        assessment_params: tuple[Any, ...] = ()
+
+        if assessment_id is not None:
+            assessment_clause = "AND mb.assessment_id = ?"
+            assessment_params = (assessment_id,)
+
         for chunk_index in range(0, len(block_starts), _MAX_SQL_IN_VARS):
             chunk = block_starts[chunk_index : chunk_index + _MAX_SQL_IN_VARS]
             placeholders = ",".join("?" for _ in chunk)
@@ -2784,12 +3636,15 @@ class USAPPackage:
                     f"""
                     SELECT
                         mb.annotation_id,
+                        mb.assessment_id,
                         mb.block_start,
                         mb.payload,
 
                         a.annotation_uid,
-                        a.label,
                         a.status,
+
+                        asm.assessment_uid,
+                        asm.assessed_at,
 
                         sc.local_name AS semantic_class,
                         sc.class_uri AS semantic_class_uri,
@@ -2798,6 +3653,8 @@ class USAPPackage:
                     FROM usap_membership_block AS mb
                     JOIN usap_annotation AS a
                         ON a.annotation_id = mb.annotation_id
+                    JOIN usap_assessment AS asm
+                        ON asm.assessment_id = mb.assessment_id
                     JOIN usap_semantic_class AS sc
                         ON sc.semantic_class_id = a.semantic_class_id
                     LEFT JOIN usap_city_object AS co
@@ -2805,6 +3662,7 @@ class USAPPackage:
                     WHERE mb.asset_part_id = ?
                     AND mb.element_kind = ?
                     AND mb.block_start IN ({placeholders})
+                    {assessment_clause}
                     ORDER BY
                         mb.block_start,
                         mb.annotation_id
@@ -2813,11 +3671,14 @@ class USAPPackage:
                         asset_part_id,
                         element_kind,
                         *chunk,
+                        *assessment_params,
                     ),
                 ).fetchall()
             )
 
-        matches_by_annotation: dict[int, dict[str, Any]] = {}
+        # Keyed on (annotation, assessment): one annotation evaluated twice on
+        # this asset is two answers, not one merged extent.
+        matches: dict[tuple[int, int], dict[str, Any]] = {}
 
         for row in rows:
             block_start = int(row["block_start"])
@@ -2832,13 +3693,15 @@ class USAPPackage:
 
             hit_offsets = roaring_to_array(hit)
 
-            annotation_id = int(row["annotation_id"])
+            key = (int(row["annotation_id"]), int(row["assessment_id"]))
 
-            if annotation_id not in matches_by_annotation:
-                matches_by_annotation[annotation_id] = {
-                    "annotation_id": annotation_id,
+            if key not in matches:
+                matches[key] = {
+                    "annotation_id": key[0],
                     "annotation_uid": row["annotation_uid"],
-                    "label": row["label"],
+                    "assessment_id": key[1],
+                    "assessment_uid": row["assessment_uid"],
+                    "assessed_at": row["assessed_at"],
                     "status": row["status"],
                     "semantic_class": row["semantic_class"],
                     "semantic_class_uri": row["semantic_class_uri"],
@@ -2846,11 +3709,11 @@ class USAPPackage:
                     "matched_elements": [],
                 }
 
-            matches_by_annotation[annotation_id]["matched_elements"].extend(
+            matches[key]["matched_elements"].extend(
                 (hit_offsets.astype(np.int64) + block_start).tolist()
             )
 
-        results = list(matches_by_annotation.values())
+        results = list(matches.values())
 
         for result in results:
             result["matched_elements"] = sorted(set(result["matched_elements"]))
@@ -2861,6 +3724,9 @@ class USAPPackage:
         self,
         annotation_id: int,
         expand: bool = True,
+        *,
+        assessment: int | str | None = None,
+        asset_part_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """
         Forward query:
@@ -2869,12 +3735,34 @@ class USAPPackage:
 
         With expand=False, this returns compact block metadata.
         With expand=True, this returns actual element indices.
+
+        Every block carries its assessment_id. By default blocks from *all* of
+        the annotation's assessments are returned, so nothing is hidden from a
+        caller who does not know about them; pass `assessment` to get one
+        evaluation alone, which is what US-ANN-08's "highlight only the elements
+        of that assessment" needs.
+
+        `asset_part_id` narrows to one index space — the app editing a
+        membership only ever holds one part's indices, and filtering here saves
+        it decoding the rest.
         """
+        where = ["annotation_id = ?"]
+        params: list[Any] = [annotation_id]
+
+        if assessment is not None:
+            where.append("assessment_id = ?")
+            params.append(self.resolve_assessment(assessment))
+
+        if asset_part_id is not None:
+            where.append("asset_part_id = ?")
+            params.append(asset_part_id)
+
         rows = self.conn.execute(
-            """
+            f"""
             SELECT
                 membership_block_id,
                 annotation_id,
+                assessment_id,
                 asset_part_id,
                 element_kind,
                 block_start,
@@ -2885,10 +3773,10 @@ class USAPPackage:
                 max_element_index,
                 payload
             FROM usap_membership_block
-            WHERE annotation_id = ?
-            ORDER BY asset_part_id, element_kind, block_start
+            WHERE {" AND ".join(where)}
+            ORDER BY assessment_id, asset_part_id, element_kind, block_start
             """,
-            (annotation_id,),
+            params,
         ).fetchall()
 
         return [
@@ -2925,6 +3813,7 @@ class USAPPackage:
             SELECT
                 mb.membership_block_id,
                 mb.annotation_id,
+                mb.assessment_id,
                 mb.asset_part_id,
                 mb.element_kind,
                 mb.block_start,
@@ -3044,6 +3933,7 @@ class USAPPackage:
             SELECT
                 mb.membership_block_id,
                 mb.annotation_id,
+                mb.assessment_id,
                 mb.asset_part_id,
                 mb.element_kind,
                 mb.block_start,
@@ -3076,6 +3966,36 @@ class USAPPackage:
             for row in rows
         ]
 
+    def elements_for_city_objects(
+        self,
+        object_uids: Sequence[str],
+        *,
+        expand: bool = False,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """
+        elements_for_city_object over a set of objects, de-duplicated.
+
+        For the common integration where the CityGML hierarchy lives outside
+        USAP: the application walks its own object tree, then asks for the whole
+        subtree's elements in one call instead of one call per uid. Keyword
+        arguments are passed through unchanged.
+
+        Blocks are keyed by membership_block_id, so an annotation reached
+        through two of the given objects is returned once.
+        """
+        blocks: dict[int, dict[str, Any]] = {}
+
+        for object_uid in object_uids:
+            for block in self.elements_for_city_object(
+                object_uid,
+                expand=expand,
+                **kwargs,
+            ):
+                blocks[int(block["membership_block_id"])] = block
+
+        return [blocks[key] for key in sorted(blocks)]
+
     # ---------------------------------------------------------------------
     # Value fields (dense per-element scalar fields)
     # ---------------------------------------------------------------------
@@ -3098,13 +4018,19 @@ class USAPPackage:
         element_kind: int | str,
         values: Any,
         value_dtype: str | None = None,
+        *,
+        assessment: int | str | None = None,
     ) -> None:
         """
-        Replace the whole value field for one annotation on one asset part.
+        Replace the whole value field for one assessment on one asset part.
 
         Editing is whole-field rewrite by design (write-once, read-many).
         Dtype resolution: explicit value_dtype > the ndarray's own dtype when
         it is in VALUE_DTYPES > 'f4'.
+
+        `assessment` behaves exactly as in replace_annotation_membership: a
+        field measured again at a later date is that date's assessment, not a
+        rewrite of the earlier measurement.
         """
         element_kind = normalize_element_kind(element_kind)
 
@@ -3180,14 +4106,20 @@ class USAPPackage:
         typed = np.ascontiguousarray(array, dtype=target_dtype)
 
         with self.transaction():
+            assessment_id = self._resolve_write_assessment(
+                annotation_id=annotation_id,
+                asset_part_id=asset_part_id,
+                assessment=assessment,
+            )
+
             self.conn.execute(
                 """
                 DELETE FROM usap_value_block
-                WHERE annotation_id = ?
+                WHERE assessment_id = ?
                 AND asset_part_id = ?
                 AND element_kind = ?
                 """,
-                (annotation_id, asset_part_id, element_kind),
+                (assessment_id, asset_part_id, element_kind),
             )
 
             for block_start in range(0, len(typed), VALUE_CHUNK_SIZE):
@@ -3204,6 +4136,7 @@ class USAPPackage:
                 self.conn.execute(
                     """
                     INSERT INTO usap_value_block (
+                        assessment_id,
                         annotation_id,
                         asset_part_id,
                         element_kind,
@@ -3215,9 +4148,10 @@ class USAPPackage:
                         value_max,
                         payload
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        assessment_id,
                         annotation_id,
                         asset_part_id,
                         element_kind,
@@ -3250,12 +4184,12 @@ class USAPPackage:
         values: Any,
         value_dtype: str | None = None,
         annotation_uid: str | None = None,
-        label: str | None = None,
         status: str = "draft",
         confidence: float | None = None,
         attributes: dict[str, Any] | None = None,
         attributes_json: str | None = None,
         scheme: str | None = None,
+        assessed_at: str | None = None,
     ) -> dict[str, Any]:
         """
         Create an annotation for a concept and attach a per-element value
@@ -3267,6 +4201,10 @@ class USAPPackage:
         vocabulary — any scheme). Field metadata (unit, validAt, method, ...)
         belongs in `attributes`. There are deliberately no city-object
         parameters: a value field is a property of the geometry asset.
+
+        `assessed_at` dates the measurement. Omitting it stores the field in the
+        annotation's undated assessment, which is what a single-measurement
+        workflow wants.
         """
         element_kind = normalize_element_kind(element_kind)
 
@@ -3274,7 +4212,6 @@ class USAPPackage:
             annotation = self.create_concept_annotation(
                 concept=concept,
                 annotation_uid=annotation_uid,
-                label=label,
                 status=status,
                 confidence=confidence,
                 attributes=attributes,
@@ -3290,6 +4227,11 @@ class USAPPackage:
                 element_kind=element_kind,
                 values=values,
                 value_dtype=value_dtype,
+                assessment=self._assessment_for_new_claim(
+                    annotation_id=annotation_id,
+                    asset_part_id=asset_part_id,
+                    assessed_at=assessed_at,
+                ),
             )
 
         result = self.get_annotation(
@@ -3310,15 +4252,24 @@ class USAPPackage:
         annotation_id: int,
         asset_part_id: int | None,
         element_kind: int | None,
+        assessment: int | str | None = None,
     ) -> list[sqlite3.Row]:
         """
         Fetch one annotation's value blocks (optionally filtered) and check
-        that they belong to exactly one (asset part, element kind) pair,
-        share one dtype, and tile the whole asset part (v1 full coverage) —
-        so every reader enforces the same contract.
+        that they belong to exactly one (assessment, asset part, element kind)
+        triple, share one dtype, and tile the whole asset part (v1 full
+        coverage) — so every reader enforces the same contract.
+
+        The assessment has to be part of that identity: the same field measured
+        at two dates is two complete fields over the same part, which without
+        this check would look like one field covering it twice.
         """
         where = ["vb.annotation_id = ?"]
         params: list[Any] = [annotation_id]
+
+        if assessment is not None:
+            where.append("vb.assessment_id = ?")
+            params.append(self.resolve_assessment(assessment))
 
         if asset_part_id is not None:
             where.append("vb.asset_part_id = ?")
@@ -3332,6 +4283,7 @@ class USAPPackage:
             f"""
             SELECT
                 vb.value_block_id,
+                vb.assessment_id,
                 vb.asset_part_id,
                 vb.element_kind,
                 vb.block_start,
@@ -3345,7 +4297,11 @@ class USAPPackage:
             JOIN usap_asset_part AS ap
                 ON ap.asset_part_id = vb.asset_part_id
             WHERE {" AND ".join(where)}
-            ORDER BY vb.asset_part_id, vb.element_kind, vb.block_start
+            ORDER BY
+                vb.assessment_id,
+                vb.asset_part_id,
+                vb.element_kind,
+                vb.block_start
             """,
             params,
         ).fetchall()
@@ -3353,6 +4309,15 @@ class USAPPackage:
         if not rows:
             raise USAPError(
                 f"No value field found for annotation {annotation_id}."
+            )
+
+        assessments = {int(r["assessment_id"]) for r in rows}
+
+        if len(assessments) > 1:
+            raise USAPError(
+                f"Annotation {annotation_id} has value fields in several "
+                f"assessments: {sorted(assessments)}. Pass assessment=... to "
+                "say which evaluation to read."
             )
 
         targets = {(int(r["asset_part_id"]), int(r["element_kind"])) for r in rows}
@@ -3400,18 +4365,23 @@ class USAPPackage:
         *,
         asset_part_id: int | None = None,
         element_kind: int | str | None = None,
+        assessment: int | str | None = None,
     ) -> np.ndarray:
         """
         Forward query: annotation -> its dense value array.
 
         Element i's value is result[i]; the array always spans the whole
         asset part (v1 contract), with NaN marking "no value" in float fields.
+
+        `assessment` picks one evaluation when the annotation has been measured
+        more than once; without it, several measurements are an error rather
+        than an arbitrary choice.
         """
         if element_kind is not None:
             element_kind = normalize_element_kind(element_kind)
 
         rows = self._value_blocks_for_annotation(
-            annotation_id, asset_part_id, element_kind
+            annotation_id, asset_part_id, element_kind, assessment
         )
 
         value_dtype = rows[0]["value_dtype"]
@@ -3432,6 +4402,7 @@ class USAPPackage:
         predicate: tuple[str, float] | Any,
         *,
         asset_part_id: int | None = None,
+        assessment: int | str | None = None,
     ) -> list[int]:
         """
         Value query: element indices where the field satisfies a predicate.
@@ -3464,7 +4435,7 @@ class USAPPackage:
             )
 
         rows = self._value_blocks_for_annotation(
-            annotation_id, asset_part_id, None
+            annotation_id, asset_part_id, None, assessment
         )
 
         value_dtype = rows[0]["value_dtype"]
@@ -3518,6 +4489,7 @@ class USAPPackage:
         annotation_id: int,
         *,
         asset_part_id: int | None = None,
+        assessment: int | str | None = None,
     ) -> dict[str, Any]:
         """
         Field stats from the stored per-block min/max — no payload decode.
@@ -3528,6 +4500,10 @@ class USAPPackage:
         where = ["vb.annotation_id = ?"]
         params: list[Any] = [annotation_id]
 
+        if assessment is not None:
+            where.append("vb.assessment_id = ?")
+            params.append(self.resolve_assessment(assessment))
+
         if asset_part_id is not None:
             where.append("vb.asset_part_id = ?")
             params.append(asset_part_id)
@@ -3535,6 +4511,7 @@ class USAPPackage:
         rows = self.conn.execute(
             f"""
             SELECT
+                vb.assessment_id,
                 vb.asset_part_id,
                 vb.element_kind,
                 vb.value_dtype,
@@ -3548,7 +4525,11 @@ class USAPPackage:
             JOIN usap_asset_part AS ap
                 ON ap.asset_part_id = vb.asset_part_id
             WHERE {" AND ".join(where)}
-            GROUP BY vb.asset_part_id, vb.element_kind, vb.value_dtype
+            GROUP BY
+                vb.assessment_id,
+                vb.asset_part_id,
+                vb.element_kind,
+                vb.value_dtype
             """,
             params,
         ).fetchall()
@@ -3559,6 +4540,15 @@ class USAPPackage:
             )
 
         if len(rows) > 1:
+            assessments = {int(r["assessment_id"]) for r in rows}
+
+            if len(assessments) > 1:
+                raise USAPError(
+                    f"Annotation {annotation_id} has value fields in several "
+                    f"assessments: {sorted(assessments)}. Pass assessment=... "
+                    "to say which evaluation to read."
+                )
+
             targets = {
                 (int(r["asset_part_id"]), int(r["element_kind"])) for r in rows
             }
@@ -3592,6 +4582,7 @@ class USAPPackage:
 
         return {
             "annotation_id": annotation_id,
+            "assessment_id": int(row["assessment_id"]),
             "asset_part_id": int(row["asset_part_id"]),
             "element_kind": int(row["element_kind"]),
             "value_dtype": row["value_dtype"],
@@ -4048,7 +5039,6 @@ class USAPPackage:
         annotation_uid: str | None = None,
         city_object_id: int | None = None,
         city_object_uid: str | None = None,
-        label: str | None = None,
         status: str = "draft",
         confidence: float | None = None,
         attributes: dict[str, Any] | None = None,
@@ -4097,7 +5087,6 @@ class USAPPackage:
             annotation_uid=annotation_uid,
             semantic_class_id=semantic_class_id,
             primary_city_object_id=resolved_city_object_id,
-            label=label,
             status=status,
             confidence=confidence,
             attributes_json=stored_attributes_json,
@@ -4125,12 +5114,12 @@ class USAPPackage:
         annotation_uid: str | None = None,
         city_object_id: int | None = None,
         city_object_uid: str | None = None,
-        label: str | None = None,
         status: str = "draft",
         confidence: float | None = None,
         attributes: dict[str, Any] | None = None,
         attributes_json: str | None = None,
         scheme: str | None = None,
+        assessed_at: str | None = None,
     ) -> dict[str, Any]:
         """
         Create an annotation for a concept and immediately attach selected elements.
@@ -4140,6 +5129,12 @@ class USAPPackage:
             annotate this asset part, these element indices, as this concept.
 
         The concept can be CityGML, ADE, or any registered semantic class.
+
+        `assessed_at` dates this evaluation. Omitting it puts the selection in
+        the annotation's undated assessment — the ordinary single-pass case. To
+        record a *re-assessment* of an existing annotation, do not call this
+        again (it would mint a second annotation): create_assessment on the
+        existing annotation, then attach_annotation_elements to it.
         """
         element_kind = normalize_element_kind(element_kind)
         with self.transaction():
@@ -4148,7 +5143,6 @@ class USAPPackage:
                 annotation_uid=annotation_uid,
                 city_object_id=city_object_id,
                 city_object_uid=city_object_uid,
-                label=label,
                 status=status,
                 confidence=confidence,
                 attributes=attributes,
@@ -4163,6 +5157,11 @@ class USAPPackage:
                 asset_part_id=asset_part_id,
                 element_kind=element_kind,
                 element_indices=element_indices,
+                assessment=self._assessment_for_new_claim(
+                    annotation_id=annotation_id,
+                    asset_part_id=asset_part_id,
+                    assessed_at=assessed_at,
+                ),
             )
 
         result = self.get_annotation(
@@ -4185,18 +5184,24 @@ class USAPPackage:
         asset_part_id: int,
         element_kind: str,
         element_indices: list[int],
+        assessment: int | str | None = None,
     ) -> dict[str, Any]:
         """
-        Attach or replace selected elements for one annotation on one asset part.
+        Attach or replace selected elements for one assessment on one asset part.
 
         This is a clearer prototype name for replace_annotation_membership.
-        It preserves memberships on other asset parts.
+        It preserves memberships on other asset parts, and on the annotation's
+        other assessments.
+
+        Pass `assessment` (from create_assessment or list_assessments) to attach
+        a re-assessment's geometry; omit it for the single-evaluation case.
         """
         self.replace_annotation_membership(
             annotation_id=annotation_id,
             asset_part_id=asset_part_id,
             element_kind=element_kind,
             element_indices=element_indices,
+            assessment=assessment,
         )
 
         annotation = self.get_annotation(

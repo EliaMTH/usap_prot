@@ -1,6 +1,6 @@
 """
 End-to-end tests for the three ingestion procedures of INGESTION.md
-(designed in DATA_INGESTION_REVAMP.md):
+(documented in docs/INGESTION.md):
 
   1. init from 3D assets + CityGML + a linking JSON keyed by gml ids
   2. init from 3D assets + a minimal vocabulary + a minimal linking JSON

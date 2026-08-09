@@ -1,6 +1,12 @@
-# Storage vs. query: which USAP tables are actually necessary?
+# Ablation study — are USAP's query tables necessary?
 
-This document records a design investigation (2026-07) into three questions:
+**What this is:** an empirical ablation (2026-07). Each "accelerator" table is
+removed in turn, the same queries are re-run against the base tables alone, and
+the cost is measured. It is a record of an experiment and its verdicts, not a
+description of the current schema — for that see
+[SCHEMA_WIRING.md](SCHEMA_WIRING.md).
+
+It sets out to answer three questions:
 
 1. If USAP only had to **store** annotations efficiently (no query layer),
    which tables are the irreducible minimum — and is there still novelty in

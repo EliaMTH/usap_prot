@@ -142,8 +142,12 @@ What is already in place are the parts that could not be added afterwards withou
 
 Explore USAP in more detail with:
 
-- [INGESTION.md](docs/INGESTION.md) — the three supported creation and editing procedures;
-- [REFERENCE.md](docs/REFERENCE.md) — the full manual, including concepts, configuration keys, batch format, and Python API;
-- [TESTS.md](docs/TESTS.md) — the test suite.
+- [API.md](docs/API.md) — every public call in one place, one line each. Start here to see what the SDK offers;
+- [REFERENCE.md](docs/REFERENCE.md) — the full manual: the data model, integrating USAP into an application, concept registries, config keys, batch format, validation;
+- [INGESTION.md](docs/INGESTION.md) — the three supported creation and editing procedures, end to end;
+- [SCHEMA_WIRING.md](docs/SCHEMA_WIRING.md) — how the tables, views and indexes connect;
+- [TESTS.md](docs/TESTS.md) — what the test suite covers and why.
 
-The rest of the documentation lives in [docs/](docs/).
+Two documents record decisions rather than describe the current state:
+[ACCELERATOR_ABLATION.md](docs/ACCELERATOR_ABLATION.md) (are the query tables
+worth their cost) and [VALUE_FIELDS_DESIGN.md](docs/VALUE_FIELDS_DESIGN.md).

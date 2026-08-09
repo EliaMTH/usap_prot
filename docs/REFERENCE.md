@@ -64,7 +64,7 @@ usap_prot/
   pyproject.toml
   README.md            motivation and mental model
   US.md                the user stories this prototype is built against
-  docs/                INTEGRATION.md, REFERENCE.md, INGESTION.md, TESTS.md,
+  docs/                API.md, REFERENCE.md, INGESTION.md, TESTS.md,
                        SCHEMA_WIRING.md, and the design records
 
   src/usap/             the Python SDK: core, validation, geopackage,
@@ -335,6 +335,75 @@ values float32 [0.0, 0.73, 0.5, ...]   one per face
 
 ---
 
+## Integrating USAP into an application
+
+USAP is a Python library, not a service or a viewer. An application drives the
+`USAPPackage` object for interactive edits, or `build_project_package_from_file`
+for bulk import. What follows is the set of things that are cheap to get right at
+the start and expensive to discover later.
+
+**USAP stores no source geometry.** A viewer or processing pipeline stays
+responsible for meshes and point clouds. USAP identifies annotated elements by
+their stable integer index within an asset part, so the application maps a
+viewer pick to `(asset_part_id, element_index)` and keeps the registered source
+version immutable.
+
+**Register assets from the code that loads them for display.** This is the one
+integration mistake nothing can detect afterwards. The application owns the
+loader, so it produces the indices USAP stores; if that loader triangulates
+quads, dedupes vertices, or orders faces differently from whatever counted the
+elements at registration, every membership silently points at the wrong geometry
+and no validation level will notice. Registering through the generic
+`register_asset` + `register_asset_part` path *from the same code that builds the
+render buffers* makes count and order agree by construction — and sidesteps the
+mesh adapter's `.glb`/`.gltf` refusal, since the adapter is then not involved.
+Record the convention in `indexing_profile`; `validate_report()` warns
+`ASSET_PART_NO_INDEXING_PROFILE` when an annotated part declares none.
+
+**City objects need not come from CityGML.** When the semantic source belongs to
+another system, create carriers on demand —
+`create_city_object(object_uid=gml_id, object_status="temporary")` — and skip
+`import_citygml_semantics` entirely. Consequence: with no imported link graph
+there is nothing for `elements_for_city_object(include_descendants=True)` to
+walk, so an application that wants "this Building and all its surfaces" walks its
+own hierarchy and passes the set to `elements_for_city_objects([...])`.
+
+**Register the semantic source with `compute_hash=False`, or not at all.** If
+another system edits the CityGML, a hash recorded here reports
+`ASSET_FILE_CHANGED` at the `external` validation level for a file USAP does not
+own.
+
+**The vocabulary is seeded into the package, not read at annotation time.**
+`load_vocabulary_folder` (or the individual loaders) copies concepts into
+`usap_semantic_class`; CRUD then validates against that copy, which is why a
+package is portable and why a concept cannot vanish from under existing
+annotations when a config file is edited. Seed on create and **re-seed on open**:
+seeding is idempotent and enriching, filling in what is missing and raising only
+on a genuine contradiction — which the application should surface rather than
+swallow. Note the asymmetry: concepts are gated (an unregistered one raises),
+link types are not (an unregistered name auto-registers).
+
+**One thread per connection.** `sqlite3` connections are thread-bound; using a
+`USAPPackage` from a worker thread raises `ProgrammingError` at runtime, not at
+review. Confine USAP to one thread, or open a connection per thread.
+
+**A city-object link and an asset membership are different things.** The
+city-object link identifies the authoritative semantic instance a claim
+represents or concerns; membership blocks identify selected points or faces in
+operational assets. `attach_annotation_elements` adds another geometric
+membership to the same claim — it does not create another city object.
+
+**Large source files stay outside the edit path.** After registration, changing
+an annotation updates the USAP package rather than rewriting the mesh, point
+cloud, or semantic authority. Query cost is governed by the stored blocks and the
+result size, not by rereading the source asset.
+
+**Errors.** Catch `usap.USAPError` (bad references, constraint violations,
+out-of-range indices, unsupported dtypes) and its subclass
+`usap.USAPAmbiguityError` (a reference matching more than one record).
+
+---
+
 ## Concept registries
 
 USAP ships **no** built-in taxonomy and does not enforce one. A new package starts with **zero** concepts; it holds only whatever vocabulary you seed into it.
@@ -556,7 +625,7 @@ Re-loading an updated copy is additive, idempotent, and enriching — new concep
 > [INGESTION.md](INGESTION.md). This section describes the config keys.
 
 One example config is provided —
-[`project_configs/example_project.json`](project_configs/example_project.json),
+[`project_configs/example_project.json`](../project_configs/example_project.json),
 a generic template: edit its `../data/area.*` paths to point at your own data
 files (paths are resolved relative to the config file; the data files
 themselves are not committed to git). Abridged here to one of its three

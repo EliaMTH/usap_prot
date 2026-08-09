@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<!--
+  Test fixture: the category overlay, as an ontology.
+
+  This is the shape a real deployment writes. The properties are CityGML's own,
+  identified by the namespace the .gml uses, and the single thing asserted over
+  them is usap:category — which no CityGML artifact carries, so somebody has to
+  say it. In a real stack these assertions live next to the properties they
+  describe, in an ADE that imports CityGML.
+-->
+<rdf:RDF
+    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"
+    xmlns:owl="http://www.w3.org/2002/07/owl#"
+    xmlns:usap="urn:usap:">
+
+  <owl:Ontology rdf:about="https://example.org/usap-citygml-categories">
+    <owl:imports rdf:resource="http://www.opengis.net/citygml/3.0"/>
+  </owl:Ontology>
+
+  <!-- Containment: the target is part of the source. -->
+  <owl:ObjectProperty rdf:about="http://www.opengis.net/citygml/3.0#boundary">
+    <rdfs:label>boundary</rdfs:label>
+    <usap:category>containment</usap:category>
+  </owl:ObjectProperty>
+
+  <owl:ObjectProperty rdf:about="http://www.opengis.net/citygml/construction/3.0#fillingSurface">
+    <usap:category>containment</usap:category>
+  </owl:ObjectProperty>
+
+  <owl:ObjectProperty rdf:about="http://www.opengis.net/citygml/building/3.0#buildingPart">
+    <usap:category>containment</usap:category>
+  </owl:ObjectProperty>
+
+  <!-- Peer: related, but neither is part of the other. -->
+  <owl:ObjectProperty rdf:about="http://www.opengis.net/citygml/3.0#adjacentTo">
+    <usap:category>peer</usap:category>
+  </owl:ObjectProperty>
+
+  <!-- The same real-world thing at another level of detail. -->
+  <owl:ObjectProperty rdf:about="http://www.opengis.net/citygml/3.0#generalizesTo">
+    <usap:category>generalization</usap:category>
+  </owl:ObjectProperty>
+
+  <!-- Declared but deliberately left unclassified, so a test can show that an
+       unknown category is reported rather than assumed. -->
+  <owl:ObjectProperty rdf:about="http://www.opengis.net/citygml/3.0#relatedTo"/>
+
+  <!-- ISO 19150-2 spelling: CityGML's published OWL renderings name a property
+       Class.property, and the property is the part after the dot. -->
+  <owl:ObjectProperty rdf:about="http://www.opengis.net/citygml/cityobjectgroup/3.0#Role.groupMember">
+    <usap:category>grouping</usap:category>
+  </owl:ObjectProperty>
+
+  <!-- An ADE class, with a parent declared in this same file. -->
+  <owl:Class rdf:about="https://example.org/ade#BuildingQuality"/>
+  <owl:Class rdf:about="https://example.org/ade#AcousticQuality">
+    <rdfs:subClassOf rdf:resource="https://example.org/ade#BuildingQuality"/>
+  </owl:Class>
+</rdf:RDF>

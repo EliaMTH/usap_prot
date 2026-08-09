@@ -24,6 +24,9 @@ FW_*
 *.owl
 *.pdf
 
+# ...but the test fixtures are part of the suite, not local working copies.
+!tests/fixtures/**/*.owl
+
 # Local working copies of external authorities. Not vendored: the SDK takes a
 # path to these, it does not ship them.
 #   citygml-3.0-schemas/  OGC CityGML 3.0 XSDs (schemas.opengis.net/citygml/citygml-3_0_0.zip)

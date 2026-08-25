@@ -1,6 +1,19 @@
 {
   "db_path": "../outputs/example_project.usap.gpkg",
   "manifest_path": "../outputs/example_project_manifest.json",
+  "citygml_schema": "../citygml-3.0-schemas",
+  "relationship_types": [
+    {
+      "local_name": "boundary",
+      "code_space": "http://www.opengis.net/citygml/3.0",
+      "category": "containment"
+    },
+    {
+      "local_name": "fillingSurface",
+      "code_space": "http://www.opengis.net/citygml/construction/3.0",
+      "category": "containment"
+    }
+  ],
   "citygml": {
     "path": "../data/area.gml",
     "compute_hash": true

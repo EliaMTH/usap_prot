@@ -71,11 +71,24 @@ rather than depending on the full OGC distribution.
   opened by a raw `pkg.conn` write is adopted and committed by the next SDK
   write.
 - `test_normalize_element_kind_is_strict` — unknown element kinds raise.
+- `test_list_assets_and_parts` — the enumeration an application's layer panel
+  runs: every registered asset with its part and element counts, filtered by
+  kind, then drilled into one asset's parts.
+- `test_list_city_objects_and_children` — the same for an object tree: list
+  all, filter to carriers (`object_status="temporary"` — the alignment hook),
+  and expand a node to its direct children by id or by uid.
 - `test_reregistering_an_asset_with_different_values_raises` /
   `test_reregistering_a_part_with_a_different_count_raises` — idempotent
   registration must mean "already registered **as the same thing**"; a
   conflicting kind or element count raises instead of returning a row that
   describes something the caller did not register.
+- `test_recreating_a_city_object_with_a_different_class_raises` — the same
+  doctrine for city objects. Idempotency on `object_uid` is what makes a
+  `gml:id` usable as the key, but a repeat call naming a *different* class had
+  been discarding it silently — and that arises naturally, since an
+  annotation's concept (`EnergyRoof`) is usually not the object's CityGML class
+  (`RoofSurface`). Only supplied fields are compared, so the bare
+  `create_city_object(uid)` lookup still resolves.
 - `test_annotation_domain_values_are_refused` — an unknown status, a
   confidence of 7.5, and non-JSON attributes are refused on create *and* on
   update; each of them breaks a reader rather than merely looking odd.
@@ -90,6 +103,22 @@ rather than depending on the full OGC distribution.
   claim fields (status, confidence, attributes).
 - `test_list_annotations_with_filters` — listing filters (status, concept,
   city object) return exactly the matching annotations.
+- `test_list_annotations_asset_filter_separates_two_assets` — the `asset_id` /
+  `asset_part_id` filters, which are how an application loads the annotations
+  of the asset it has just opened. **Two** assets and two parts are what make
+  this testable at all: with one of each, the filters are indistinguishable
+  from no-ops — they return everything either way, so a broken implementation
+  looks exactly like a working one. The fixture mirrors the real case, a point
+  cloud and a mesh of the same area, and includes a claim spanning both (it
+  must appear under each: this is a filter, not a partition) and one with no
+  membership at all (it belongs to no asset).
+- `test_reverse_query_reports_the_same_identifiers_as_the_detail_read` — a
+  lasso and a detail panel must name the same CityObject the same way.
+  `annotations_for_elements` used to return `object_uid` alone while
+  `get_annotation` and `list_annotations` also returned `gml_id`. The fixture
+  deliberately gives the object a `gml_id` *different* from its `object_uid`,
+  since with them equal a column aliased to the wrong one would still pass.
+  Also pins the unlinked case: both fields `None`, not absent.
 - `test_delete_annotation_cascades_membership` — deleting an annotation must
   not orphan its membership blocks.
 - `test_create_annotation_rejects_conflicting_concept` — re-using an
@@ -403,6 +432,10 @@ End-to-end tests of the three INGESTION.md procedures:
   real to everything downstream, so a failed build must leave nothing.
 - `test_failed_update_leaves_the_previous_package_intact` — an `update=True`
   failure must not half-modify a package someone already has.
+- `test_removed_mirror_key_is_refused_not_ignored` — `also_usap_default`
+  switched off a mirror graph that no longer exists. Ignoring a retired config
+  key would leave the file asserting behaviour the build does not perform, so
+  it raises.
 
 ## Membership encoding — `test_encoding.py`
 
@@ -418,6 +451,27 @@ selection over a 10 GB point cloud is hundreds of millions of them).
   still accepted, since JSON has no integer type.
 - `test_negative_and_oversized_indices_are_refused` — the u32 index space is
   the storage format, so its edges are errors.
+- `test_index_normalization_does_not_depend_on_the_input_dtype` — parametrised
+  over seven integer dtypes. A caller holding a large selection as `uint32` to
+  halve its memory is doing the obvious thing, and the monotonicity fast path
+  was `np.diff(values) > 0`, which subtracts in the *input's* dtype: on an
+  unsigned one a descending step wraps to a huge positive, so every unsigned
+  array was taken for sorted and came back in the order given.
+- `test_oversized_index_is_refused_wherever_it_sits` — the u32 range check
+  reads the last element, which is only the upper bound once sorted. An
+  unsorted `uint64` input hid 2\*\*40 behind a small final element, and
+  `astype(uint32)` wrapped it to 0 — the annotation silently moved to a
+  different element.
+- `test_normalized_indices_split_into_blocks_without_loss` — the same root
+  cause seen from the other end: `split_indices_into_blocks` finds its
+  boundaries in sorted order, so unsorted input does not merely reorder the
+  result, it **drops** elements — four indices came back as two, with no error
+  anywhere.
+- `test_unsorted_selection_is_range_checked_against_the_asset_part` — and the
+  same again at the write path: `_validate_membership_indices` range-checks the
+  last element only, trusting normalization to have sorted. When that trust was
+  misplaced, an out-of-range index was accepted and written, surfacing only at
+  `validate_report()` time.
 - `test_blocks_split_on_block_boundaries` / `test_roundtrip_preserves_offsets`
   — the block split and the payload round-trip.
 - `test_a_run_of_offsets_costs_a_fraction_of_the_indices_it_names` — a surface
@@ -464,6 +518,10 @@ Conformance additions:
 - `test_srs_row_needs_a_definition` / `test_incomplete_srs_row_is_repaired` —
   "undefined" definitions are reserved for srs_id −1/0, and an already-written
   incomplete row must be repairable (INSERT OR IGNORE left it broken forever).
+- `test_srs_row_resolves_epsg_when_crs_extra_is_installed` — the other half of
+  that contract: with `usap[crs]` present a bare EPSG code suffices, because
+  pyproj carries the definition. Skipped on a bare install, which is the branch
+  the CI extras job exists to cover.
 - `test_mixed_asset_crs_is_reported` — one CRS per package is an assumption
   nothing enforced; mixed CRSs are warned about, not silently misplaced.
 - `test_extension_definition_is_a_uri` — the standard asks for a reference to
@@ -503,6 +561,8 @@ be added afterwards without rewriting existing packages (see
   read time would differ between two readers of the same file.
 - `test_explicit_package_iri_is_honoured` — adopting an identity that already
   exists elsewhere must be possible; only the default is minted.
+- `test_mint_package_iri_is_unique` — the minting function itself, below the
+  package: two calls never collide.
 - `test_blank_package_iri_is_reported` — the column is `NOT NULL`, so this is
   the shape a package written by something else could still take: validation
   reports `INVALID_PACKAGE_IRI` and the accessor raises.
@@ -631,14 +691,19 @@ acceptance criteria rather than the implementation.
 
 Appended to `test_ontology_loading.py`:
 
-- `test_turtle_is_read_when_rdflib_is_available` — the same facts as the
-  RDF/XML path, from a different syntax. The reader split exists so both agree
-  by construction; skipped when `rdflib` is absent.
-- `test_turtle_without_rdflib_reports_a_missing_capability` — a missing
-  optional parser is reported as `install usap[ttl]`, never as a broken file:
-  the rule `pyproject.toml` states for laspy/pyproj, applied to rdflib.
-- `test_unknown_ontology_suffix_is_refused` — an unrecognised suffix names both
-  reader families rather than guessing one.
+- `test_turtle_is_refused_with_a_conversion_hint` — RDF/XML is the only syntax
+  read, so a `.ttl` is refused by name with the remedy in the message, rather
+  than being accepted or reported as broken XML.
+- `test_unsupported_rdf_syntax_in_a_folder_raises_rather_than_being_skipped` —
+  the failure mode dropping Turtle support could have introduced. The
+  unsupported suffixes stay in the folder's file set on purpose: routed to
+  `load_ontology` precisely so they raise. A walk that no longer recognised
+  them would seed fewer concepts than the folder names and say nothing.
+  Parametrised over `.ttl` `.n3` `.nt` `.trig` `.jsonld`, and it also asserts
+  the folder's *other* files were not seeded — a partial load is the same lie
+  in slower form.
+- `test_unknown_ontology_suffix_is_refused` — an unrecognised suffix names the
+  supported set rather than guessing.
 - `test_vocabulary_folder_loads_schemas_and_ontologies_together` — US-DATA-04's
   "reads the configured file(s) at startup" as one call over a directory
   holding XSDs, an ontology, and a JSON vocabulary; re-running is a no-op, so

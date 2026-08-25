@@ -247,57 +247,47 @@ ex:RoofPanel a owl:Class ;
 """
 
 
-def test_turtle_is_read_when_rdflib_is_available(tmp_path):
+def test_turtle_is_refused_with_a_conversion_hint(tmp_path):
     """
-    Same facts as the RDF/XML path, from a different syntax: the reader split
-    exists so both agree by construction.
+    USAP reads RDF/XML only. A Turtle file must be refused by name, with the
+    remedy in the message — not accepted, and not reported as broken XML.
     """
-    pytest.importorskip("rdflib")
-
     ontology = tmp_path / "domain.ttl"
     ontology.write_text(TURTLE_ONTOLOGY)
 
     with make_pkg(tmp_path, "ttl.usap.gpkg") as pkg:
-        result = load_ontology(pkg, ontology)
-
-        assert result.categorised == 1
-        assert len(result.concepts) == 2
-
-        types = {t["local_name"]: t for t in pkg.list_relationship_types()}
-        assert types["boundary"]["category"] == "containment"
-
-        # The subClassOf survived the syntax change.
-        panel = pkg.resolve_semantic_class("RoofPanel")
-        surface = pkg.resolve_semantic_class("Surface")
-        blocks = pkg.conn.execute(
-            "SELECT parent_class_id FROM usap_semantic_class WHERE semantic_class_id = ?",
-            (panel,),
-        ).fetchone()
-        assert blocks["parent_class_id"] == surface
-
-
-def test_turtle_without_rdflib_reports_a_missing_capability(tmp_path, monkeypatch):
-    """
-    A missing optional parser must never be reported as a broken file — the
-    rule pyproject.toml states for laspy/pyproj, applied to rdflib.
-    """
-    import builtins
-
-    real_import = builtins.__import__
-
-    def no_rdflib(name, *args, **kwargs):
-        if name == "rdflib":
-            raise ImportError("no rdflib")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", no_rdflib)
-
-    ontology = tmp_path / "domain.ttl"
-    ontology.write_text(TURTLE_ONTOLOGY)
-
-    with make_pkg(tmp_path, "nottl.usap.gpkg") as pkg:
-        with pytest.raises(USAPError, match=r"install usap\[ttl\]"):
+        with pytest.raises(USAPError, match="no longer supported") as excinfo:
             load_ontology(pkg, ontology)
+
+        assert "RDF/XML" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("suffix", [".ttl", ".n3", ".nt", ".trig", ".jsonld"])
+def test_unsupported_rdf_syntax_in_a_folder_raises_rather_than_being_skipped(
+    tmp_path, suffix
+):
+    """
+    The failure mode dropping Turtle support could have introduced: a folder
+    walk that no longer recognises .ttl walks straight past it, and the package
+    comes up with fewer concepts than the operator configured, silently.
+
+    So the unsupported suffixes stay in the folder's file set on purpose — they
+    are routed to load_ontology precisely so they raise. Nothing else in the
+    folder may be seeded either; a partial load is the same lie in slower form.
+    """
+    config = tmp_path / "vocabulary"
+    config.mkdir()
+
+    (config / f"domain{suffix}").write_text(TURTLE_ONTOLOGY)
+    (config / "local.json").write_text(
+        json.dumps({"scheme": "local", "concepts": [{"local_name": "SolarPanel"}]})
+    )
+
+    with make_pkg(tmp_path, f"folder{suffix.replace('.', '_')}.usap.gpkg") as pkg:
+        with pytest.raises(USAPError, match="no longer supported"):
+            load_vocabulary_folder(pkg, config)
+
+        assert pkg.list_accepted_concepts() == []
 
 
 def test_unknown_ontology_suffix_is_refused(tmp_path):

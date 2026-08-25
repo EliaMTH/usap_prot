@@ -144,6 +144,7 @@ Explore USAP in more detail with:
 
 - [API.md](docs/API.md) — every public call in one place, one line each. Start here to see what the SDK offers;
 - [REFERENCE.md](docs/REFERENCE.md) — the full manual: the data model, integrating USAP into an application, concept registries, config keys, batch format, validation;
+- [HANDOFF.md](docs/HANDOFF.md) — the rules an application embedding USAP must uphold, and that USAP cannot enforce from its side. Read before writing integration code;
 - [INGESTION.md](docs/INGESTION.md) — the three supported creation and editing procedures, end to end;
 - [SCHEMA_WIRING.md](docs/SCHEMA_WIRING.md) — how the tables, views and indexes connect;
 - [TESTS.md](docs/TESTS.md) — what the test suite covers and why.

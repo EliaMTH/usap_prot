@@ -726,6 +726,66 @@ def test_reregistering_a_part_with_a_different_count_raises(pkg: USAPPackage) ->
         )
 
 
+def test_recreating_a_city_object_with_a_different_class_raises(
+    pkg: USAPPackage,
+) -> None:
+    # create_city_object is idempotent on object_uid, which is what makes a
+    # gml:id usable as the key: the CityGML owns uniqueness, USAP just anchors
+    # to it. Same rule as register_asset, though: "already there" has to mean
+    # "there as the same thing".
+    #
+    # The way this goes wrong in practice is a class mismatch, and it arises
+    # naturally — the annotation's concept (EnergyRoof) is usually not the
+    # object's CityGML class (RoofSurface). Passing the former here used to
+    # return the existing row and drop it with no error.
+    roof = pkg.create_semantic_class(
+        scheme="citygml", class_uri="c:RoofSurface", local_name="RoofSurface"
+    )
+    energy_roof = pkg.create_semantic_class(
+        scheme="ade", class_uri="a:EnergyRoof", local_name="EnergyRoof"
+    )
+
+    first = pkg.create_city_object(
+        object_uid="building_1_roof_1",
+        semantic_class_id=roof,
+        gml_id="building_1_roof_1",
+    )
+
+    # Same values: still idempotent.
+    assert pkg.create_city_object(
+        object_uid="building_1_roof_1",
+        semantic_class_id=roof,
+        gml_id="building_1_roof_1",
+    ) == first
+
+    with pytest.raises(USAPError, match="already exists with different"):
+        pkg.create_city_object(
+            object_uid="building_1_roof_1",
+            semantic_class_id=energy_roof,
+        )
+
+    with pytest.raises(USAPError, match="already exists with different"):
+        pkg.create_city_object(
+            object_uid="building_1_roof_1",
+            gml_id="some_other_gml_id",
+        )
+
+    # Only supplied fields are compared, so the bare "give me the id" call
+    # still works against a fully populated row — that idiom is how carrier
+    # objects get looked up.
+    assert pkg.create_city_object(object_uid="building_1_roof_1") == first
+
+    # And nothing was written by the rejected calls.
+    stored = pkg.conn.execute(
+        "SELECT semantic_class_id, gml_id FROM usap_city_object "
+        "WHERE object_uid = ?",
+        ("building_1_roof_1",),
+    ).fetchone()
+
+    assert stored["semantic_class_id"] == roof
+    assert stored["gml_id"] == "building_1_roof_1"
+
+
 def test_annotation_domain_values_are_refused(pkg: USAPPackage, mesh_part: int) -> None:
     # These three all used to be stored and to validate clean. Each breaks a
     # reader: an unknown status drops out of every status filter, a

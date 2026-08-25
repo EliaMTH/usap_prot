@@ -1356,6 +1356,27 @@ class USAPPackage:
         object_status: str = "accepted",
         attributes_json: str | None = None,
     ) -> int:
+        """
+        Register a city object under `object_uid`; returns city_object_id.
+
+        `object_uid` is supplied, never derived: uniqueness belongs to whoever
+        owns the semantic model. In carrier-only use the caller passes the
+        `gml:id`, so a repeat call names the same instance and returning the
+        existing row is the whole point.
+
+        Idempotent on object_uid, and — as in register_asset — only while
+        "already registered" means "registered as the same thing". A repeat
+        call that supplies a *different* value for a field already stored
+        raises rather than discarding it. The case this exists for: an
+        annotation's concept (EnergyRoof) is usually not the object's CityGML
+        class (RoofSurface), so passing the annotation's concept here used to
+        vanish without a word.
+
+        Only fields the caller actually supplies are compared, so the bare
+        `create_city_object(uid)` "give me the id" call stays valid against a
+        fully populated row. `object_status` is excluded: its default is a real
+        value, so a supplied status cannot be told from an omitted one.
+        """
         if object_status not in CITY_OBJECT_STATUSES:
             raise USAPError(
                 f"Unknown city object status {object_status!r}. "
@@ -1364,7 +1385,13 @@ class USAPPackage:
 
         existing = self.conn.execute(
             """
-            SELECT city_object_id
+            SELECT
+                city_object_id,
+                semantic_class_id,
+                gml_id,
+                source_asset_id,
+                source_object_id,
+                attributes_json
             FROM usap_city_object
             WHERE object_uid = ?
             """,
@@ -1372,6 +1399,30 @@ class USAPPackage:
         ).fetchone()
 
         if existing is not None:
+            conflicts = _conflicting_fields(
+                existing,
+                {
+                    column: value
+                    for column, value in (
+                        ("semantic_class_id", semantic_class_id),
+                        ("gml_id", gml_id),
+                        ("source_asset_id", source_asset_id),
+                        ("source_object_id", source_object_id),
+                        ("attributes_json", attributes_json),
+                    )
+                    if value is not None
+                },
+            )
+
+            if conflicts:
+                raise USAPError(
+                    f"City object {object_uid!r} already exists with different "
+                    f"values: {conflicts}. Creating it again cannot change it; "
+                    "the semantic source owns these fields. If you meant to "
+                    "record a different concept, that belongs on the "
+                    "annotation, not on the city object."
+                )
+
             return int(existing["city_object_id"])
 
         with self.transaction():
@@ -3649,7 +3700,8 @@ class USAPPackage:
                         sc.local_name AS semantic_class,
                         sc.class_uri AS semantic_class_uri,
 
-                        co.object_uid AS primary_city_object_uid
+                        co.object_uid AS primary_city_object_uid,
+                        co.gml_id AS primary_city_object_gml_id
                     FROM usap_membership_block AS mb
                     JOIN usap_annotation AS a
                         ON a.annotation_id = mb.annotation_id
@@ -3706,6 +3758,7 @@ class USAPPackage:
                     "semantic_class": row["semantic_class"],
                     "semantic_class_uri": row["semantic_class_uri"],
                     "primary_city_object_uid": row["primary_city_object_uid"],
+                    "primary_city_object_gml_id": row["primary_city_object_gml_id"],
                     "matched_elements": [],
                 }
 

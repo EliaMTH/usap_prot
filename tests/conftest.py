@@ -60,8 +60,9 @@ def seed_citygml_concepts(pkg: USAPPackage) -> VocabularyResult:
 # "and its parts" should mean.
 #
 # In a real package these assertions live in the ontology and arrive via
-# load_ontology(); here they are inline so the suite does not need an RDF
-# parser. Replace this with a fixture .ttl when load_ontology lands.
+# load_ontology(); here they are inline so a test that only needs a category
+# does not have to carry an .owl fixture. tests/fixtures/ has the real thing
+# for the tests that exercise the reader itself.
 CITYGML_3_0_RELATIONSHIP_CATEGORIES = {
     # core
     ("boundary", CITYGML_3_0_CORE_NS): "containment",

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "usap"
-version = "0.4.0"
+version = "0.4.1"
 description = "Urban Semantic Annotation Package phase-1 prototype"
 requires-python = ">=3.11"
 dependencies = [
@@ -23,12 +23,10 @@ dependencies = [
 laz = ["laspy[lazrs]>=2.5"]
 crs = ["pyproj>=3.6"]
 
-# The built-in ontology reader is RDF/XML only, parsed with the lxml USAP
-# already depends on. Turtle and the other RDF syntaxes need a real RDF
-# parser; kept optional so an RDF/XML-only install stays small, and a missing
-# parser is reported as a missing capability, never as "this file is broken"
-# (see domain_vocab._read_ontology_rdflib).
-ttl = ["rdflib>=7"]
+# There is deliberately no RDF extra. Ontologies are read as RDF/XML with the
+# lxml USAP already depends on; Turtle and the other non-XML RDF syntaxes are
+# refused with a "convert to RDF/XML" message rather than pulling in a second
+# RDF stack (see domain_vocab._UNSUPPORTED_RDF_SUFFIXES).
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -529,11 +529,15 @@ def _split_iri(iri: str) -> tuple[str, str] | None:
     return None
 
 
-# Which reader handles which syntax. RDF/XML stays on the built-in lxml reader
-# so the common path needs no extra dependency and its behaviour does not
-# change; the rest need rdflib, which is an optional extra ([ttl]).
+# RDF/XML is the only ontology syntax USAP reads, on the built-in lxml reader,
+# so the package has no RDF dependency at all.
 _RDFXML_SUFFIXES = frozenset({".owl", ".rdf", ".rdfs", ".xml"})
-_RDFLIB_SUFFIXES = frozenset({".ttl", ".n3", ".nt", ".trig", ".jsonld"})
+
+# The non-XML RDF syntaxes, kept solely so a file in one of them is *refused*
+# rather than ignored. They stay in _VOCABULARY_SUFFIXES for the same reason:
+# dropping them would make load_vocabulary_folder walk straight past a .ttl,
+# seeding fewer concepts than the operator configured and saying nothing.
+_UNSUPPORTED_RDF_SUFFIXES = frozenset({".ttl", ".n3", ".nt", ".trig", ".jsonld"})
 
 
 @dataclass(frozen=True)
@@ -541,9 +545,9 @@ class _OntologyFacts:
     """
     What a reader extracts, independent of the file's syntax.
 
-    Readers produce this; _register_ontology_facts writes it. Splitting them is
-    what lets Turtle and RDF/XML share every downstream decision (identity,
-    parent resolution, category handling) instead of each re-deriving it.
+    Readers produce this; _register_ontology_facts writes it. Splitting them
+    keeps every downstream decision (identity, parent resolution, category
+    handling) in one place, independent of how a file was parsed.
 
         properties  (iri, usap:category or None)
         classes     (iri, [named parent iri, ...])
@@ -565,9 +569,9 @@ def _read_ontology_rdfxml(path: Path) -> _OntologyFacts:
         root = etree.parse(str(path)).getroot()
     except etree.XMLSyntaxError as exc:
         raise USAPError(
-            f"{path} is not readable as RDF/XML: {exc}. Files with a .ttl, "
-            ".n3, .nt, .trig or .jsonld suffix are read with rdflib instead — "
-            "rename the file if it is really Turtle, or install usap[ttl]."
+            f"{path} is not readable as RDF/XML: {exc}. USAP reads RDF/XML "
+            "only — if this is really Turtle or another RDF syntax, convert it "
+            "(Protege: 'Save as' -> RDF/XML)."
         ) from exc
 
     if root.tag != f"{_RDF}RDF":
@@ -620,70 +624,6 @@ def _read_ontology_rdfxml(path: Path) -> _OntologyFacts:
         properties=properties,
         classes=classes,
         imports=imports,
-    )
-
-
-def _read_ontology_rdflib(path: Path) -> _OntologyFacts:
-    """
-    Read any RDF syntax rdflib understands (Turtle, N-Triples, JSON-LD, ...).
-
-    Deliberately *not* implemented by serializing to RDF/XML and re-feeding the
-    lxml reader: rdflib may write a typed node as rdf:Description + rdf:type,
-    which that reader does not look for, so classes would silently go
-    unregistered. Reading the graph directly also makes the syntax irrelevant,
-    which is the point.
-    """
-    try:
-        from rdflib import OWL, RDF, RDFS, Graph, URIRef
-    except ImportError as exc:
-        raise USAPError(
-            f"Reading {path.name} needs rdflib, which is not installed: "
-            "install usap[ttl]. Alternatively convert the file to RDF/XML "
-            "(Protégé: 'Save as' → RDF/XML), which the built-in reader handles."
-        ) from exc
-
-    graph = Graph()
-
-    try:
-        graph.parse(str(path))
-    except Exception as exc:  # rdflib raises a parser-specific zoo
-        raise USAPError(f"{path} is not readable as RDF: {exc}") from exc
-
-    category_predicate = URIRef(f"{USAP_ONTOLOGY_NAMESPACE}category")
-
-    properties: list[tuple[str, str | None]] = []
-
-    for subject in graph.subjects(RDF.type, OWL.ObjectProperty):
-        if not isinstance(subject, URIRef):
-            continue  # a blank node cannot be referred to from a document
-
-        category = graph.value(subject, category_predicate)
-        properties.append(
-            (str(subject), str(category).strip() or None if category else None)
-        )
-
-    classes: list[tuple[str, list[str]]] = []
-
-    for subject in graph.subjects(RDF.type, OWL.Class):
-        if not isinstance(subject, URIRef):
-            continue
-
-        parents = [
-            str(parent)
-            for parent in graph.objects(subject, RDFS.subClassOf)
-            if isinstance(parent, URIRef)
-        ]
-
-        classes.append((str(subject), parents))
-
-    imports = [str(target) for target in graph.objects(None, OWL.imports)]
-
-    # Sorted for a stable result: rdflib's graph iteration order is not the
-    # file's, and two runs over one file must register the same things.
-    return _OntologyFacts(
-        properties=sorted(properties),
-        classes=sorted(classes),
-        imports=sorted(imports),
     )
 
 
@@ -796,11 +736,12 @@ def load_ontology(
                              classes; CityGML's own come from the XSD, which is
                              the only artifact carrying their hierarchy.
 
-    Syntax is chosen by suffix. ``.owl`` / ``.rdf`` / ``.rdfs`` / ``.xml`` are
-    read by a narrow built-in RDF/XML reader, so the common path costs no extra
-    install. ``.ttl`` / ``.n3`` / ``.nt`` / ``.trig`` / ``.jsonld`` are read
-    through **rdflib**, an optional extra: without it the file is reported as a
-    missing capability (``install usap[ttl]``), never as a broken file.
+    **RDF/XML only.** ``.owl`` / ``.rdf`` / ``.rdfs`` / ``.xml`` are read by a
+    narrow built-in reader, so ontology loading costs no extra dependency.
+    Turtle and the other non-XML RDF syntaxes (``.ttl`` / ``.n3`` / ``.nt`` /
+    ``.trig`` / ``.jsonld``) are **refused with an explicit message** telling
+    the caller to convert the file — never silently skipped, so a package can
+    never come up with fewer concepts than its configuration named.
 
     Anything a reader does not recognise is left alone: this adds facts, it
     never removes or overrides them.
@@ -822,15 +763,19 @@ def load_ontology(
 
     suffix = ontology_path.suffix.lower()
 
-    if suffix in _RDFLIB_SUFFIXES:
-        facts = _read_ontology_rdflib(ontology_path)
-    elif suffix in _RDFXML_SUFFIXES:
+    if suffix in _UNSUPPORTED_RDF_SUFFIXES:
+        raise USAPError(
+            f"{ontology_path.name}: {suffix} is no longer supported. USAP "
+            "reads RDF/XML only. Convert the file (Protege: 'Save as' -> "
+            f"RDF/XML) and give it one of {sorted(_RDFXML_SUFFIXES)}."
+        )
+
+    if suffix in _RDFXML_SUFFIXES:
         facts = _read_ontology_rdfxml(ontology_path)
     else:
         raise USAPError(
             f"Unsupported ontology suffix {suffix!r}: {ontology_path.name}. "
-            f"RDF/XML {sorted(_RDFXML_SUFFIXES)} is read directly; "
-            f"{sorted(_RDFLIB_SUFFIXES)} need rdflib (install usap[ttl])."
+            f"USAP reads RDF/XML only: {sorted(_RDFXML_SUFFIXES)}."
         )
 
     return _register_ontology_facts(
@@ -843,11 +788,15 @@ def load_ontology(
 
 # What each suffix in a configuration folder means. .xsd is a CityGML schema
 # (concepts + hierarchy), .json a vocabulary file, the rest an ontology.
+#
+# _UNSUPPORTED_RDF_SUFFIXES is included on purpose: those files are routed to
+# load_ontology so they raise. Excluding them would make the walk skip them,
+# which is the one failure mode a configuration folder must not have.
 _VOCABULARY_SUFFIXES = (
     frozenset({".xsd"})
     | frozenset({".json"})
     | _RDFXML_SUFFIXES
-    | _RDFLIB_SUFFIXES
+    | _UNSUPPORTED_RDF_SUFFIXES
 )
 
 
@@ -868,8 +817,12 @@ def load_vocabulary_folder(
         .xsd                     load_citygml_schema  (concepts + hierarchy)
         .owl .rdf .rdfs .xml     load_ontology        (RDF/XML reader)
         .ttl .n3 .nt .trig .jsonld
-                                 load_ontology        (rdflib, usap[ttl])
+                                 load_ontology, which *raises*: RDF/XML only
         .json                    seed_vocabulary_file
+
+    A file in an unsupported RDF syntax is refused, not passed over. Skipping
+    it would seed a package with fewer concepts than the folder names, and
+    nothing downstream could tell that from a folder that simply held less.
 
     Returns what each file contributed, keyed by its name — so a caller can
     show "these concepts came from that file" rather than one opaque total.
@@ -925,7 +878,7 @@ def load_vocabulary_folder(
     for item in files:
         suffix = item.suffix.lower()
 
-        if suffix in _RDFXML_SUFFIXES or suffix in _RDFLIB_SUFFIXES:
+        if suffix in _RDFXML_SUFFIXES or suffix in _UNSUPPORTED_RDF_SUFFIXES:
             results[item.name] = load_ontology(
                 pkg,
                 item,

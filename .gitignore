@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 build/
+data/
 dist/
 *.usap.gpkg
 *.prof
@@ -18,6 +19,7 @@ benchmark_results/
 usap_devdiary.md
 PHASE1_BASELINE.md
 USAP_report.md
+HANDOFF_PLAN.md
 
 FW_*
 
@@ -27,11 +29,9 @@ FW_*
 # ...but the test fixtures are part of the suite, not local working copies.
 !tests/fixtures/**/*.owl
 
-# Local working copies of external authorities. Not vendored: the SDK takes a
-# path to these, it does not ship them.
+# Local working copy of an external authority. Not vendored: the SDK takes a
+# path to it, it does not ship it.
 #   citygml-3.0-schemas/  OGC CityGML 3.0 XSDs (schemas.opengis.net/citygml/citygml-3_0_0.zip)
-#   ontologies-local/     LIRIS CityGML 3.0 OWL, served as Turtle
 citygml-3.0-schemas/
-ontologies-local/
 
 US.md

@@ -64,8 +64,8 @@ usap_prot/
   pyproject.toml
   README.md            motivation and mental model
   US.md                the user stories this prototype is built against
-  docs/                API.md, REFERENCE.md, INGESTION.md, TESTS.md,
-                       SCHEMA_WIRING.md, and the design records
+  docs/                API.md, REFERENCE.md, HANDOFF.md, INGESTION.md,
+                       TESTS.md, SCHEMA_WIRING.md, and the design records
 
   src/usap/             the Python SDK: core, validation, geopackage,
                         domain_vocab, batch, project_builder, synthetic
@@ -93,18 +93,20 @@ mode:
 python -m pip install -e .
 ```
 
-LAS is supported by the base install; LAZ, CRS parsing, and non-RDF/XML
-ontology syntaxes each need a backend of their own, so they are optional
-extras:
+LAS is supported by the base install; LAZ and CRS parsing each need a backend
+of their own, so they are optional extras:
 
 ```bash
-python -m pip install -e ".[laz,crs,ttl]"
+python -m pip install -e ".[laz,crs]"
 ```
 
-`[ttl]` adds rdflib, needed only for Turtle/N3/JSON-LD ontologies; RDF/XML is
-read without it. Without an extra, a `.laz` file fails to open, reading a CRS
-raises a capability error, and a `.ttl` ontology reports that rdflib is missing
-— none of them degrades silently into "this file has no CRS" or "no concepts".
+Without an extra, a `.laz` file fails to open and reading a CRS raises a
+capability error — neither degrades silently into "this file has no CRS".
+
+Ontologies are **RDF/XML only** and need no extra: they are parsed with the
+lxml USAP already depends on. A `.ttl` (or `.n3` / `.nt` / `.trig` /
+`.jsonld`) is refused with a "convert to RDF/XML" message — including inside a
+configuration folder, where being passed over would show up as "no concepts".
 
 Run the test suite (described in [TESTS.md](TESTS.md)):
 
@@ -304,6 +306,13 @@ once the same asset really has been evaluated twice, which is exactly when they
 must be distinguishable. The two extents are never merged — a union would report
 a coverage no single evaluation ever claimed.
 
+Each entry carries both `primary_city_object_uid` and
+`primary_city_object_gml_id`, the same pair `get_annotation` and
+`list_annotations` return, so a selection list and a detail panel name the same
+object identically. (Added in 0.4.1; before that the reverse query returned the
+uid alone.) Both are `None` for an annotation with no city object — the normal
+case for a free lasso claim, and for every value field.
+
 The asset of an assessment cannot be changed after the fact: its membership is
 indexed against that asset's parts, so re-pointing it would silently make every
 stored index mean different geometry. Record a new assessment instead.
@@ -367,6 +376,14 @@ another system, create carriers on demand —
 there is nothing for `elements_for_city_object(include_descendants=True)` to
 walk, so an application that wants "this Building and all its surfaces" walks its
 own hierarchy and passes the set to `elements_for_city_objects([...])`.
+
+**Create carriers classless.** A carrier is an identity anchor; its class lives
+in the semantic source, by the same division of authority that keeps attributes
+there. This matters because an annotation's concept (`EnergyRoof`) is usually
+*not* the object's class (`RoofSurface`), so passing the former here is an easy
+mistake — one that used to be swallowed, and since 0.4.1 raises. Idempotency on
+`object_uid` compares only the fields a call actually supplies, so the bare
+`create_city_object(uid)` lookup keeps working against a populated row.
 
 **Register the semantic source with `compute_hash=False`, or not at all.** If
 another system edits the CityGML, a hash recorded here reports
@@ -480,19 +497,22 @@ is idempotent and order-independent — classify before or after the import, the
 result is the same, and a category that contradicts one already recorded raises
 rather than overwriting it.
 
-Syntax is picked by suffix. `.owl` / `.rdf` / `.rdfs` / `.xml` go through a
-narrow built-in RDF/XML reader that uses the `lxml` USAP already depends on, so
-the common path adds no install. `.ttl` / `.n3` / `.nt` / `.trig` / `.jsonld`
-go through **rdflib**, an optional extra: without it the file is reported as a
-missing capability (`install usap[ttl]`), never as a broken file. Both readers
-produce the same intermediate facts, so the syntax never changes what gets
-registered.
+**RDF/XML is the only syntax read**, picked by suffix: `.owl` / `.rdf` /
+`.rdfs` / `.xml` go through a narrow built-in reader that uses the `lxml` USAP
+already depends on, so ontology loading adds no install and the package carries
+no second RDF stack.
+
+`.ttl` / `.n3` / `.nt` / `.trig` / `.jsonld` **raise**, with the remedy in the
+message (convert to RDF/XML — Protégé's "Save as" does it). They raise inside
+`load_vocabulary_folder` too, which is the point: a folder walk that quietly
+ignored them would seed fewer concepts than the configuration names, and
+nothing downstream could tell that apart from a folder that held less.
 
 One deliberate limit remains: **`owl:imports` is not followed** — the imported
 IRIs are returned so you can load them yourself, but fetching over the network
 during a package build is not something the SDK does for you. To seed a whole
-configuration directory in one call — schemas, ontologies of either syntax, and
-JSON vocabularies — use `load_vocabulary_folder(pkg, path)`.
+configuration directory in one call — schemas, ontologies, and JSON
+vocabularies — use `load_vocabulary_folder(pkg, path)`.
 
 A category only bites if the property's IRI namespace matches the namespace the
 source document writes; that pair *is* the type's identity. Mismatch it and the
@@ -1302,6 +1322,8 @@ basic     GeoPackage metadata and registered layers
 deep      + membership payload decoding, offsets, stored min/max agreement
           + value payload decoding and stored min/max agreement
           + asset extent recomputation
+          + more than one CRS across the registered assets
+                                         (MIXED_ASSET_CRS, warning)
           + content hash canonical form  (NON_CANONICAL_CONTENT_HASH, warning)
           + annotated asset part with no declared indexing convention
                                          (ASSET_PART_NO_INDEXING_PROFILE, warning)

@@ -77,6 +77,11 @@ CONFIDENCE_RANGE = (0.0, 1.0)
 # Neither step has a migration path: the endpoint columns are renamed and the
 # type is now a foreign key, so an older package cannot be read as a newer one.
 # Packages are experimental and are rebuilt rather than migrated.
+#
+# NOT the SDK version. pyproject.toml's `version` moves with every release;
+# this one moves only when schema.sql changes, because SUPPORTED_PROFILE_
+# VERSIONS below carries no migration path — bumping it in step with a bugfix
+# release would make this build refuse every package already written.
 CURRENT_PROFILE_VERSION = "0.4.0"
 
 # Only packages written by a profile version this build understands can be

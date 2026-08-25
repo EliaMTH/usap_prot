@@ -9,6 +9,7 @@ from conftest import assert_package_valid, make_mesh_part, make_pkg, seed_citygm
 from conftest import write_tiny_mesh as _write_tiny_mesh
 from usap import (
     ELEMENT_KIND_FACE,
+    ELEMENT_KIND_POINT,
     USAPError,
     USAPPackage,
     register_mesh_asset,
@@ -163,6 +164,178 @@ def test_list_annotations_with_filters(tmp_path: Path) -> None:
             "ann_citygml_roof",
             "ann_energy_roof",
         }
+
+
+def test_list_annotations_asset_filter_separates_two_assets(tmp_path: Path) -> None:
+    """
+    US-DATA-01's load step: "the annotations belonging to the 3D asset just
+    opened". With a single registered asset this filter is indistinguishable
+    from a no-op — it returns everything either way — so a broken
+    implementation looks exactly like a working one. It takes two assets to
+    test at all, which is why this went uncovered.
+
+    The pair mirrors the real case: a point cloud and a mesh of the same area,
+    with one claim spanning both.
+    """
+    with make_pkg(tmp_path) as pkg:
+        classes = seed_citygml_concepts(pkg)
+        roof = classes.by_name["RoofSurface"]
+
+        mesh_asset = pkg.register_asset(uri="area.ply", asset_kind="mesh")
+        mesh_part = pkg.register_asset_part(
+            asset_id=mesh_asset,
+            part_path="geometry/0",
+            element_kind=ELEMENT_KIND_FACE,
+            element_count=100,
+        )
+        # A second part on the same asset: without it, asset_id and
+        # asset_part_id are themselves indistinguishable.
+        mesh_part_2 = pkg.register_asset_part(
+            asset_id=mesh_asset,
+            part_path="geometry/1",
+            element_kind=ELEMENT_KIND_FACE,
+            element_count=100,
+        )
+
+        cloud_asset = pkg.register_asset(uri="area.las", asset_kind="pointcloud")
+        cloud_part = pkg.register_asset_part(
+            asset_id=cloud_asset,
+            part_path="points/0",
+            element_kind=ELEMENT_KIND_POINT,
+            element_count=100,
+        )
+
+        def annotate(uid: str, part: int, kind: int) -> int:
+            return int(
+                pkg.annotate_elements(
+                    concept=roof,
+                    annotation_uid=uid,
+                    asset_part_id=part,
+                    element_kind=kind,
+                    element_indices=[1, 2, 3],
+                )["annotation_id"]
+            )
+
+        annotate("ann_mesh_only", mesh_part, ELEMENT_KIND_FACE)
+        annotate("ann_mesh_part_2", mesh_part_2, ELEMENT_KIND_FACE)
+        annotate("ann_cloud_only", cloud_part, ELEMENT_KIND_POINT)
+
+        # One claim covering both assets — it must appear under each, and is
+        # the reason the filter cannot be a partition.
+        both = annotate("ann_both_assets", mesh_part, ELEMENT_KIND_FACE)
+        pkg.attach_annotation_elements(
+            annotation_id=both,
+            asset_part_id=cloud_part,
+            element_kind=ELEMENT_KIND_POINT,
+            element_indices=[10, 11],
+        )
+
+        # No membership anywhere: belongs to no asset, so no asset lists it.
+        pkg.create_annotation(
+            annotation_uid="ann_unattached",
+            semantic_class_id=roof,
+            status="draft",
+        )
+
+        def uids(**filters) -> set[str]:
+            return {item["annotation_uid"] for item in pkg.list_annotations(**filters)}
+
+        assert uids() == {
+            "ann_mesh_only",
+            "ann_mesh_part_2",
+            "ann_cloud_only",
+            "ann_both_assets",
+            "ann_unattached",
+        }
+
+        assert uids(asset_id=mesh_asset) == {
+            "ann_mesh_only",
+            "ann_mesh_part_2",
+            "ann_both_assets",
+        }
+
+        assert uids(asset_id=cloud_asset) == {
+            "ann_cloud_only",
+            "ann_both_assets",
+        }
+
+        # asset_part_id is narrower than asset_id: the second mesh part drops
+        # out even though it is the same asset.
+        assert uids(asset_part_id=mesh_part) == {"ann_mesh_only", "ann_both_assets"}
+        assert uids(asset_part_id=mesh_part_2) == {"ann_mesh_part_2"}
+        assert uids(asset_part_id=cloud_part) == {"ann_cloud_only", "ann_both_assets"}
+
+        # Filters AND-combine, including across assets: a part of one asset
+        # and the id of the other keeps only what spans both.
+        assert uids(asset_id=cloud_asset, asset_part_id=mesh_part) == {
+            "ann_both_assets"
+        }
+
+
+def test_reverse_query_reports_the_same_identifiers_as_the_detail_read(
+    tmp_path: Path,
+) -> None:
+    # A lasso (annotations_for_elements) and a detail panel (get_annotation /
+    # list_annotations) must name the same CityObject the same way. The reverse
+    # query used to return object_uid only, so an app showing gml:id in the
+    # detail panel had nothing to show beside the lasso hit.
+    #
+    # object_uid and gml_id are deliberately different here: with them equal a
+    # column aliased to the wrong one would still pass.
+    with make_pkg(tmp_path) as pkg:
+        part = make_mesh_part(pkg)
+        seed_citygml_concepts(pkg)
+
+        roof_id = pkg.create_city_object(
+            object_uid="carrier::roof_1",
+            gml_id="GML_ROOF_1",
+        )
+
+        pkg.annotate_elements(
+            concept="RoofSurface",
+            annotation_uid="ann_reverse_identifiers",
+            asset_part_id=part,
+            element_kind=ELEMENT_KIND_FACE,
+            element_indices=[3, 4],
+            city_object_id=roof_id,
+        )
+
+        (match,) = pkg.annotations_for_elements(
+            asset_part_id=part,
+            element_kind=ELEMENT_KIND_FACE,
+            selected_indices=[4],
+        )
+
+        assert match["primary_city_object_uid"] == "carrier::roof_1"
+        assert match["primary_city_object_gml_id"] == "GML_ROOF_1"
+
+        detail = pkg.get_annotation(annotation_uid="ann_reverse_identifiers")
+        (listed,) = pkg.list_annotations(city_object_uid="carrier::roof_1")
+
+        assert detail is not None
+
+        for field in ("primary_city_object_uid", "primary_city_object_gml_id"):
+            assert match[field] == detail[field]
+            assert match[field] == listed[field]
+
+        # An annotation with no CityObject reports both as None rather than
+        # omitting the key, so the caller can branch on one shape.
+        pkg.annotate_elements(
+            concept="RoofSurface",
+            annotation_uid="ann_reverse_unlinked",
+            asset_part_id=part,
+            element_kind=ELEMENT_KIND_FACE,
+            element_indices=[9],
+        )
+
+        (unlinked,) = pkg.annotations_for_elements(
+            asset_part_id=part,
+            element_kind=ELEMENT_KIND_FACE,
+            selected_indices=[9],
+        )
+
+        assert unlinked["primary_city_object_uid"] is None
+        assert unlinked["primary_city_object_gml_id"] is None
 
 
 def test_delete_annotation_cascades_membership(tmp_path: Path) -> None:

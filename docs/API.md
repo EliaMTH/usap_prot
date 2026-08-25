@@ -69,25 +69,25 @@ supply; USAP asserts no taxonomy of its own.
 
 | Call | Does |
 |---|---|
-| `load_vocabulary_folder(pkg, path)` | seed a whole config directory: `.xsd`, `.owl`/`.ttl`, `.json` — the one-call startup path |
+| `load_vocabulary_folder(pkg, path)` | seed a whole config directory: `.xsd`, `.owl`, `.json` — the one-call startup path |
 | `load_citygml_schema(pkg, path)` | CityGML concepts **and their hierarchy** from the OGC XSDs |
-| `load_ontology(pkg, path)` | link types, their `usap:category`, and ADE classes from an ontology (`.ttl` needs `usap[ttl]`) |
+| `load_ontology(pkg, path)` | link types, their `usap:category`, and ADE classes from an ontology (**RDF/XML only**; `.ttl` and the other non-XML syntaxes raise) |
 | `seed_vocabulary_file(pkg, path)` | concepts from a JSON registry |
 | `seed_default_ade_vocabulary(pkg)` | the shipped ADE prototype registry (an example, not a standard) |
 | `create_semantic_class(scheme, class_uri, local_name, parent_class_id=None, ...)` | register one concept by hand; maintains the subclass closure |
 | `list_accepted_concepts(scheme=None, search=None, in_use=None)` | the vocabulary picker, with usage counts |
 | `resolve_semantic_class(concept, scheme=None)` | name / URI / id → `semantic_class_id`; **raises if unregistered** |
 | `get_semantic_class(concept)` / `concept_exists(concept)` | read one concept / test resolvability without raising |
-| `city_object_classes(pkg)` / `is_city_object_class(pkg, id)` | which concepts a `.gml` may instantiate as objects (importer's filter) |
+| `city_object_classes(pkg)` / `is_city_object_class(pkg, semantic_class_id)` | which concepts a `.gml` may instantiate as objects (importer's filter) |
 
 ## City objects and the link graph
 
 | Call | Does |
 |---|---|
-| `create_city_object(object_uid, semantic_class_id=None, gml_id=None, object_status="accepted", ...)` | the semantic instance a claim is about; `object_status="temporary"` marks a carrier |
+| `create_city_object(object_uid, semantic_class_id=None, gml_id=None, object_status="accepted", ...)` | the semantic instance a claim is about; `object_status="temporary"` marks a carrier. Idempotent on `object_uid`, and a repeat call supplying a field that **contradicts** the stored row raises rather than discarding it |
 | `list_city_objects(object_status=None, related_to=None, descendants_of=None, direction="out", ...)` | list, or walk the graph one hop (`related_to`) or transitively (`descendants_of`) |
 | `resolve_city_object(city_object)` | id, `object_uid`, or `gml_id` → `city_object_id` |
-| `link_city_objects(from_id, to_id, relationship_type, to_external_uri=None, role=None, ...)` | one typed directed edge; the target may be outside the package |
+| `link_city_objects(from_city_object_id, to_city_object_id, relationship_type, to_external_uri=None, role=None, ...)` | one typed directed edge; the target may be outside the package |
 | `related_city_objects(city_object, direction="out", ...)` | the **edges** touching an object — the only view showing external targets |
 | `register_relationship_type(local_name, code_space=None, category=None)` | declare a link type and whether it means *part of* |
 | `list_relationship_types(category=None)` | the link vocabulary with edge counts; `None` also lists unclassified |

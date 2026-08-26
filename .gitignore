@@ -21,6 +21,10 @@ PHASE1_BASELINE.md
 USAP_report.md
 HANDOFF_PLAN.md
 
+# One-off data-preparation scripts. Not part of the SDK: they fix up source
+# data before it is registered, and say nothing about how USAP behaves.
+utility/
+
 FW_*
 
 *.owl

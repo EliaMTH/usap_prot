@@ -1,14 +1,6 @@
 # Integration rules for the desktop application
 
-For the team building the C++ desktop application around USAP.
-
-This is not an API listing — [API.md](API.md) is that, and
-[REFERENCE.md](REFERENCE.md) is the manual. This document states the rules the
-**application** has to uphold, because USAP cannot enforce them from its side
-of the boundary. Most of them are things that fail *silently* if broken: the
-package stays valid, every query answers, and the answers are wrong.
-
-Read it once before writing integration code, and again before shipping.
+This document states the rules that an application that uses USAP has to uphold, because USAP cannot enforce them from its side of the boundary. Most of them are things that fail *silently* if broken.
 
 ---
 
@@ -17,20 +9,9 @@ Read it once before writing integration code, and again before shipping.
 USAP stores **claims**: which indexed elements of an external 3D asset are
 associated with which semantic concept, and optionally with which city object.
 
-It stores **no geometry**, does **no spatial reasoning**, and owns **no
-meaning**. It never compares coordinates, never matches a point to a face,
+It stores **no geometry**, does **no spatial reasoning**, and owns **no meaning**. It never compares coordinates, never matches a point to a face,
 never checks that two assets overlap. An element is an integer index into a
 file it does not read.
-
-The split, restated as ownership:
-
-| Layer | Owner |
-|---|---|
-| Which objects and concepts exist, their attributes, their hierarchy | the semantic source (CityGML + the vocabulary folder) |
-| Which elements of which asset are claimed as what | USAP |
-| Viewport, lasso, layer panel, CRS handling, session and project state | the application |
-
-Every rule below follows from that split.
 
 ---
 
@@ -171,9 +152,7 @@ which is how the result is routed to the right viewport layer.
 
 ## 4. Display labels
 
-`usap_annotation` has **no label column**. It was removed in 0.4.0 as a
-temporary field nobody used. Where the user stories say "label", they mean the
-concept and the object identity, composed for display:
+Where the user stories say "label", they mean the concept and the object identity, composed for display:
 
 | Case | Label |
 |---|---|

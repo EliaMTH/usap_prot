@@ -61,8 +61,9 @@ def test_build_project_package_from_config(tmp_path: Path) -> None:
     config = {
         "db_path": str(db_path),
         "manifest_path": str(manifest_path),
-        # No "schema_path"/"vocabularies": both default to the files shipped
-        # inside the package, which is what a normal install has.
+        # No "schema_path": that one does default to the shipped file, being
+        # the database schema. "vocabularies" has no default -- concepts come
+        # only from what a config names, here the CityGML XSDs.
         "citygml_schema": str(CITYGML_SCHEMA_FIXTURE),
         "citygml": {
             "path": str(citygml_path),
@@ -252,3 +253,97 @@ def test_removed_mirror_key_is_refused_not_ignored(tmp_path: Path) -> None:
 
     with pytest.raises(USAPError, match="also_usap_default"):
         build_project_package(config, base_dir=tmp_path)
+
+
+def test_a_config_naming_no_vocabulary_seeds_no_concepts(tmp_path: Path) -> None:
+    # A package starts with zero concepts and USAP asserts no taxonomy of its
+    # own -- so a build must load exactly what the config named and nothing
+    # else. 'vocabularies' used to default to the ADE registry shipped inside
+    # the package, quietly seeding 15 concepts no config asked for, which made
+    # the config describe less than the package contained.
+    _write_tiny_mesh(tmp_path / "lod2.ply")
+
+    build_project_package(
+        {
+            "db_path": "empty.usap.gpkg",
+            "meshes": [{"path": "lod2.ply", "representation_name": "m"}],
+        },
+        base_dir=tmp_path,
+    )
+
+    with USAPPackage.open(tmp_path / "empty.usap.gpkg") as pkg:
+        assert pkg.list_accepted_concepts() == []
+
+        # And the consequence is loud rather than silent: annotating against a
+        # concept nothing registered raises.
+        with pytest.raises(USAPError):
+            pkg.resolve_semantic_class("EnergyRoof")
+
+
+def test_vocabulary_folder_matches_the_key_by_key_form(tmp_path: Path) -> None:
+    # 'vocabulary_folder' is the application startup path (US-DATA-04): one
+    # directory, every source in it, dispatched by suffix. It has to seed the
+    # same package as naming those sources one key at a time, or the config
+    # path and the app path would drift.
+    folder = tmp_path / "vocabulary"
+    folder.mkdir()
+
+    for xsd in CITYGML_SCHEMA_FIXTURE.rglob("*.xsd"):
+        (folder / xsd.name).write_bytes(xsd.read_bytes())
+
+    (folder / "local.json").write_text(
+        json.dumps({"scheme": "local", "concepts": [{"local_name": "SolarPanel"}]}),
+        encoding="utf-8",
+    )
+
+    build_project_package(
+        {"db_path": str(tmp_path / "folder.usap.gpkg"),
+         "vocabulary_folder": str(folder)},
+        base_dir=tmp_path,
+    )
+    build_project_package(
+        {"db_path": str(tmp_path / "keys.usap.gpkg"),
+         "citygml_schema": str(CITYGML_SCHEMA_FIXTURE),
+         "vocabularies": [str(folder / "local.json")]},
+        base_dir=tmp_path,
+    )
+
+    def names(db: Path) -> set[str]:
+        with USAPPackage.open(db) as pkg:
+            return {c["local_name"] for c in pkg.list_accepted_concepts()}
+
+    from_folder = names(tmp_path / "folder.usap.gpkg")
+
+    assert from_folder == names(tmp_path / "keys.usap.gpkg")
+    assert {"Building", "SolarPanel"} <= from_folder
+
+
+def test_unrecognised_config_keys_are_refused(tmp_path: Path) -> None:
+    # The failure this exists for: 'annotation_batch' for 'annotation_batches'
+    # built a package with zero annotations, exit code 0, and a clean
+    # validation report. Nothing reads an unknown key, so nothing could say the
+    # intent had been dropped.
+    _write_tiny_mesh(tmp_path / "lod2.ply")
+
+    base = {
+        "db_path": str(tmp_path / "typo.usap.gpkg"),
+        "meshes": [{"path": "lod2.ply", "representation_name": "m"}],
+    }
+
+    with pytest.raises(USAPError, match="annotation_batch"):
+        build_project_package(
+            {**base, "annotation_batch": ["x.json"]}, base_dir=tmp_path)
+
+    # Nested blocks too -- a misspelled compute_hash silently left an asset
+    # unhashed, which trades away change detection without saying so.
+    with pytest.raises(USAPError, match="compute_hashh"):
+        build_project_package(
+            {**base,
+             "meshes": [{"path": "lod2.ply", "representation_name": "m",
+                         "compute_hashh": False}]},
+            base_dir=tmp_path,
+        )
+
+    # '_'-prefixed keys are comments: JSON has nowhere else to put them.
+    build_project_package(
+        {**base, "_comment": "why this config exists"}, base_dir=tmp_path)

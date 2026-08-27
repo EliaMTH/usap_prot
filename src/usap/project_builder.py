@@ -18,12 +18,51 @@ from .batch import BatchImportResult, apply_annotation_batch_file
 from .constants import DEFAULT_GRAPH_NAME
 from .core import DEFAULT_SCHEMA_PATH, USAPPackage
 from .domain_vocab import (
-    DEFAULT_ADE_VOCABULARY_PATH,
     load_citygml_schema,
+    load_vocabulary_folder,
     seed_vocabulary_file,
 )
 from .errors import USAPError
 from .geopackage import epsg_from_wkt, set_package_srs
+
+
+# Every key each block of a project config understands. A config is written by
+# hand, so a key the builder does not read is a key whose intent is silently
+# dropped -- see _check_keys and the docstring on build_project_package.
+_CONFIG_KEYS = frozenset({
+    "db_path", "schema_path", "manifest_path",
+    "srs_id", "srs_wkt", "validation_level",
+    "vocabulary_folder", "citygml_schema", "citygml_schema_version",
+    "vocabularies", "relationship_types",
+    "citygml", "las", "meshes", "annotation_batches",
+})
+_CITYGML_KEYS = frozenset({"path", "uri", "compute_hash", "graph_name",
+                           "also_usap_default"})
+_LAS_KEYS = frozenset({"path", "uri", "compute_hash", "part_path"})
+_MESH_KEYS = frozenset({"path", "uri", "representation_name",
+                        "representation_kind", "lod", "compute_hash"})
+_RELATIONSHIP_KEYS = frozenset({"local_name", "code_space", "category"})
+
+
+def _check_keys(block: dict[str, Any], known: frozenset[str], *, where: str) -> None:
+    """
+    Refuse keys this builder does not read.
+
+    Values are already validated where they are used; what escaped was the key
+    *name*. Anything starting with '_' is a comment and is skipped.
+    """
+    unknown = sorted(
+        key for key in block
+        if not key.startswith("_") and key not in known
+    )
+
+    if unknown:
+        raise USAPError(
+            f"Unrecognised key(s) in {where}: {', '.join(repr(k) for k in unknown)}. "
+            f"Known keys are: {', '.join(sorted(known))}. Nothing reads an "
+            "unknown key, so leaving it would silently drop whatever it meant; "
+            "prefix a key with '_' to keep it as a comment."
+        )
 
 
 @dataclass(frozen=True)
@@ -84,8 +123,16 @@ def build_project_package(
     at all for a fresh build, and an untouched one for update=True; without
     that, a build that died after seeding concepts but before registering
     assets left a package that looked real and was not.
+
+    Unrecognised keys raise. A config is hand-written, and a key the builder
+    never reads is a key whose intent was never carried out: 'annotation_batch'
+    for 'annotation_batches' built a package with no annotations at all, exit
+    code 0 and a clean validation report. Keys beginning with '_' are ignored,
+    the usual place to put comments in JSON.
     """
     base_path = Path(base_dir)
+
+    _check_keys(config, _CONFIG_KEYS, where="config")
 
     db_path = _resolve_path(
         require_str(config, "db_path"),
@@ -243,12 +290,37 @@ def _seed_config_vocabularies(
     """
     Load the package's concept sources, in dependency order.
 
-    'citygml_schema' comes first: it is the path to the OGC CityGML 3.0 XSDs
-    and supplies the base classes plus their substitutionGroup hierarchy.
-    USAP no longer ships a CityGML registry, so a config that imports CityGML
-    must name this. ADE and local schemes follow, since they inherit from the
-    base classes those schemas define.
+    Three ways to name them, and **nothing is loaded that the config did not
+    ask for**. A package starts with zero concepts; USAP asserts no taxonomy of
+    its own, and a build that quietly seeded one would make a config describe
+    less than the package contains.
+
+        'vocabulary_folder'  one configuration directory, dispatched by suffix
+                             (.xsd, .owl, .json) in a single pass. This is the
+                             application startup path (US-DATA-04), so a config
+                             using it exercises what the app will really do.
+        'citygml_schema'     the OGC CityGML 3.0 XSDs: base classes plus their
+                             substitutionGroup hierarchy, which no other
+                             artifact carries.
+        'vocabularies'       individual JSON concept registries.
+
+    The folder comes first, then the schema, then the JSON files: CityGML's
+    hierarchy has to exist before an ADE class can name a CityGML parent.
+    Seeding is idempotent and additive, so naming the same concepts twice is
+    harmless and only a genuine contradiction raises.
     """
+    folder = config.get("vocabulary_folder")
+
+    if folder is not None:
+        if not isinstance(folder, str):
+            raise ValueError(f"Invalid 'vocabulary_folder' path: {folder!r}")
+
+        load_vocabulary_folder(
+            pkg,
+            _resolve_path(folder, base_path=base_path, must_exist=True),
+            scheme_version=config.get("citygml_schema_version"),
+        )
+
     schema_path = config.get("citygml_schema")
 
     if schema_path is not None:
@@ -261,10 +333,10 @@ def _seed_config_vocabularies(
             scheme_version=config.get("citygml_schema_version"),
         )
 
-    vocabularies = config.get(
-        "vocabularies",
-        [str(DEFAULT_ADE_VOCABULARY_PATH)],
-    )
+    # Deliberately no default. Falling back to the ADE registry that ships
+    # inside the package used to seed 15 concepts nobody named, which is the
+    # one thing this loader must not do -- and which batch.py already avoids.
+    vocabularies = config.get("vocabularies", [])
 
     if not isinstance(vocabularies, list):
         raise ValueError("'vocabularies' must be a list.")
@@ -310,6 +382,8 @@ def _register_config_relationship_types(
     for item in items:
         if not isinstance(item, dict):
             raise ValueError(f"Invalid relationship type entry: {item!r}")
+
+        _check_keys(item, _RELATIONSHIP_KEYS, where="a 'relationship_types' entry")
 
         local_name = item.get("local_name")
 
@@ -368,6 +442,8 @@ def _import_config_citygml(
     if not isinstance(citygml, dict):
         raise ValueError("'citygml' must be an object when provided.")
 
+    _check_keys(citygml, _CITYGML_KEYS, where="the 'citygml' block")
+
     path = _resolve_path(
         require_str(citygml, "path"),
         base_path=base_path,
@@ -413,6 +489,8 @@ def _register_config_las(
         if not isinstance(item, dict):
             raise ValueError(f"Invalid LAS entry: {item!r}")
 
+        _check_keys(item, _LAS_KEYS, where="a 'las' entry")
+
         path = _resolve_path(
             require_str(item, "path"),
             base_path=base_path,
@@ -448,6 +526,8 @@ def _register_config_meshes(
     for item in items:
         if not isinstance(item, dict):
             raise ValueError(f"Invalid mesh entry: {item!r}")
+
+        _check_keys(item, _MESH_KEYS, where="a 'meshes' entry")
 
         path = _resolve_path(
             require_str(item, "path"),

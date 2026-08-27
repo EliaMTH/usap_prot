@@ -617,6 +617,21 @@ def test_list_assets_and_parts(pkg: USAPPackage) -> None:
     # unfiltered lists every part across assets
     assert len(pkg.list_asset_parts()) == 3
 
+    # indexing_profile has to come back: it is the field saying what the
+    # stored indices mean, and an application comparing it against its own
+    # loader is how a mismatched reader gets caught at all.
+    profiled = pkg.register_asset_part(
+        asset_id=mesh_id,
+        part_path="geometry/2",
+        element_kind=ELEMENT_KIND_FACE,
+        element_count=3,
+        indexing_profile="usap:ply-face-record-order-v1",
+    )
+    by_id = {p["asset_part_id"]: p for p in pkg.list_asset_parts()}
+
+    assert by_id[profiled]["indexing_profile"] == "usap:ply-face-record-order-v1"
+    assert by_id[mesh_parts[0]["asset_part_id"]]["indexing_profile"] is None
+
 
 def test_list_city_objects_and_children(pkg: USAPPackage) -> None:
     # A UI populates an object tree: list all objects, filter carriers, and
@@ -856,3 +871,59 @@ def test_open_refuses_an_unsupported_profile_version(tmp_path: Path) -> None:
 
     with pytest.raises(USAPError, match="Unsupported USAP profile version"):
         USAPPackage.open(db_path)
+
+
+def test_elements_for_city_objects_is_the_call_an_app_owns_its_tree_uses(
+    pkg: USAPPackage,
+) -> None:
+    # The plural call exists for the integration where the object hierarchy
+    # lives outside USAP: the application walks its own CityGML tree and asks
+    # for the whole subtree's elements in one go. HANDOFF.md tells the app to
+    # use only this form, so it needs to hold up without a link graph, which is
+    # exactly the state a carrier-only package is in.
+    part = make_mesh_part(pkg, element_count=200)
+    roof = pkg.create_semantic_class(
+        scheme="s", class_uri="s:Roof", local_name="Roof")
+
+    building = pkg.create_city_object(object_uid="b1", object_status="temporary")
+    roof_1 = pkg.create_city_object(object_uid="b1_roof_1",
+                                    object_status="temporary")
+    wall_1 = pkg.create_city_object(object_uid="b1_wall_1",
+                                    object_status="temporary")
+
+    # No link_city_objects anywhere: carriers only, so the graph is empty.
+    assert pkg.list_city_objects(related_to="b1") == []
+
+    for uid, obj, faces in (("ann_roof", roof_1, [1, 2]),
+                            ("ann_wall", wall_1, [3, 4])):
+        pkg.annotate_elements(concept=roof, annotation_uid=uid,
+                              city_object_id=obj, asset_part_id=part,
+                              element_kind=ELEMENT_KIND_FACE,
+                              element_indices=faces)
+
+    # The singular call is the footgun: it looks like it asks for the subtree
+    # and answers for the building alone, silently.
+    assert pkg.elements_for_city_object("b1", expand=True) == []
+
+    # The plural call, given the tree the application already knows, reaches
+    # every element.
+    blocks = pkg.elements_for_city_objects(
+        ["b1", "b1_roof_1", "b1_wall_1"], expand=True)
+
+    assert {i for b in blocks for i in b["elements"]} == {1, 2, 3, 4}
+
+    # Every block names the part it belongs to, which is how a caller routes
+    # the result to the right viewport layer.
+    assert all(b["asset_part_id"] == part for b in blocks)
+
+    # One annotation reached through two of the given objects is returned
+    # once, not twice: blocks are keyed on membership_block_id.
+    pkg.link_annotation_to_object(
+        annotation_id=int(pkg.get_annotation(annotation_uid="ann_roof")["annotation_id"]),
+        city_object_id=building,
+    )
+
+    shared = pkg.elements_for_city_objects(["b1", "b1_roof_1"], expand=True)
+
+    assert len(shared) == len({b["membership_block_id"] for b in shared})
+    assert {i for b in shared for i in b["elements"]} == {1, 2}

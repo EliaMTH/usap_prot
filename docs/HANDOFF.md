@@ -73,6 +73,22 @@ elements and nothing inside the package can tell.
 Pass a `content_hash` at registration, or `verify_assets` can only ever report
 `unhashed`.
 
+**Register assets under a uri relative to the package, not an absolute path.**
+A relative uri is resolved against the directory holding the `.usap.gpkg` — the
+rule glTF uses for external buffers and 3D Tiles for tileset content — so a
+project folder can be moved, renamed, copied to another machine or handed to
+someone else and every asset still verifies. An absolute path is used as given,
+which bakes one machine's layout into the package and makes `verify_assets`
+report `missing` everywhere else.
+
+```python
+pkg.register_asset(uri="catania.obj", ...)          # beside the package
+pkg.register_asset(uri="meshes/catania.obj", ...)   # in a subfolder
+```
+
+The uri is also the string an annotation batch references as `asset_uri`, so
+whatever you choose here is what the rest of the pipeline names the asset by.
+
 ---
 
 ## 2. City objects are identity anchors, nothing else

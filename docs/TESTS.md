@@ -74,6 +74,14 @@ rather than depending on the full OGC distribution.
 - `test_list_assets_and_parts` — the enumeration an application's layer panel
   runs: every registered asset with its part and element counts, filtered by
   kind, then drilled into one asset's parts.
+- `test_elements_for_city_objects_is_the_call_an_app_owns_its_tree_uses` — the
+  plural call, for the integration where the object hierarchy lives outside
+  USAP. `docs/HANDOFF.md` tells the application to use only this form, so it is
+  tested in the state that makes the singular form dangerous: a carrier-only
+  package with an empty link graph, where `elements_for_city_object("b1")`
+  returns nothing while looking like it asked for the subtree. Also pins that
+  blocks carry `asset_part_id` for viewport routing, and that an annotation
+  reached through two of the given objects is returned once.
 - `test_list_city_objects_and_children` — the same for an object tree: list
   all, filter to carriers (`object_status="temporary"` — the alignment hook),
   and expand a node to its direct children by id or by uid.
@@ -432,6 +440,22 @@ End-to-end tests of the three INGESTION.md procedures:
   real to everything downstream, so a failed build must leave nothing.
 - `test_failed_update_leaves_the_previous_package_intact` — an `update=True`
   failure must not half-modify a package someone already has.
+- `test_a_config_naming_no_vocabulary_seeds_no_concepts` — a package starts with
+  zero concepts and USAP asserts no taxonomy of its own, so a build must load
+  exactly what the config named. `vocabularies` used to default to the ADE
+  registry shipped inside the package, quietly seeding 15 concepts nobody asked
+  for — which made the config describe less than the package contained. Also
+  pins the consequence as loud: resolving an unregistered concept raises.
+- `test_vocabulary_folder_matches_the_key_by_key_form` — `vocabulary_folder` is
+  the application startup path (US-DATA-04): one directory, dispatched by
+  suffix in a single pass. It has to seed the same package as naming those
+  sources one key at a time, or the config path and the app path would drift.
+- `test_unrecognised_config_keys_are_refused` — the failure this exists for:
+  `annotation_batch` for `annotation_batches` built a package with zero
+  annotations, exit code 0 and a clean validation report, because nothing reads
+  an unknown key and so nothing could say the intent had been dropped. Covers a
+  top-level key, a nested one (`compute_hashh`, which silently left an asset
+  unhashed), and that `_`-prefixed keys still pass as comments.
 - `test_removed_mirror_key_is_refused_not_ignored` — `also_usap_default`
   switched off a mirror graph that no longer exists. Ignoring a retired config
   key would leave the file asserting behaviour the build does not perform, so
@@ -614,6 +638,13 @@ Each test corrupts one invariant and asserts `validate_report()` names it:
   and must not claim to.
 - `test_verify_assets_reports_unhashed_assets` — registering without a hash
   trades away change detection, and that trade has to be visible.
+- `test_relative_asset_uri_resolves_against_the_package` — a relative uri is
+  relative to the package making the reference, not to the caller's working
+  directory: the rule glTF applies to external buffers and 3D Tiles to tileset
+  content. The test moves a package and its asset together, from an unrelated
+  cwd, and asserts they still verify — then that a real change is still caught
+  through the same path. Without this, a package and its assets cannot be
+  moved, and "does this file still match" depends on where you stood.
 - `test_validation_catches_primary_object_without_represents_link` — an
   annotation whose `primary_city_object_id` has no matching `represents` link
   is reported as an **error** (`ANNOTATION_PRIMARY_OBJECT_LINK_MISSING`):

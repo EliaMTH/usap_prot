@@ -1,7 +1,11 @@
 {
   "db_path": "../outputs/example_project.usap.gpkg",
   "manifest_path": "../outputs/example_project_manifest.json",
+  "_comment_vocabulary": "Concept sources are named explicitly: nothing is loaded that a config did not ask for, so a package built from this file contains exactly these concepts and no others. Alternatively drop both keys and use \"vocabulary_folder\": \"<one directory>\", which ingests .xsd/.owl/.json in a single pass -- the path an application takes at startup.",
   "citygml_schema": "../citygml-3.0-schemas",
+  "vocabularies": [
+    "../src/usap/data/vocabularies/usap_ade_prototype.json"
+  ],
   "relationship_types": [
     {
       "local_name": "boundary",

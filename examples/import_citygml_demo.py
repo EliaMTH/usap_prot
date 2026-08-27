@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 
+import _bootstrap  # noqa: F401  -- puts src/ on sys.path from a checkout
+
 from usap import USAPPackage, import_citygml_semantics, load_citygml_schema
 
 

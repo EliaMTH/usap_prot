@@ -14,7 +14,7 @@ from usap import (
     create_synthetic_package,
     validate_connection,
 )
-from usap._util import sha256_file
+from usap._util import canonical_hash, sha256_file
 from usap.validation import verify_assets
 
 
@@ -355,6 +355,45 @@ def test_external_level_detects_changed_asset(tmp_path: Path) -> None:
         asset_path.unlink()
 
         assert "ASSET_FILE_MISSING" in _codes(pkg.validate_report(level="external"))
+
+
+def test_relative_asset_uri_resolves_against_the_package(tmp_path: Path) -> None:
+    # A relative uri is relative to the package that makes the reference, not
+    # to whatever directory the process happens to be in -- the rule glTF uses
+    # for external buffers and 3D Tiles for tileset content. Without it a
+    # package and its assets cannot be moved, and "does this file still match"
+    # depends on the caller's cwd.
+    import os
+    import shutil
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "area.las").write_bytes(b"payload")
+
+    with USAPPackage.create(project / "p.usap.gpkg", overwrite=True) as pkg:
+        pkg.register_asset(
+            uri="area.las",                       # bare filename, beside the package
+            asset_kind="pointcloud",
+            content_hash=canonical_hash(project / "area.las"),
+        )
+        assert [r["status"] for r in verify_assets(pkg.conn)] == ["ok"]
+
+    # Moved as a unit, from an unrelated working directory: still ok.
+    moved = tmp_path / "somewhere" / "else"
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(project), str(moved))
+
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        with USAPPackage.open(moved / "p.usap.gpkg") as pkg:
+            assert [r["status"] for r in verify_assets(pkg.conn)] == ["ok"]
+
+            # And a real change is still detected through the same path.
+            (moved / "area.las").write_bytes(b"different payload")
+            assert [r["status"] for r in verify_assets(pkg.conn)] == ["changed"]
+    finally:
+        os.chdir(cwd)
 
 
 def test_verify_assets_reports_unhashed_assets(tmp_path: Path) -> None:

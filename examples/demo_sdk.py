@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import _bootstrap  # noqa: F401  -- puts src/ on sys.path from a checkout
+
 from usap import ELEMENT_KIND_FACE, USAPPackage
 from usap.constants import (
     CITYGML_3_0_BUILDING_NS,

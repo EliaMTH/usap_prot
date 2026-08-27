@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 
+import _bootstrap  # noqa: F401  -- puts src/ on sys.path from a checkout
+
 from usap import (
     ELEMENT_KIND_FACE,
     ELEMENT_KIND_POINT,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 
+import _bootstrap  # noqa: F401  -- puts src/ on sys.path from a checkout
+
 from usap import VALIDATION_LEVELS, USAPPackage
 
 

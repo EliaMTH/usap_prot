@@ -1123,6 +1123,7 @@ class USAPPackage:
                 element_kind,
                 element_count,
                 index_origin,
+                indexing_profile,
                 minx, miny, minz,
                 maxx, maxy, maxz
             FROM usap_asset_part
@@ -3931,6 +3932,20 @@ class USAPPackage:
         the graph is typed, so a peer edge (adjacentTo, predecessor, ...) must
         NOT make its target's annotations answer for the source object. Name
         types explicitly to override, or pass an empty sequence to walk none.
+
+        **include_descendants defaults to True, and expands over the link graph
+        stored in this package.** A package built without importing a semantic
+        source has no such graph: city objects created on demand as identity
+        carriers have no edges between them. The expansion then finds no
+        descendants and this returns the object's own elements alone -- no
+        error, no warning, because an object with no children is a normal
+        thing. So "this Building and its surfaces" silently becomes "this
+        Building", which is indistinguishable from a correct answer.
+
+        An application that owns the hierarchy elsewhere -- a CityGML document
+        it parsed itself -- should walk that hierarchy and pass the resulting
+        set to elements_for_city_objects() instead of relying on this
+        expansion. See docs/HANDOFF.md.
         """
         relation_types = tuple(link_types)
 

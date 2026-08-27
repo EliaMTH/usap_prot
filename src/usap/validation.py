@@ -1340,6 +1340,38 @@ def _validate_annotation_domain(
         )
 
 
+def _package_directory(conn: sqlite3.Connection) -> Path | None:
+    """
+    The directory holding this package's file, or None for an in-memory one.
+
+    sqlite3 knows where its own database lives, which is what lets a relative
+    asset uri be resolved against the package rather than the process's working
+    directory.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error:
+        return None
+
+    for row in rows:
+        # (seq, name, file) — 'main' is the attached package; file is '' when
+        # the connection is in-memory.
+        if row[1] == "main" and row[2]:
+            return Path(row[2]).resolve().parent
+
+    return None
+
+
+def _resolve_asset_uri(uri: str, base: Path | None) -> Path:
+    """Where an asset uri points, relative uris being relative to the package."""
+    path = Path(uri)
+
+    if base is None or path.is_absolute():
+        return path
+
+    return base / path
+
+
 def verify_assets(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """
     Re-check every registered asset file against what was recorded for it.
@@ -1356,6 +1388,12 @@ def verify_assets(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     own. Hashing is a full read of the file, so this is never part of a
     normal validate_report() — it is the 'external' level, or call it
     directly.
+
+    A **relative** uri is resolved against the directory holding the package,
+    not the working directory, so a package and its assets can be moved or
+    renamed together and still verify. This is the same rule glTF applies to
+    external buffers and 3D Tiles to tileset content: a relative reference is
+    relative to the file that makes it. Absolute uris are used as given.
     """
     rows = conn.execute(
         """
@@ -1365,12 +1403,13 @@ def verify_assets(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         """
     ).fetchall()
 
+    base = _package_directory(conn)
     results: list[dict[str, Any]] = []
 
     for row in rows:
         uri = row["uri"]
         recorded_hash = row["content_hash"]
-        path = Path(uri)
+        path = _resolve_asset_uri(uri, base)
 
         recorded = parse_content_hash(recorded_hash)
 

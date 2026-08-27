@@ -108,6 +108,10 @@ lxml USAP already depends on. A `.ttl` (or `.n3` / `.nt` / `.trig` /
 `.jsonld`) is refused with a "convert to RDF/XML" message — including inside a
 configuration folder, where being passed over would show up as "no concepts".
 
+Installing is not required to try the SDK: the scripts under `examples/` put
+`src/` on `sys.path` themselves when `usap` is not already importable, so they
+run straight from a clone. An installed copy always wins.
+
 Run the test suite (described in [TESTS.md](TESTS.md)):
 
 ```bash
@@ -367,7 +371,15 @@ and no validation level will notice. Registering through the generic
 render buffers* makes count and order agree by construction — and sidesteps the
 mesh adapter's `.glb`/`.gltf` refusal, since the adapter is then not involved.
 Record the convention in `indexing_profile`; `validate_report()` warns
-`ASSET_PART_NO_INDEXING_PROFILE` when an annotated part declares none.
+`ASSET_PART_NO_INDEXING_PROFILE` when an annotated part declares none, and
+`list_asset_parts()` returns it so an application can compare it against what
+its own loader would produce.
+
+**Register under a uri relative to the package.** It is resolved against the
+directory holding the `.usap.gpkg`, so a project folder can be moved, copied to
+another machine, or handed to someone else and every asset still verifies. An
+absolute path records one machine's layout and reports `missing` on every
+other. The uri is also what an annotation batch names the asset by.
 
 **City objects need not come from CityGML.** When the semantic source belongs to
 another system, create carriers on demand —
@@ -572,7 +584,11 @@ src/usap/data/vocabularies/local_minimal_example.json
 ```
 
 The ADE one is reachable in code as `DEFAULT_ADE_VOCABULARY_PATH`
-(`usap.domain_vocab`), so config files need not name it by path.
+(`usap.domain_vocab`), and `seed_default_ade_vocabulary(pkg)` loads it in one
+call. Both are **explicit**: a project config that wants these concepts must
+name the file in `"vocabularies"`, or put a copy in its `"vocabulary_folder"`.
+Nothing seeds them on a caller's behalf — which is what "seeds only what you
+ask for" above has to mean to be worth anything.
 
 **No CityGML registry ships.** There used to be a hand-written
 `citygml_3_0_mvp.json`, and every error it accumulated came from being
@@ -709,8 +725,22 @@ Key notes:
   LAS files' CRS WKT is promoted automatically when they all agree; otherwise
   the layer stays in the undefined SRS (−1), which is honest for
   local-coordinate meshes.
-- `"schema_path"` / `"vocabularies"` are optional; both default to the files
-  shipped inside the package.
+- `"vocabulary_folder"` — one configuration directory, ingested by
+  `load_vocabulary_folder` in a single pass (`.xsd`, `.owl`, `.json`). This is
+  the path an application takes at startup, so a config using it exercises what
+  the application will really do. It can be combined with the two keys below;
+  the folder is loaded first.
+- **Concept sources are never implicit.** `"citygml_schema"` and
+  `"vocabularies"` have no defaults: a config that names no vocabulary builds a
+  package with **zero concepts**, and annotating against an unregistered
+  concept then raises. Anything else would let the package contain a taxonomy
+  the config never mentioned. (`"schema_path"` *is* optional and defaults to
+  the shipped file — that one is the database schema, not a vocabulary.)
+- **Unrecognised keys raise**, at the top level and inside `citygml`, `las`,
+  `meshes` and `relationship_types` entries. A config is written by hand, and a
+  key nothing reads is a key whose intent was dropped: `"annotation_batch"` for
+  `"annotation_batches"` used to build a package with no annotations at all,
+  successfully. Keys beginning with `_` are ignored, for comments.
 - `"validation_level"` — the level the build validates at before committing
   (`deep` by default; see Validation).
 - the whole build is **one transaction**: on failure a fresh build leaves no
@@ -1341,6 +1371,14 @@ report. Note what this does **not** do: USAP can detect that a file changed,
 but it cannot rebind annotations to it — element indices into the new file
 may mean something entirely different. Re-register the new version as its own
 asset.
+
+**Where an asset uri points.** A relative `uri` is resolved against the
+directory holding the package, not the process's working directory, so a
+package and its assets can be moved or renamed together and still verify — the
+rule glTF applies to external buffers and 3D Tiles to tileset content. An
+absolute uri is used as given. Registering `uri="area.las"` beside the package
+is therefore portable; registering `/home/me/data/area.las` records one
+machine's layout, and reports `missing` on every other.
 
 `build_project_package` validates at `deep` before committing; set
 `"validation_level"` in the project config to change that.

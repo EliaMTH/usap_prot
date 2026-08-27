@@ -47,7 +47,7 @@ anything relative to a part.
 | `register_asset_part(asset_id, part_path, element_kind, element_count, ..., indexing_profile=None)` | declare an index space and its element count |
 | `update_asset(asset_id, uri=..., content_hash=..., srs_id=..., ...)` | repair a record about the same file (a moved path); never re-indexes |
 | `list_assets(asset_kind=None)` | registered assets with part and element counts |
-| `list_asset_parts(asset_id=None)` | the index spaces of an asset |
+| `list_asset_parts(asset_id=None)` | the index spaces of an asset, with `element_count`, bounds and `indexing_profile` |
 | `resolve_asset(asset)` | asset id or uri → `asset_id` |
 | `resolve_asset_part(asset_part, part_path=None)` | id, or asset uri (+ part path) → `asset_part_id` |
 
@@ -148,7 +148,7 @@ implicitly and behave exactly as before they existed.
 
 | Call | Does |
 |---|---|
-| `build_project_package_from_file(config_path, overwrite=True, update=False)` | build a whole package from one JSON config (assets + vocabularies + batches) |
+| `build_project_package_from_file(config_path, overwrite=True, update=False)` | build a whole package from one JSON config (assets + vocabularies + batches). Concept sources are never implicit and unrecognised keys raise |
 | `build_project_package(config, base_dir=".", update=False)` | the same, from a config already in memory |
 | `apply_annotation_batch_file(pkg, path, replace_existing=False)` | apply a JSON annotation batch to an existing package |
 | `apply_annotation_batch(pkg, data, replace_existing=False)` | the same, from a dict |
@@ -160,7 +160,7 @@ implicitly and behave exactly as before they existed.
 |---|---|
 | `pkg.validate_report(level="deep")` | integrity check — `basic` (SQL only), `deep` (+ payloads), `external` (+ files on disk) |
 | `validate_connection(conn, level="deep")` | the same against a raw connection |
-| `verify_assets(conn)` | per asset: `ok` / `missing` / `changed` / `unhashed` |
+| `verify_assets(conn)` | per asset: `ok` / `missing` / `changed` / `unhashed`. A **relative** `uri` resolves against the package's own directory, so a package moves with its assets |
 | `read_geopackage_header(conn)` | application id and user version, to confirm the file is a GeoPackage |
 | `set_package_srs(conn, srs_id, definition_wkt=None)` | declare the package's CRS (re-stamps; never transforms coordinates) |
 | `epsg_from_wkt(wkt)` | best-effort EPSG code from a CRS WKT (needs `usap[crs]`) |

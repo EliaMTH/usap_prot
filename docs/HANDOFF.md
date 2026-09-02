@@ -123,7 +123,7 @@ The object's class belongs to the CityGML (`RoofSurface`). The annotation's
 concept is usually something else (`EnergyRoof`). They are different facts
 about different things, and the second one belongs on the annotation.
 
-Pass `semantic_class_id=None` when creating carriers. As of 0.4.1, passing a
+Pass `semantic_class_id=None` when creating carriers. As of 0.4.2, passing a
 *different* class for an existing `object_uid` raises rather than discarding it
 — but the fix is to not pass one, not to catch the error.
 
@@ -212,7 +212,7 @@ geometry, not of an object.
 All three read paths — `get_annotation`, `list_annotations`,
 `annotations_for_elements` — return both `primary_city_object_uid` and
 `primary_city_object_gml_id`, so the lasso result list and the detail panel can
-render the identical string. (Before 0.4.1 the reverse query returned only the
+render the identical string. (Before 0.4.2 the reverse query returned only the
 uid; if you are reading an older build, that is why.)
 
 Uniqueness of displayed labels is the application's problem. Two annotations

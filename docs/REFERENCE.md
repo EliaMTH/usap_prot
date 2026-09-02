@@ -344,7 +344,7 @@ a coverage no single evaluation ever claimed.
 Each entry carries both `primary_city_object_uid` and
 `primary_city_object_gml_id`, the same pair `get_annotation` and
 `list_annotations` return, so a selection list and a detail panel name the same
-object identically. (Added in 0.4.1; before that the reverse query returned the
+object identically. (Added in 0.4.2; before that the reverse query returned the
 uid alone.) Both are `None` for an annotation with no city object — the normal
 case for a free lasso claim, and for every value field.
 
@@ -424,7 +424,7 @@ own hierarchy and passes the set to `elements_for_city_objects([...])`.
 in the semantic source, by the same division of authority that keeps attributes
 there. This matters because an annotation's concept (`EnergyRoof`) is usually
 *not* the object's class (`RoofSurface`), so passing the former here is an easy
-mistake — one that used to be swallowed, and since 0.4.1 raises. Idempotency on
+mistake — one that used to be swallowed, and since 0.4.2 raises. Idempotency on
 `object_uid` compares only the fields a call actually supplies, so the bare
 `create_city_object(uid)` lookup keeps working against a populated row.
 

@@ -177,6 +177,84 @@ def write_tiny_mesh(path: Path) -> None:
     mesh.export(path)
 
 
+# ---------------------------------------------------------------------------
+# Real-data fixtures.
+#
+# Everything above builds its own input: a 2-triangle mesh, a 10-point LAS, a
+# 7-file XSD subset. That keeps the suite hermetic, but it means no test ever
+# reaches the paths only real files reach -- block splitting past
+# DEFAULT_BLOCK_SIZE, a 22-XSD vocabulary, a reverse query over 100k indices.
+#
+# --realdata-dir points at a directory holding real ones. Absent, every fixture
+# below skips, so the default run is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--realdata-dir",
+        action="store",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Directory holding real assets (a mesh, a point cloud of the same "
+            "area, a .gml, and a vocabulary/ folder). Enables tests/"
+            "test_realdata.py; without it those tests skip."
+        ),
+    )
+
+
+@pytest.fixture(scope="session")
+def realdata_dir(request: pytest.FixtureRequest) -> Path:
+    raw = request.config.getoption("--realdata-dir")
+
+    if not raw:
+        pytest.skip("needs --realdata-dir")
+
+    path = Path(raw).resolve()
+
+    if not path.is_dir():
+        pytest.skip(f"--realdata-dir {path} is not a directory")
+
+    return path
+
+
+def _one(realdata_dir: Path, *candidates: str) -> Path:
+    """The first candidate that exists, or skip naming all of them."""
+    for name in candidates:
+        candidate = realdata_dir / name
+
+        if candidate.exists():
+            return candidate
+
+    pytest.skip(f"none of {candidates} found in {realdata_dir}")
+
+
+@pytest.fixture(scope="session")
+def real_mesh_path(realdata_dir: Path) -> Path:
+    return _one(realdata_dir, "catania.obj")
+
+
+@pytest.fixture(scope="session")
+def real_las_path(realdata_dir: Path) -> Path:
+    return _one(realdata_dir, "catania.las")
+
+
+@pytest.fixture(scope="session")
+def real_citygml_path(realdata_dir: Path) -> Path:
+    return _one(realdata_dir, "catania_ids.gml", "catania.gml")
+
+
+@pytest.fixture(scope="session")
+def real_vocabulary_dir(realdata_dir: Path) -> Path:
+    return _one(realdata_dir, "vocabulary")
+
+
+@pytest.fixture(scope="session")
+def real_batch_path(realdata_dir: Path) -> Path:
+    return _one(realdata_dir, "batches/catania_annotations.json")
+
+
 # The same categories as a project-config fragment, for builds driven by
 # build_project_package_from_file rather than by SDK calls.
 CITYGML_CONTAINMENT_CONFIG = [
@@ -185,3 +263,92 @@ CITYGML_CONTAINMENT_CONFIG = [
         CITYGML_3_0_RELATIONSHIP_CATEGORIES.items()
     )
 ]
+
+
+# The real package is expensive to build (~60 s), so it is built once per
+# session and handed to tests as a cheap copy. The copy lives beside the staged
+# assets rather than in the test's own tmp_path, because asset uris are
+# package-relative: a package moved away from its assets resolves them from the
+# wrong directory and verify_assets reports 'missing'.
+REAL_PACKAGE_NAME = "real.usap.gpkg"
+
+
+@pytest.fixture(scope="session")
+def real_package_dir(
+    tmp_path_factory: pytest.TempPathFactory,
+    real_mesh_path: Path,
+    real_las_path: Path,
+    real_citygml_path: Path,
+    real_vocabulary_dir: Path,
+    real_batch_path: Path,
+) -> Path:
+    """
+    A staging copy of the real files, with a package built beside them.
+
+    Copying (~1.2 s for 150 MB on a local disk) buys isolation -- no test writes
+    into the caller's --realdata-dir -- and lets the build use bare-filename
+    uris, which is the resolution path a delivered package actually uses.
+    """
+    import shutil
+
+    from usap import build_project_package
+
+    staged = tmp_path_factory.mktemp("realdata")
+
+    for source in (real_mesh_path, real_las_path, real_citygml_path):
+        shutil.copy2(source, staged / source.name)
+
+    shutil.copytree(real_vocabulary_dir, staged / "vocabulary")
+    shutil.copy2(real_batch_path, staged / "batch.json")
+
+    build_project_package(
+        {
+            "db_path": REAL_PACKAGE_NAME,
+            "vocabulary_folder": "vocabulary",
+            "citygml_schema_version": "3.0",
+            "relationship_types": CITYGML_CONTAINMENT_CONFIG,
+            "citygml": {
+                "path": real_citygml_path.name,
+                "uri": real_citygml_path.name,
+                "compute_hash": False,
+            },
+            "las": [
+                {
+                    "path": real_las_path.name,
+                    "uri": real_las_path.name,
+                    "part_path": "points/all",
+                    "compute_hash": True,
+                }
+            ],
+            "meshes": [
+                {
+                    "path": real_mesh_path.name,
+                    "uri": real_mesh_path.name,
+                    "representation_name": "real_lod1",
+                    "representation_kind": "building_mesh",
+                    "compute_hash": True,
+                }
+            ],
+            "annotation_batches": ["batch.json"],
+            "validation_level": "deep",
+        },
+        base_dir=staged,
+    )
+
+    return staged
+
+
+@pytest.fixture
+def real_package(real_package_dir: Path, request) -> Iterator[USAPPackage]:
+    """An isolated copy of the session package, safe to mutate."""
+    import shutil
+
+    name = f"copy_{abs(hash(request.node.nodeid)) % 10**8}.usap.gpkg"
+    copy = real_package_dir / name
+    shutil.copy2(real_package_dir / REAL_PACKAGE_NAME, copy)
+
+    try:
+        with USAPPackage.open(copy) as pkg:
+            yield pkg
+    finally:
+        copy.unlink(missing_ok=True)

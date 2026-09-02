@@ -29,6 +29,13 @@ A CityGML source may contain its own geometry, but this workflow does not copy o
 
 City-object names in the linking JSON are the **`gml:id` values** from the CityGML file. Objects, their classes, and their relationships come from the CityGML import — which needs `citygml_schema` in the config, since USAP ships no CityGML vocabulary, and a `relationship_types` block to say which links mean *part of*; the linking JSON only states which elements in the registered operational assets correspond to which authoritative city object.
 
+The block below declares one type because a LOD1 building model produces one.
+For the full CityGML 3.0 mapping — which of the thirteen relation properties
+mean *part of*, and which are peers, generalizations or groupings — see
+REFERENCE.md → *City object relationships* → **What to assert, for CityGML
+3.0**. Declaring a type your documents never use is harmless; omitting one they
+do use leaves those edges unclassified, so "and its parts" silently skips them.
+
 `project.json`:
 ```json
 {

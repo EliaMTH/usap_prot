@@ -164,6 +164,35 @@ Blocks come back de-duplicated by `membership_block_id`, so an annotation
 reached through two objects appears once. Each block names its `asset_part_id`,
 which is how the result is routed to the right viewport layer.
 
+### 3.1 If you ever do build a link graph, classify it
+
+Carrier-only mode has no edges, so this does not arise there. It arises the
+moment a package is built by importing a CityGML — which is what
+`build_project_package` does, and what any package handed to you was probably
+made with.
+
+An imported edge records the property name it came from (`boundary`), but
+**nothing in CityGML says which properties mean *part of***. Until a link type
+is classified, its edges are stored and queryable by name and skipped by every
+subtree query, and `validate_report()` reports
+`UNCLASSIFIED_RELATIONSHIP_TYPE`.
+
+Project configs declare this in a `relationship_types` block. **The application
+has no config**, so it must assert the same thing directly:
+
+```python
+pkg.register_relationship_type(
+    "boundary",
+    code_space="http://www.opengis.net/citygml/3.0",
+    category="containment",
+)
+```
+
+REFERENCE.md → *City object relationships* → **What to assert, for CityGML
+3.0** carries the full thirteen-property mapping. Assert once, at build; the
+category is stored on `usap_relationship_type` and survives close/reopen.
+Re-asserting a *different* non-NULL category raises rather than overwriting.
+
 ---
 
 ## 4. Display labels

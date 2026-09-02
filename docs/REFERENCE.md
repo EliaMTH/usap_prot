@@ -220,6 +220,37 @@ block). Until something does, an imported edge is stored, queryable by name,
 and reported as `UNCLASSIFIED_RELATIONSHIP_TYPE` — never silently treated as
 containment.
 
+**What to assert, for CityGML 3.0.** USAP not shipping this is a statement
+about *authority*, not a reason to make every project re-derive it from the
+spec. The reading below is the one USAP's own suite uses; take it as a starting
+point and change whatever your data means differently.
+
+| Property | Module namespace | Category |
+|---|---|---|
+| `boundary` | `…/citygml/3.0` | `containment` |
+| `relatedTo` | `…/citygml/3.0` | `peer` |
+| `generalizesTo` | `…/citygml/3.0` | `generalization` |
+| `filling` | `…/citygml/construction/3.0` | `containment` |
+| `fillingSurface` | `…/citygml/construction/3.0` | `containment` |
+| `buildingPart` | `…/citygml/building/3.0` | `containment` |
+| `buildingRoom` | `…/citygml/building/3.0` | `containment` |
+| `buildingInstallation` | `…/citygml/building/3.0` | `containment` |
+| `buildingConstructiveElement` | `…/citygml/building/3.0` | `containment` |
+| `buildingFurniture` | `…/citygml/building/3.0` | `containment` |
+| `buildingSubdivision` | `…/citygml/building/3.0` | `containment` |
+| `groupMember` | `…/citygml/cityobjectgroup/3.0` | `grouping` |
+| `parent` | `…/citygml/cityobjectgroup/3.0` | `grouping` |
+
+Namespaces are written in full in a config; the elided prefix is
+`http://www.opengis.net/`. Only the properties your documents actually use
+matter — a LOD1 building model typically produces `boundary` alone, and
+declaring types no edge ever references is harmless but pointless.
+
+Assert them once, at build time. `category` is a column on
+`usap_relationship_type`, so a package keeps its classification and a later
+`open()` repeats nothing. Re-asserting a *different* non-NULL category raises
+rather than overwriting, so a package cannot be quietly reclassified.
+
 Containment must be acyclic — a cycle would make an object its own part, and
 `validate_report()` flags it as `CITY_OBJECT_GRAPH_CYCLE`. A cycle of peer
 edges is legitimate and is not flagged.

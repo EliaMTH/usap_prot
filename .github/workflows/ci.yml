@@ -124,3 +124,23 @@ jobs:
 
           print("clean wheel install OK")
           PY
+
+      # The wheel installs a console script (pyproject [project.scripts]).
+      # tests/test_cli.py calls cli.main() directly, which cannot catch a
+      # broken entry point -- a typo in the target would ship green. This is
+      # the only place the installed command is actually invoked, and the
+      # package the step above just built is right there to point it at.
+      - name: Check the console script is wired
+        working-directory: /tmp
+        run: /tmp/wheel-env/bin/usap validate /tmp/clean.usap.gpkg
+
+      # The job already built and functionally verified this wheel; it just
+      # threw it away. Keeping it lets anyone grab a build off a branch
+      # without tagging. A *release* is the durable answer for a version
+      # someone pins -- see release.yml.
+      - name: Publish the wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: usap-wheel
+          path: dist/*.whl
+          if-no-files-found: error

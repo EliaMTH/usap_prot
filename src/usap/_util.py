@@ -5,6 +5,10 @@ import re
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import url2pathname
+
+from .errors import USAPError
 
 # Canonical stored form of a content hash: 'algorithm:digest'.
 _CANONICAL_HASH_RE = re.compile(r"^([a-z0-9][a-z0-9+.-]*):([0-9a-f]+)$")
@@ -103,3 +107,54 @@ def require_str(
         raise ValueError(f"Missing required string field: {key}")
 
     return value
+
+
+def _check_keys(block: dict[str, Any], known: frozenset[str], *, where: str) -> None:
+    """
+    Refuse keys this caller does not read.
+
+    Values are already validated where they are used; what escaped was the key
+    *name*. Anything starting with '_' is a comment and is skipped.
+
+    Lives here rather than beside either caller: project_builder imports batch,
+    so batch cannot import back from it.
+    """
+    unknown = sorted(
+        key for key in block
+        if not key.startswith("_") and key not in known
+    )
+
+    if unknown:
+        raise USAPError(
+            f"Unrecognised key(s) in {where}: {', '.join(repr(k) for k in unknown)}. "
+            f"Known keys are: {', '.join(sorted(known))}. Nothing reads an "
+            "unknown key, so leaving it would silently drop whatever it meant; "
+            "prefix a key with '_' to keep it as a comment."
+        )
+
+
+def path_from_uri(uri: str) -> Path:
+    """
+    Where an asset uri points, understanding the file:// spelling.
+
+    A stored uri is a path, not a URL -- but writers reach for file:// anyway,
+    and Path("file://x.obj") is Path("file:/x.obj"): a *relative* path that
+    resolves under the package directory and reports missing forever.
+    Accepting the spelling costs five lines and repairs every package already
+    written that way; refusing it silently does not.
+    """
+    # Case-insensitively, because register_asset's scheme guard is: a uri it
+    # accepted as file:// must resolve as one here, or FILE://model.obj is
+    # stored happily and then reports missing for the life of the package.
+    if uri[:7].lower() != "file://":
+        return Path(uri)
+
+    parsed = urlparse(uri)
+
+    # file://name.obj puts name.obj in netloc, because there is no third
+    # slash -- which is exactly how a writer meaning "beside the package"
+    # spells it. Only file:///abs and file://localhost/abs carry a real host.
+    if parsed.netloc in ("", "localhost"):
+        return Path(url2pathname(parsed.path))
+
+    return Path(url2pathname(parsed.netloc + parsed.path))

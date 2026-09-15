@@ -94,6 +94,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 import json
+import re
 import uuid
 
 import numpy as np
@@ -159,6 +160,38 @@ _COMPARISON_OPS = {
     "==": np.equal,
     "!=": np.not_equal,
 }
+
+
+def _reject_unresolvable_scheme(uri: str) -> None:
+    """
+    Refuse an asset uri USAP could never resolve.
+
+    http://, s3://, ... are not paths, and nothing in USAP fetches them: a
+    package holding one would verify as "missing" for the life of the file.
+    Refuse it while the writer is still here, rather than at someone else's
+    first verify_assets.
+
+    file:// is allowed and is deliberately stored unchanged rather than
+    normalised: an asset row's identity is (uri, content_hash), so rewriting
+    the uri would stop a re-registration matching the file:// row an earlier
+    run of the same writer stored, and insert a duplicate asset instead of
+    returning the existing one. verify_assets resolves the spelling instead
+    (see _util.path_from_uri). A Windows path (C:\\model.obj) has no "//" and
+    is unaffected.
+
+    Shared by register_asset and update_asset: a uri refused at registration
+    that walks back in through an update is the same broken package, and
+    update_asset is what the asset-identity guideline in HANDOFF.md tells
+    integrators to call.
+    """
+    scheme = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*)://", uri)
+
+    if scheme is not None and scheme.group(1).lower() != "file":
+        raise USAPError(
+            f"Asset uri {uri!r} uses the {scheme.group(1)!r} scheme. USAP "
+            "resolves asset uris as paths relative to the package file; "
+            "register the asset under a relative path or an absolute one."
+        )
 
 
 def _same_value(stored: Any, requested: Any) -> bool:
@@ -694,11 +727,38 @@ class USAPPackage:
         returns the existing asset_id. That is only sound while the rest of
         the record agrees, so a re-registration that changes the kind, media
         type, SRS, or metadata raises instead of quietly returning a row that
-        describes something else.
+        describes something else. Fields you omit are not compared, so the
+        bare "give me the id" re-registration stays valid against a fully
+        populated row.
+
+        `content_hash` is part of the row's identity but follows that same
+        rule, because the pair is a *uniqueness key* and not a lookup the
+        caller must reproduce exactly:
+
+        - omitting it finds the row anyway. A caller who does not pass a hash
+          is not claiming the asset has none — it is the "give me the id"
+          call, and requiring the hash to get the id would mean recomputing a
+          digest over a 10 GB file to ask a question about a row;
+        - supplying one against a row that has none *fills it in*, as
+          create_city_object fills a NULL gml_id. Nothing could have relied on
+          a hash that was absent, and verify_assets starts working;
+        - supplying one that *differs* from the stored hash registers a
+          separate asset. That is a new version of the file, which is what the
+          (uri, content_hash) uniqueness key exists to keep apart.
+
+        Where the uri alone cannot pick a row — it is registered at several
+        hashes — this raises USAPAmbiguityError rather than choosing one, as
+        resolve_asset does for the same shape.
+
+        A `file://` uri is stored as given — verify_assets understands the
+        spelling — but a scheme USAP cannot resolve is refused here.
         """
+        _reject_unresolvable_scheme(uri)
+
         existing = self.conn.execute(
             """
-            SELECT asset_id, asset_kind, media_type, srs_id, metadata_json
+            SELECT asset_id, asset_kind, media_type, content_hash,
+                   srs_id, metadata_json
             FROM usap_asset
             WHERE uri = ?
               AND content_hash IS ?
@@ -706,14 +766,76 @@ class USAPPackage:
             (uri, content_hash),
         ).fetchone()
 
+        # Whether the row found below is missing the hash this call carries.
+        # Set only by the uri-only fallback: an exact-pair match above already
+        # agrees about the hash, by construction.
+        fill_content_hash = False
+
+        if existing is None:
+            # The pair missed. Before concluding this is a new asset -- which
+            # inserts a second row for a uri that already has one, splits its
+            # parts and hides each row's annotations from the other -- retry
+            # on the uri alone and decide from what is actually stored.
+            rows = self.conn.execute(
+                """
+                SELECT asset_id, asset_kind, media_type, content_hash,
+                       srs_id, metadata_json
+                FROM usap_asset
+                WHERE uri = ?
+                ORDER BY asset_id
+                """,
+                (uri,),
+            ).fetchall()
+
+            if content_hash is None:
+                # No claim about content: any row for this uri answers.
+                candidates = rows
+            else:
+                # A row holding a different hash is another version of the
+                # file and is left alone; only a row with no hash at all is a
+                # record of *this* one, waiting for the digest.
+                candidates = [
+                    row for row in rows if row["content_hash"] is None
+                ]
+
+            if len(candidates) > 1:
+                # Every candidate shares the uri by construction, so the
+                # hash is the only thing that tells them apart.
+                options = [
+                    {
+                        "asset_id": int(row["asset_id"]),
+                        "content_hash": row["content_hash"],
+                    }
+                    for row in candidates
+                ]
+
+                raise USAPAmbiguityError(
+                    "Asset reference is ambiguous — the same uri is "
+                    "registered at several content hashes, so registering it "
+                    "again cannot tell which row you mean. Pass the "
+                    f"content_hash of the file you are registering. Reference: "
+                    f"{uri!r}. Options: {options}"
+                )
+
+            if candidates:
+                existing = candidates[0]
+                fill_content_hash = content_hash is not None
+
         if existing is not None:
+            # Only fields the caller actually supplies are compared, as in
+            # create_city_object: omitting one is a "give me the id" call, not
+            # a claim that it should be NULL.
             conflicts = _conflicting_fields(
                 existing,
                 {
-                    "asset_kind": asset_kind,
-                    "media_type": media_type,
-                    "srs_id": srs_id,
-                    "metadata_json": metadata_json,
+                    column: value
+                    for column, value in (
+                        ("asset_kind", asset_kind),
+                        ("media_type", media_type),
+                        ("srs_id", srs_id),
+                        ("metadata_json", metadata_json),
+                    )
+                    if value is not None
                 },
             )
 
@@ -725,7 +847,33 @@ class USAPPackage:
                     "content hash, or fix the caller."
                 )
 
-            return int(existing["asset_id"])
+            asset_id = int(existing["asset_id"])
+
+            if fill_content_hash:
+                # The row predates the digest -- registered with
+                # compute_hash=False, or by a writer that had not hashed the
+                # file yet. Filling it is an enrichment, not a change: the
+                # guard makes that explicit and keeps the write a no-op if
+                # anything else populated the column meanwhile.
+                with self.transaction():
+                    self.conn.execute(
+                        """
+                        UPDATE usap_asset
+                        SET content_hash = ?
+                        WHERE asset_id = ?
+                          AND content_hash IS NULL
+                        """,
+                        (content_hash, asset_id),
+                    )
+
+                    self.log_edit(
+                        "backfill_asset",
+                        "usap_asset",
+                        asset_id,
+                        details_json=json.dumps(["content_hash"]),
+                    )
+
+            return asset_id
 
         with self.transaction():
             cur = self.conn.execute(
@@ -811,19 +959,28 @@ class USAPPackage:
         ).fetchone()
 
         if existing is not None:
+            # Only fields the caller actually supplies are compared, as in
+            # create_city_object. element_count is required and index_origin
+            # has a real default, so both are always compared -- which is the
+            # point, since element_count is the index space existing
+            # memberships are validated against.
             conflicts = _conflicting_fields(
                 existing,
                 {
-                    "element_count": element_count,
-                    "index_origin": index_origin,
-                    "minx": minx,
-                    "miny": miny,
-                    "minz": minz,
-                    "maxx": maxx,
-                    "maxy": maxy,
-                    "maxz": maxz,
-                    "metadata_json": metadata_json,
-                    "indexing_profile": indexing_profile,
+                    column: value
+                    for column, value in (
+                        ("element_count", element_count),
+                        ("index_origin", index_origin),
+                        ("minx", minx),
+                        ("miny", miny),
+                        ("minz", minz),
+                        ("maxx", maxx),
+                        ("maxy", maxy),
+                        ("maxz", maxz),
+                        ("metadata_json", metadata_json),
+                        ("indexing_profile", indexing_profile),
+                    )
+                    if value is not None
                 },
             )
 
@@ -910,8 +1067,15 @@ class USAPPackage:
         stored index pointing at different geometry. asset_kind cannot be changed
         at all — a mesh does not become a point cloud.
 
+        A new uri is held to the same rule register_asset applies: a scheme
+        USAP cannot resolve is refused, since repairing a record into one that
+        can only ever verify as missing is not a repair.
+
         Returns the updated row.
         """
+        if uri is not _UNSET:
+            _reject_unresolvable_scheme(str(uri))
+
         updates: list[str] = []
         params: list[Any] = []
 
@@ -1347,6 +1511,37 @@ class USAPPackage:
     # City objects and graph
     # ---------------------------------------------------------------------
 
+    # Columns a later call may fill in on a city object that already exists.
+    # object_uid is the identity and is deliberately absent; object_status has
+    # a real default, so a supplied value cannot be told from an omitted one
+    # (accept_city_object is how a carrier's status moves).
+    #
+    # semantic_class_id is here because carriers are born classless (batch.py):
+    # the class arrives with the CityGML import that aligns the carrier, which
+    # is the one source entitled to assert it. If carriers ever go back to
+    # being born classed, take it out again -- filling a class guessed from an
+    # annotation's concept is the mistake this hardening set out to stop.
+    _CITY_OBJECT_BACKFILLABLE = (
+        "semantic_class_id",
+        "gml_id",
+        "source_asset_id",
+        "source_object_id",
+        "attributes_json",
+    )
+
+    # Columns where "" means "unknown" rather than a value. Only the text
+    # identities: a writer emits "" for an absent gml:id the way it emits it
+    # for any blank field, and an empty identity is not one. attributes_json is
+    # not here -- "" is not valid JSON, so it is a corrupt value, not an unset
+    # one.
+    _CITY_OBJECT_EMPTY_IS_UNSET = ("gml_id", "source_object_id")
+
+    # Columns compared as parsed JSON rather than as text, so that the same
+    # attributes re-serialized with different key order or spacing are not
+    # read as a contradiction. Deliberately not the identities: they are
+    # opaque strings, and parsing them would make "7" and "7.0" equal.
+    _CITY_OBJECT_JSON_COLUMNS = ("attributes_json",)
+
     def create_city_object(
         self,
         object_uid: str,
@@ -1373,16 +1568,32 @@ class USAPPackage:
         class (RoofSurface), so passing the annotation's concept here used to
         vanish without a word.
 
+        Creating it again *fills in* what is still missing, on the same rule
+        `create_semantic_class` re-seeding follows: a column still NULL is an
+        enrichment and is written, a column already holding a different value
+        is a contradiction and raises. This is how a carrier created by the
+        batch — an identity and nothing else — acquires its class, its gml_id
+        and its provenance when the CityGML import that aligns it arrives.
+
         Only fields the caller actually supplies are compared, so the bare
         `create_city_object(uid)` "give me the id" call stays valid against a
         fully populated row. `object_status` is excluded: its default is a real
-        value, so a supplied status cannot be told from an omitted one.
+        value, so a supplied status cannot be told from an omitted one — see
+        accept_city_object for moving a carrier to 'accepted'.
         """
         if object_status not in CITY_OBJECT_STATUSES:
             raise USAPError(
                 f"Unknown city object status {object_status!r}. "
                 f"Use one of: {', '.join(CITY_OBJECT_STATUSES)}."
             )
+
+        # An empty gml_id is not an identity, and storing it as one makes the
+        # object permanently uncompletable: "" survives the "no claim" filter
+        # below and then compares as a stored value. Writers that emit "" for
+        # "unknown" -- the usual shape when the value came from a form or a CSV
+        # column -- get the same treatment as writers that omit it.
+        gml_id = gml_id or None
+        source_object_id = source_object_id or None
 
         existing = self.conn.execute(
             """
@@ -1400,31 +1611,86 @@ class USAPPackage:
         ).fetchone()
 
         if existing is not None:
-            conflicts = _conflicting_fields(
-                existing,
-                {
-                    column: value
-                    for column, value in (
-                        ("semantic_class_id", semantic_class_id),
-                        ("gml_id", gml_id),
-                        ("source_asset_id", source_asset_id),
-                        ("source_object_id", source_object_id),
-                        ("attributes_json", attributes_json),
+            city_object_id = int(existing["city_object_id"])
+
+            requested = {
+                "semantic_class_id": semantic_class_id,
+                "gml_id": gml_id,
+                "source_asset_id": source_asset_id,
+                "source_object_id": source_object_id,
+                "attributes_json": attributes_json,
+            }
+
+            backfill: dict[str, Any] = {}
+
+            # Driven by the tuple rather than by `requested`, so adding a
+            # column to the table cannot silently make it fillable.
+            for column in self._CITY_OBJECT_BACKFILLABLE:
+                value = requested[column]
+
+                # Requesting None makes no claim, so the bare
+                # create_city_object(uid) "give me the id" call stays valid
+                # against a fully populated row.
+                if value is None:
+                    continue
+
+                # _same_value on the JSON column only: two spellings of the
+                # same attributes are the same claim. It parses both sides as
+                # JSON when both are text, which is wrong for the identities --
+                # it would read source_object_id "7" and "7.0" as equal, and
+                # then neither fill nor complain.
+                if column in self._CITY_OBJECT_JSON_COLUMNS:
+                    if _same_value(existing[column], value):
+                        continue
+                elif existing[column] == value:
+                    continue
+
+                stored = existing[column]
+
+                # A stored "" is still empty. Writers emit it for "unknown" --
+                # a blank form field, an empty CSV column -- and rows carrying
+                # one predate the normalisation above. Treating it as a value
+                # would make those rows uncompletable for good, which is the
+                # whole failure this fix exists to end.
+                if stored == "" and column in self._CITY_OBJECT_EMPTY_IS_UNSET:
+                    stored = None
+
+                if stored is not None:
+                    raise USAPError(
+                        f"City object {object_uid!r} already exists with a "
+                        f"different {column}: {stored!r}, requested {value!r}. "
+                        "Creating it again fills in what is still missing; it "
+                        "does not overwrite what a package already asserts. If "
+                        "you meant to record a different concept, that belongs "
+                        "on the annotation, not on the city object. A stored "
+                        "value that is simply wrong means the package "
+                        "disagrees with its source: rebuild it rather than "
+                        "editing it here."
                     )
-                    if value is not None
-                },
-            )
 
-            if conflicts:
-                raise USAPError(
-                    f"City object {object_uid!r} already exists with different "
-                    f"values: {conflicts}. Creating it again cannot change it; "
-                    "the semantic source owns these fields. If you meant to "
-                    "record a different concept, that belongs on the "
-                    "annotation, not on the city object."
-                )
+                backfill[column] = value
 
-            return int(existing["city_object_id"])
+            if backfill:
+                assignments = ", ".join(f"{c} = ?" for c in backfill)
+
+                with self.transaction():
+                    self.conn.execute(
+                        f"""
+                        UPDATE usap_city_object
+                        SET {assignments}
+                        WHERE city_object_id = ?
+                        """,
+                        (*backfill.values(), city_object_id),
+                    )
+
+                    self.log_edit(
+                        "backfill_city_object",
+                        "usap_city_object",
+                        city_object_id,
+                        details_json=json.dumps(sorted(backfill)),
+                    )
+
+            return city_object_id
 
         with self.transaction():
             cur = self.conn.execute(
@@ -1453,6 +1719,62 @@ class USAPPackage:
             city_object_id = require_lastrowid(cur)
             self.log_edit(
                 "create_city_object",
+                "usap_city_object",
+                city_object_id,
+            )
+
+        return city_object_id
+
+    def accept_city_object(self, city_object: int | str) -> int:
+        """
+        Mark a carrier as aligned: object_status 'temporary' -> 'accepted'.
+
+        A carrier created by the annotation batch is born 'temporary', the
+        marker that a CityGML-backed object should later be found for it.
+        Nothing else in the SDK moves that marker, so without this an aligned
+        object stays listed by
+        `list_city_objects(object_status="temporary")` — "still awaiting
+        alignment" — for the life of the package.
+
+        This is not `update_city_object` by another name, and HANDOFF §2.3
+        still holds: it changes nothing about *what the object is*. The class,
+        the gml_id and the provenance arrive through `create_city_object`
+        backfill, from the semantic source that owns them. All this records is
+        that the alignment happened.
+
+        One-way and idempotent: a row that is already 'accepted' is left alone
+        and returns quietly, and there is deliberately no reverse — an object
+        the CityGML has once backed does not go back to being provisional.
+
+        `city_object` takes any form `resolve_city_object` accepts: a
+        city_object_id, an object_uid, or a gml_id.
+        """
+        city_object_id = self.resolve_city_object(city_object)
+
+        row = self.conn.execute(
+            """
+            SELECT object_status
+            FROM usap_city_object
+            WHERE city_object_id = ?
+            """,
+            (city_object_id,),
+        ).fetchone()
+
+        if row["object_status"] == "accepted":
+            return city_object_id
+
+        with self.transaction():
+            self.conn.execute(
+                """
+                UPDATE usap_city_object
+                SET object_status = 'accepted'
+                WHERE city_object_id = ?
+                """,
+                (city_object_id,),
+            )
+
+            self.log_edit(
+                "accept_city_object",
                 "usap_city_object",
                 city_object_id,
             )
@@ -2192,6 +2514,7 @@ class USAPPackage:
                 a.primary_city_object_id,
                 co.object_uid AS primary_city_object_uid,
                 co.gml_id AS primary_city_object_gml_id,
+                a.label,
                 a.status,
                 a.confidence,
                 a.attributes_json,
@@ -2353,6 +2676,7 @@ class USAPPackage:
                 a.primary_city_object_id,
                 primary_co.object_uid AS primary_city_object_uid,
                 primary_co.gml_id AS primary_city_object_gml_id,
+                a.label,
                 a.status,
                 a.confidence,
                 a.attributes_json,
@@ -2379,6 +2703,69 @@ class USAPPackage:
         return result
 
 
+    def _merged_attributes_json(
+        self,
+        annotation_id: int,
+        attributes: Any,
+    ) -> str:
+        """
+        The annotation's stored attributes with `attributes` merged over them.
+
+        A key present replaces, a key set to None is removed, and every other
+        stored key is preserved. That last clause is the whole reason this
+        exists: attributes_json is a multi-key field whose contents are
+        prescribed (`method`, `source`, the reserved `usap:` keys), and the
+        only way to change one key used to be to rewrite the column — so the
+        obvious one-liner silently discarded everything else in it.
+        """
+        if not isinstance(attributes, dict):
+            raise USAPError(
+                "attributes must be a dict of keys to merge, not "
+                f"{type(attributes).__name__}. To replace the whole field, "
+                "use attributes_json."
+            )
+
+        existing = self.get_annotation(annotation_id)
+
+        if existing is None:
+            raise USAPError(f"Annotation not found: {annotation_id}")
+
+        stored = existing["attributes_json"]
+
+        if stored is None or stored == "":
+            merged: dict[str, Any] = {}
+        else:
+            try:
+                merged = json.loads(stored)
+            except ValueError as exc:
+                raise USAPError(
+                    f"Annotation {annotation_id} holds attributes_json that "
+                    f"does not parse as JSON ({exc}), so there is nothing to "
+                    "merge into. Replace the whole field with attributes_json "
+                    "if you mean to discard it."
+                ) from exc
+
+            if not isinstance(merged, dict):
+                raise USAPError(
+                    f"Annotation {annotation_id} holds attributes_json that is "
+                    f"a JSON {type(merged).__name__} rather than an object, so "
+                    "keys cannot be merged into it. Replace the whole field "
+                    "with attributes_json instead."
+                )
+
+        for key, value in attributes.items():
+            if value is None:
+                # Removing the key, which is not the same as storing a null:
+                # a key whose value is null still reads as present.
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+
+        # An empty result stays an empty object rather than becoming NULL.
+        # Blanking the field outright is attributes_json=None's job, and "no
+        # attributes" and "attributes, none of them set" are different claims.
+        return json.dumps(merged)
+
     def update_annotation(
         self,
         annotation_id: int,
@@ -2386,8 +2773,10 @@ class USAPPackage:
         annotation_uid: object = _UNSET,
         semantic_class_id: object = _UNSET,
         primary_city_object_id: object = _UNSET,
+        label: object = _UNSET,
         status: object = _UNSET,
         confidence: object = _UNSET,
+        attributes: object = _UNSET,
         attributes_json: object = _UNSET,
     ) -> dict[str, Any]:
         """
@@ -2395,6 +2784,14 @@ class USAPPackage:
 
         Omitted fields are preserved.
         Passing None explicitly stores NULL.
+
+        `attributes` is the merging form, `attributes_json` the replacing one,
+        and supplying both raises rather than picking a winner. Under
+        `attributes` a key present replaces, a key set to None is removed, and
+        every other stored key survives — so setting one key cannot discard the
+        claim-level metadata beside it, which is what rewriting the raw column
+        does. Under `attributes_json` the whole field is replaced; that is also
+        how you blank it (pass None).
 
         Changing primary_city_object_id also moves the annotation's
         'represents' link in usap_annotation_object, in the same transaction,
@@ -2404,6 +2801,19 @@ class USAPPackage:
         added 'represents' link to the old primary object is indistinguishable
         from the primary one and is removed with it.
         """
+        if attributes is not _UNSET and attributes_json is not _UNSET:
+            raise USAPError(
+                f"Annotation {annotation_id}: provide attributes or "
+                "attributes_json, not both. attributes merges into what is "
+                "stored; attributes_json replaces the whole field."
+            )
+
+        if attributes is not _UNSET:
+            attributes_json = self._merged_attributes_json(
+                annotation_id,
+                attributes,
+            )
+
         _check_annotation_fields(
             status=status,
             confidence=confidence,
@@ -2423,6 +2833,7 @@ class USAPPackage:
         add_update("annotation_uid", annotation_uid)
         add_update("semantic_class_id", semantic_class_id)
         add_update("primary_city_object_id", primary_city_object_id)
+        add_update("label", label)
         add_update("status", status)
         add_update("confidence", confidence)
         add_update("attributes_json", attributes_json)
@@ -2588,6 +2999,7 @@ class USAPPackage:
         confidence: float | None = None,
         attributes_json: str | None = None,
         link_primary_object: bool = True,
+        label: str | None = None,
     ) -> int:
         _check_annotation_fields(
             status=status,
@@ -2624,16 +3036,18 @@ class USAPPackage:
                     annotation_uid,
                     semantic_class_id,
                     primary_city_object_id,
+                    label,
                     status,
                     confidence,
                     attributes_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     annotation_uid,
                     semantic_class_id,
                     primary_city_object_id,
+                    label,
                     status,
                     confidence,
                     attributes_json,
@@ -3693,6 +4107,7 @@ class USAPPackage:
                         mb.payload,
 
                         a.annotation_uid,
+                        a.label,
                         a.status,
 
                         asm.assessment_uid,
@@ -3752,6 +4167,7 @@ class USAPPackage:
                 matches[key] = {
                     "annotation_id": key[0],
                     "annotation_uid": row["annotation_uid"],
+                    "label": row["label"],
                     "assessment_id": key[1],
                     "assessment_uid": row["assessment_uid"],
                     "assessed_at": row["assessed_at"],
@@ -4252,6 +4668,7 @@ class USAPPackage:
         values: Any,
         value_dtype: str | None = None,
         annotation_uid: str | None = None,
+        label: str | None = None,
         status: str = "draft",
         confidence: float | None = None,
         attributes: dict[str, Any] | None = None,
@@ -4280,6 +4697,7 @@ class USAPPackage:
             annotation = self.create_concept_annotation(
                 concept=concept,
                 annotation_uid=annotation_uid,
+                label=label,
                 status=status,
                 confidence=confidence,
                 attributes=attributes,
@@ -5107,6 +5525,7 @@ class USAPPackage:
         annotation_uid: str | None = None,
         city_object_id: int | None = None,
         city_object_uid: str | None = None,
+        label: str | None = None,
         status: str = "draft",
         confidence: float | None = None,
         attributes: dict[str, Any] | None = None,
@@ -5155,6 +5574,7 @@ class USAPPackage:
             annotation_uid=annotation_uid,
             semantic_class_id=semantic_class_id,
             primary_city_object_id=resolved_city_object_id,
+            label=label,
             status=status,
             confidence=confidence,
             attributes_json=stored_attributes_json,
@@ -5182,6 +5602,7 @@ class USAPPackage:
         annotation_uid: str | None = None,
         city_object_id: int | None = None,
         city_object_uid: str | None = None,
+        label: str | None = None,
         status: str = "draft",
         confidence: float | None = None,
         attributes: dict[str, Any] | None = None,
@@ -5211,6 +5632,7 @@ class USAPPackage:
                 annotation_uid=annotation_uid,
                 city_object_id=city_object_id,
                 city_object_uid=city_object_uid,
+                label=label,
                 status=status,
                 confidence=confidence,
                 attributes=attributes,

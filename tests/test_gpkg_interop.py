@@ -81,6 +81,7 @@ def test_annotations_view_is_readable(tmp_path: Path) -> None:
             element_kind="face",
             element_indices=[1, 2, 3],
             city_object_id=roof_id,
+            label="North roof plane",
         )
 
         row = pkg.conn.execute(
@@ -93,6 +94,10 @@ def test_annotations_view_is_readable(tmp_path: Path) -> None:
         assert row["city_object_uid"] == "b1_roof"
         assert row["selected_element_count"] == 3
         assert row["value_field_count"] == 0
+
+        # The GIS layer is where a human browses a package, so the one
+        # human-readable column has to reach it.
+        assert row["label"] == "North roof plane"
 
         concept_row = pkg.conn.execute(
             "SELECT * FROM usap_concepts_view WHERE local_name = 'Roof'"
@@ -132,7 +137,12 @@ def test_city_objects_view_shows_temporary_carriers(tmp_path: Path) -> None:
         ).fetchone()
 
         assert row is not None
-        assert row["semantic_class"] == "TempRoof"
+
+        # The carrier is classless by design, so the view's LEFT JOIN on
+        # usap_semantic_class is load-bearing: an inner join would drop every
+        # carrier out of the GIS layer, which is the one place a user goes
+        # looking for objects still awaiting alignment.
+        assert row["semantic_class"] is None
         assert row["object_status"] == "temporary"
 
 

@@ -28,7 +28,7 @@ A `*.usap.gpkg` file stores, for one study area:
 - the exact **element indices** covered by each annotation;
 - the **semantic concept** asserted by each annotation, drawn from a registered external or local vocabulary;
 - an optional link to the authoritative **city-object instance** represented or concerned by the claim;
-- editable **annotation records** with status, confidence, and claim-level attributes such as method and source, each carrying one or more dated **assessments** (one evaluation of the claim against one 3D asset);
+- editable **annotation records** with a display label, status, confidence, and claim-level attributes such as method and source, each carrying one or more dated **assessments** (one evaluation of the claim against one 3D asset);
 - optional **per-element value fields**, stored as compressed typed blocks and queryable by value;
 - a lightweight mirror of **city-object identity** and a typed, directed **relationship graph** used to retrieve annotations across an object and its parts, or across whatever else the source says it relates to.
 
@@ -152,3 +152,17 @@ Explore USAP in more detail with:
 Two documents record decisions rather than describe the current state:
 [ACCELERATOR_ABLATION.md](docs/ACCELERATOR_ABLATION.md) (are the query tables
 worth their cost) and [VALUE_FIELDS_DESIGN.md](docs/VALUE_FIELDS_DESIGN.md).
+
+---
+
+A package is a file, so it should be checkable without writing Python. Installing
+the wheel puts a `usap` command on your path:
+
+```bash
+usap validate area.usap.gpkg                    # 0 if it passes, 1 if not
+usap validate area.usap.gpkg --json             # the same report, for a CI gate
+usap validate area.usap.gpkg --level external   # also re-hash every asset file
+```
+
+It runs the same `validate_report()` the SDK does — no second implementation and
+no second set of rules.

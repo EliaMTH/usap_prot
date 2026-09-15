@@ -184,12 +184,16 @@ def test_procedure_2_minimal_init_is_fully_queryable(tmp_path: Path) -> None:
     assert result.batches[0].created_city_object_count == 1
 
     with USAPPackage.open(result.db_path) as pkg:
-        # The carrier: classed by "what it is", marked for later alignment.
+        # The carrier: an identity and nothing more, marked for later
+        # alignment. Deliberately classless -- the class belongs to the
+        # CityGML that aligns it, and arrives through create_city_object
+        # backfill. LEFT JOIN, because the inner join this test used to do
+        # returns no row at all once semantic_class_id is NULL.
         carrier = pkg.conn.execute(
             """
             SELECT co.object_status, sc.local_name
             FROM usap_city_object AS co
-            JOIN usap_semantic_class AS sc
+            LEFT JOIN usap_semantic_class AS sc
                 ON sc.semantic_class_id = co.semantic_class_id
             WHERE co.object_uid = 'tower_A_roof'
             """
@@ -197,7 +201,7 @@ def test_procedure_2_minimal_init_is_fully_queryable(tmp_path: Path) -> None:
 
         assert carrier is not None
         assert carrier["object_status"] == "temporary"
-        assert carrier["local_name"] == "TempRoof"
+        assert carrier["local_name"] is None
 
         # All query families work on the minimal package:
         blocks = pkg.elements_for_city_object("tower_A_roof", expand=True)
@@ -235,6 +239,88 @@ def test_procedure_2_minimal_init_is_fully_queryable(tmp_path: Path) -> None:
         ).fetchone()["n"]
 
         assert count == 1
+
+
+def test_a_citygml_import_completes_the_carrier_it_aligns(tmp_path: Path) -> None:
+    """
+    The whole point of a carrier, end to end.
+
+    Procedure 2 leaves an object that is an identity and a marker. The import
+    that should settle what it is has to do three separate things for that
+    promise to hold: fill the class, fill the provenance, and clear the marker.
+    Each is asserted below, because until now nothing exercised the sequence --
+    only its halves, in different files.
+    """
+    from usap import import_citygml_semantics
+
+    gml_path = tmp_path / "city.gml"
+    gml_path.write_text(TINY_CITYGML, encoding="utf-8")
+
+    with _minimal_pkg(tmp_path) as pkg:
+        seed_citygml_concepts(pkg)
+
+        # The carrier: named by the gml:id it is waiting for, as HANDOFF 2.1
+        # asks, and classed by nothing.
+        apply_annotation_batch(pkg, {
+            "create_missing_city_objects": True,
+            "annotations": [{
+                "annotation_uid": "ann_1",
+                "city_object_uid": "building_1_roof_1",
+                "concept": "TempRoof",
+                "memberships": [
+                    {"asset_uri": "city_mesh", "element_indices": [0]}
+                ],
+            }],
+        })
+
+        before = pkg.conn.execute(
+            """
+            SELECT semantic_class_id, gml_id, source_object_id, object_status
+            FROM usap_city_object WHERE object_uid = 'building_1_roof_1'
+            """
+        ).fetchone()
+
+        assert before["semantic_class_id"] is None
+        assert before["gml_id"] is None
+        assert before["object_status"] == "temporary"
+
+        import_citygml_semantics(pkg, gml_path)
+
+        after = pkg.conn.execute(
+            """
+            SELECT sc.local_name, co.gml_id, co.source_object_id,
+                   co.source_asset_id, co.attributes_json, co.object_status
+            FROM usap_city_object AS co
+            LEFT JOIN usap_semantic_class AS sc
+                ON sc.semantic_class_id = co.semantic_class_id
+            WHERE co.object_uid = 'building_1_roof_1'
+            """
+        ).fetchone()
+
+        # The class arrives from the one source entitled to assert it...
+        assert after["local_name"] == "RoofSurface"
+
+        # ...along with everything else the carrier could not know.
+        assert after["gml_id"] == "building_1_roof_1"
+        assert after["source_object_id"] == "building_1_roof_1"
+        assert after["source_asset_id"] is not None
+        assert json.loads(after["attributes_json"])["source"] == "citygml_adapter"
+
+        # And the marker is cleared, or the object stays listed as awaiting an
+        # alignment that already happened, for the life of the package.
+        assert after["object_status"] == "accepted"
+        assert pkg.list_city_objects(object_status="temporary") == []
+
+        # One object, not two: the import recognised the carrier rather than
+        # creating a sibling beside it.
+        assert pkg.conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM usap_city_object
+            WHERE gml_id = 'building_1_roof_1'
+            """
+        ).fetchone()["n"] == 1
+
+        assert_package_valid(pkg)
 
 
 def _minimal_pkg(tmp_path: Path) -> USAPPackage:

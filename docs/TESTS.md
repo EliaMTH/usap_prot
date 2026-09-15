@@ -90,6 +90,17 @@ rather than depending on the full OGC distribution.
   registration must mean "already registered **as the same thing**"; a
   conflicting kind or element count raises instead of returning a row that
   describes something the caller did not register.
+- `test_omitting_the_hash_finds_a_hashed_row` /
+  `test_supplying_a_hash_fills_a_row_that_has_none` — `(uri, content_hash)` is a
+  uniqueness key, not a lookup the caller must reproduce, so the hash follows
+  the same omission rule as every other field. Each asserts the row *count* as
+  well as the id: the failure these pin was a silent second row, not a wrong
+  return value.
+- `test_a_different_hash_is_still_a_separate_asset` /
+  `test_a_uri_at_several_hashes_cannot_be_named_without_one` — the limits of
+  that fallback. A disagreeing hash is a new version and stays its own asset;
+  once a uri has two, the bare call raises `USAPAmbiguityError` rather than
+  guessing, as `resolve_asset` does for the same shape.
 - `test_recreating_a_city_object_with_a_different_class_raises` — the same
   doctrine for city objects. Idempotency on `object_uid` is what makes a
   `gml:id` usable as the key, but a repeat call naming a *different* class had
@@ -127,6 +138,29 @@ rather than depending on the full OGC distribution.
   deliberately gives the object a `gml_id` *different* from its `object_uid`,
   since with them equal a column aliased to the wrong one would still pass.
   Also pins the unlinked case: both fields `None`, not absent.
+- The `update_annotation(attributes=…)` merge group —
+  `test_update_annotation_attributes_merges_rather_than_replacing`,
+  `..._replaces_a_key_it_names`, `..._none_removes_a_key`,
+  `..._merges_into_an_empty_field`, `..._emptied_stays_an_object`,
+  `test_update_annotation_refuses_attributes_and_attributes_json_together`,
+  `..._refuses_a_non_object_stored_value`, `..._requires_a_dict`.
+  `attributes_json` is a multi-key field whose contents are prescribed
+  (`method`, `source`, the reserved `usap:` keys), so changing one key by
+  rewriting the column discarded the rest — the merge form exists to make that
+  impossible. What the group pins beyond the happy path: `None` removes a key
+  rather than storing a null (a null key still reads as present); an emptied
+  result stays `'{}'` rather than becoming NULL, since blanking the field is
+  `attributes_json=None`'s job; and a stored value that is valid JSON but not an
+  object is refused rather than silently replaced.
+- The `label` group — `test_label_round_trips_through_every_read_path`,
+  `test_label_is_editable_and_clearable`,
+  `test_omitting_the_label_leaves_it_alone`,
+  `test_the_label_is_not_an_identifier`. The first asserts all **three** read
+  paths, because a column added to one SELECT and forgotten in another is
+  exactly how the 0.4.2 `gml_id`/`object_uid` mismatch happened. The last is the
+  reason the column is safe to have: no UNIQUE, no lookup accepts it, and two
+  annotations may share a caption — so it cannot become a fourth name to
+  reconcile beside `annotation_uid`, `object_uid` and `gml_id`.
 - `test_delete_annotation_cascades_membership` — deleting an annotation must
   not orphan its membership blocks.
 - `test_create_annotation_rejects_conflicting_concept` — re-using an
@@ -396,13 +430,19 @@ End-to-end tests of the three INGESTION.md procedures:
 - `test_procedure_2_minimal_init_is_fully_queryable` — no CityGML: carrier
   city objects (`object_status='temporary'`) answer the same queries; re-running
   in update mode edits in place.
+- `test_a_citygml_import_completes_the_carrier_it_aligns` — the whole point of a
+  carrier, end to end, which nothing exercised before: the import fills the
+  class, fills the provenance, clears the `temporary` marker, and leaves **one**
+  object rather than a sibling beside it. Each of the three is asserted
+  separately, because they are three different calls.
 - `test_unknown_city_object_fails_without_the_flag` — strict by default:
   unknown object names fail loudly unless `create_missing_city_objects` opts in.
 - `test_carriers_are_queryable_in_every_graph` — a carrier created after a
   CityGML import has no edges in any graph; an edgeless object must still
   answer for itself in every graph, named or not.
-- `test_new_carrier_requires_a_concept` — a carrier without "what it is" is
-  meaningless and must be rejected.
+- `test_new_carrier_requires_a_concept` — an entry creating a carrier still
+  needs a `concept`, now because it is what classes the *annotation*: the
+  carrier itself is created classless.
 - `test_part_reference_strictness` — ambiguous or contradictory asset/part
   references in batches fail loudly; `part_path` disambiguates.
 - `test_procedure_3_update_adds_assets_and_edits` — update mode adds assets
@@ -412,6 +452,59 @@ End-to-end tests of the three INGESTION.md procedures:
   the `link_city_objects` idempotency guard).
 - `test_update_mode_requires_an_existing_package` — update on a missing file
   is an error, not a silent create.
+
+## City object backfill — `test_city_object_backfill.py`
+
+Filling in an object that already exists, and clearing the carrier marker. The
+distinction these pin: a NULL is an enrichment and is written, a different value
+is a contradiction and raises.
+
+- `test_backfill_fills_every_still_empty_column` — the alignment call: a carrier
+  acquires its class, `gml_id`, `source_asset_id`, `source_object_id` and
+  `attributes_json` in one `create_city_object`, and the same row comes back.
+- `test_backfill_is_recorded_in_the_edit_log` — a write nothing recorded is a
+  write nobody can explain later.
+- `test_a_contradiction_still_raises` — the 0.4.2 hardening's actual target
+  keeps raising, the message names the column, and the refused call writes
+  nothing.
+- `test_the_bare_give_me_the_id_call_stays_valid` — requesting nothing claims
+  nothing, so the carrier-lookup idiom survives a fully populated row.
+- `test_an_empty_gml_id_is_stored_as_null` /
+  `test_a_row_already_holding_an_empty_string_still_completes` — the two halves
+  of the `""` problem: new rows stop acquiring it, and rows an older build wrote
+  complete on the next real value without a migration.
+- `test_attributes_json_respelled_is_not_a_conflict` — two spellings of the same
+  JSON are the same claim, or an idempotent re-import would fail on whitespace.
+- `test_accept_city_object_promotes_once_and_has_no_reverse` — `temporary` →
+  `accepted`, idempotent, and no way back through the API.
+- `test_accept_city_object_rejects_an_unknown_object`.
+
+## Command line — `test_cli.py`
+
+The machine-facing contract a pipeline gates on. The validation itself is
+`validate_report`'s, tested under Validation; there is no second implementation
+here to check.
+
+- `test_validate_exits_zero_on_a_clean_package`.
+- `test_validate_json_is_machine_readable` /
+  `test_validate_json_carries_every_issue_field` — a gate that has to parse the
+  human format is a gate that breaks when the wording improves, so `--json` is
+  pinned to the full `ValidationIssue` field set.
+- `test_warnings_do_not_fail_by_default` /
+  `test_fail_on_warning_makes_a_pipeline_say_which_it_means` — `is_ok` counts
+  errors only; the flag makes the default explicit rather than surprising.
+- `test_an_unknown_level_is_refused`, `test_no_subcommand_prints_help`.
+- `test_a_missing_package_is_a_message_not_a_traceback` — typing a path that is
+  not there is ordinary, and this command exists for people who do not write
+  Python. The exit code is 1 either way, so what is pinned is the output.
+- `test_a_failure_under_json_is_still_json` — the same failure under `--json`
+  has to be a document. A wrong path and an unsupported profile are this
+  command's most ordinary failures, so emitting prose there means a gate piping
+  stdout to a parser meets a decode error instead of a reason.
+- `test_json_failed_matches_the_exit_code` — `is_ok` counts errors only, so
+  under `--fail-on-warning` a warnings-only package is `is_ok: true` *and* exit
+  1. `failed` is what the exit code reflects; without it the document says the
+  opposite of what the command did.
 
 ## Batches — `test_batch_annotations.py`
 
@@ -428,6 +521,53 @@ End-to-end tests of the three INGESTION.md procedures:
   both.
 - `test_apply_annotation_batch_file` — the file entry point behaves exactly
   like the in-memory batch and fails loudly on a missing path.
+- `test_batch_passes_gml_id_and_source_object_id_through` — the identity reaches
+  the row, and the carrier stays classless: the entry's concept classes the
+  annotation, not the object.
+- `test_identity_reaches_an_object_that_already_existed` — the shape every
+  re-run takes, and the one a writer that pre-creates its objects takes on the
+  first run. The fields were once passed only where the batch created the
+  object, so an entry naming an object something else had made reported success
+  and wrote nothing.
+- `test_identity_reaches_an_object_named_by_id` — `create_city_object` is keyed
+  on the uid, so without a lookup the `city_object_id` form dropped the identity
+  by construction rather than by accident.
+- `test_identity_reaches_an_object_named_by_its_gml_id` — the two lookups do not
+  agree: `resolve_city_object` matches `object_uid` **or** `gml_id`, while
+  `create_city_object` is keyed on `object_uid` alone and inserts when it finds
+  nothing. So the write has to be addressed to the row resolve matched, not to
+  the string the entry gave — keying it by the string minted a phantom row
+  instead, leaving two rows claiming one `gml_id` and that value ambiguous
+  forever while the batch reported success. The fixture gives the object a
+  `gml_id` *different* from its `object_uid`, since with them equal either
+  spelling finds the same row and a broken implementation passes.
+- `test_re_running_the_same_identity_is_not_a_conflict` — re-running is how a
+  re-survey is imported, so the second pass must not trip over the first.
+- `test_a_changed_identity_raises_rather_than_being_ignored` — a generator whose
+  `gml_id` was wrong and has been corrected must hear that the package
+  disagrees, and the refused call must write nothing.
+- `test_an_item_referencing_a_carrier_must_carry_its_own_concept` — the one
+  shape classless carriers break, pinned deliberately. The inherited class was
+  the annotation's own concept laundered through the object.
+- `test_an_item_supplying_its_own_concept_is_unaffected` — and the common shape
+  is not disturbed.
+- `test_a_batch_entry_can_carry_a_label` — the key whitelist refuses anything it
+  does not name, so a column the batch forgot to list would make every entry
+  carrying it fail. Batch files predating 0.4.0 do carry `label`.
+- `test_a_re_run_without_a_label_leaves_the_stored_one` — replace is a partial
+  update, so a caption typed in the application survives the next run of a
+  generator that knows nothing about it, while `"label": null` still clears it.
+  This is the failure the attributes-based label had, since an entry's
+  `attributes` replaces the whole field.
+- `test_an_unknown_item_key_is_refused` /
+  `test_unknown_keys_are_refused_in_nested_blocks` /
+  `test_an_unknown_top_level_key_is_refused` — a bad *value* already failed; what
+  escaped was the key *name*, silently, on every entry of every run.
+- `test_unknown_keys_are_refused_before_anything_is_written` — the check runs
+  before the transaction opens, so a typo in the last entry prevents the write
+  rather than rolling back every entry before it.
+- `test_an_underscore_prefixed_key_is_a_comment` — the same escape project
+  configs use.
 
 ## Project builder — `test_project_builder.py`
 
@@ -655,6 +795,47 @@ Each test corrupts one invariant and asserts `validate_report()` names it:
   package invalid.
 - `test_validate_connection_accepts_plain_connection` — validation works on a
   bare `sqlite3.Connection` and restores the caller's row factory.
+
+### Asset uris and re-registration
+
+- `test_verify_assets_understands_the_file_scheme` — `Path("file://x.obj")` is
+  the *relative* path `file:/x.obj`, so such an asset reported `missing`
+  forever. Also pins that the uri is stored **as given**: the row's identity is
+  `(uri, content_hash)`, so normalising on write would make a re-registration
+  miss the row and insert a duplicate.
+- `test_verify_assets_understands_absolute_file_uris`.
+- `test_register_asset_refuses_a_scheme_usap_cannot_resolve` — `http://` raises
+  at registration, while a Windows path (no `//`) is unaffected.
+- `test_the_file_scheme_is_recognised_whatever_its_case` — registration compares
+  the scheme lowercased, so resolution has to as well, or `FILE://` is stored
+  happily and then reports `missing` for good.
+- `test_update_asset_refuses_a_scheme_usap_cannot_resolve` — the same guard on
+  the other door into the column. `update_asset` is what the asset-identity
+  guideline tells integrators to call, so a uri refused at registration must not
+  walk back in through it.
+- `test_two_objects_sharing_a_gml_id_is_an_error` — `resolve_city_object`
+  matches on `object_uid` *or* `gml_id`, so a second row claiming one makes
+  every reference to that value ambiguous from then on. Reported at `basic`,
+  since it is pure SQL and a caller who asked for the cheap check still wants
+  to know its identities are broken.
+- `test_distinct_gml_ids_and_absent_ones_are_fine` /
+  `test_empty_gml_ids_written_by_an_older_build_are_not_duplicates` — any number
+  of objects may have no `gml_id`: "unknown" is not a shared identity, and that
+  holds for the `""` an older build may have stored as much as for NULL.
+- `test_re_registering_an_asset_may_omit_fields` /
+  `test_re_registering_an_asset_part_may_omit_fields` — omitting a field is a
+  "give me the id" call, not a claim that it should be NULL. `element_count` is
+  still always compared: existing memberships are indexed against it.
+- `test_a_uri_split_across_a_hashed_and_an_unhashed_row_is_a_warning` — the
+  shape older builds produced when a registration omitted a hash the stored row
+  had. One file recorded twice: `resolve_asset` raises for the uri, and each row
+  takes its own parts, so annotations on one are invisible from the other. Built
+  with raw SQL, because the fixed `register_asset` can no longer create it.
+- `test_one_uri_at_two_hashes_is_two_versions_and_is_not_reported` /
+  `test_a_single_unhashed_asset_is_not_a_duplicate` — the negative cases that
+  stop the check counting rows per uri. Two hashes is the old file and the new
+  one, which the uniqueness key exists to keep apart; one unhashed row is an
+  ordinary `compute_hash=False` registration.
 
 ## Synthetic generator — `test_synthetic.py`
 

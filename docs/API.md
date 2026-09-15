@@ -43,7 +43,7 @@ anything relative to a part.
 
 | Call | Does |
 |---|---|
-| `register_asset(uri, asset_kind, media_type=None, content_hash=None, srs_id=None, metadata_json=None)` | register an external file; idempotent on `(uri, content_hash)` |
+| `register_asset(uri, asset_kind, media_type=None, content_hash=None, srs_id=None, metadata_json=None)` | register an external file; idempotent on `(uri, content_hash)`, and fields you omit are not compared. `content_hash` follows that rule too: omitting it still finds the row, supplying one fills a row that has none, and a *different* one registers a separate asset (a new version of the file). A uri already registered at several hashes raises `USAPAmbiguityError` unless you name one. A scheme USAP cannot resolve (`http://`, `s3://`, …) raises; `file://` is accepted and stored as given |
 | `register_asset_part(asset_id, part_path, element_kind, element_count, ..., indexing_profile=None)` | declare an index space and its element count |
 | `update_asset(asset_id, uri=..., content_hash=..., srs_id=..., ...)` | repair a record about the same file (a moved path); never re-indexes |
 | `list_assets(asset_kind=None)` | registered assets with part and element counts |
@@ -84,7 +84,8 @@ supply; USAP asserts no taxonomy of its own.
 
 | Call | Does |
 |---|---|
-| `create_city_object(object_uid, semantic_class_id=None, gml_id=None, object_status="accepted", ...)` | the semantic instance a claim is about; `object_status="temporary"` marks a carrier. Idempotent on `object_uid`, and a repeat call supplying a field that **contradicts** the stored row raises rather than discarding it |
+| `create_city_object(object_uid, semantic_class_id=None, gml_id=None, object_status="accepted", ...)` | the semantic instance a claim is about; `object_status="temporary"` marks a carrier. Idempotent on `object_uid`: a field still NULL is **filled in**, a field that **contradicts** the stored row raises. `""` counts as empty for `gml_id` / `source_object_id` |
+| `accept_city_object(city_object)` | a carrier's `object_status`: `temporary` → `accepted`. One-way, idempotent, and called for you by `import_citygml_semantics`. Records that the alignment happened; it changes nothing about what the object *is* |
 | `list_city_objects(object_status=None, related_to=None, descendants_of=None, direction="out", ...)` | list, or walk the graph one hop (`related_to`) or transitively (`descendants_of`) |
 | `resolve_city_object(city_object)` | id, `object_uid`, or `gml_id` → `city_object_id` |
 | `link_city_objects(from_city_object_id, to_city_object_id, relationship_type, to_external_uri=None, role=None, ...)` | one typed directed edge; the target may be outside the package |
@@ -100,11 +101,11 @@ supply; USAP asserts no taxonomy of its own.
 |---|---|
 | `annotate_elements(concept=..., asset_part_id=..., element_kind=..., element_indices=..., assessed_at=None, ...)` | **the main entry point**: create a claim and attach its geometry in one call |
 | `annotate_value_field(concept=..., asset_part_id=..., values=..., assessed_at=None, ...)` | same, for a per-element scalar field instead of a selection |
-| `create_concept_annotation(concept=..., city_object_uid=None, ...)` | create a claim with no geometry yet |
-| `create_annotation(annotation_uid, semantic_class_id, ...)` | the low-level form, taking a raw class id |
-| `get_annotation(annotation_id \| annotation_uid=...)` | one claim, with its assessment / membership / value summaries |
+| `create_concept_annotation(concept=..., city_object_uid=None, label=None, ...)` | create a claim with no geometry yet |
+| `create_annotation(annotation_uid, semantic_class_id, ..., label=None)` | the low-level form, taking a raw class id |
+| `get_annotation(annotation_id \| annotation_uid=...)` | one claim, with its assessment / membership / value summaries. `label` is returned but is **not** a lookup key |
 | `list_annotations(status=None, city_object_uid=None, asset_id=None, asset_part_id=None, limit=None, ...)` | filtered list; `asset_id` is how an app loads the annotations of the asset it just opened |
-| `update_annotation(annotation_id, status=..., confidence=..., semantic_class_id=..., ...)` | partial update; omitted fields are preserved |
+| `update_annotation(annotation_id, label=..., status=..., confidence=..., semantic_class_id=..., attributes=..., attributes_json=..., ...)` | partial update; omitted fields are preserved, and `label=None` clears the caption. `attributes` **merges** into the stored attributes (a key present replaces, a key set to `None` is removed, the rest survive); `attributes_json` **replaces** the whole field. Supplying both raises |
 | `delete_annotation(annotation_id, missing_ok=False)` | delete a claim and everything under it |
 | `link_annotation_to_object(annotation_id, city_object_id, relation_type="represents")` | add a secondary object link (`concerns`, `derivedFrom`, …) |
 
@@ -160,10 +161,55 @@ implicitly and behave exactly as before they existed.
 |---|---|
 | `pkg.validate_report(level="deep")` | integrity check — `basic` (SQL only), `deep` (+ payloads), `external` (+ files on disk) |
 | `validate_connection(conn, level="deep")` | the same against a raw connection |
-| `verify_assets(conn)` | per asset: `ok` / `missing` / `changed` / `unhashed`. A **relative** `uri` resolves against the package's own directory, so a package moves with its assets |
+| `verify_assets(conn)` | per asset: `ok` / `missing` / `changed` / `unhashed`. A **relative** `uri` resolves against the package's own directory, so a package moves with its assets; `file://` is understood as the same thing |
 | `read_geopackage_header(conn)` | application id and user version, to confirm the file is a GeoPackage |
 | `set_package_srs(conn, srs_id, definition_wkt=None)` | declare the package's CRS (re-stamps; never transforms coordinates) |
 | `epsg_from_wkt(wkt)` | best-effort EPSG code from a CRS WKT (needs `usap[crs]`) |
+
+## Content hashes
+
+| Call | Does |
+|---|---|
+| `canonical_hash(path)` | the canonical stored hash of a file: `'sha256:<lowercase hex>'` |
+| `parse_content_hash(value)` | a stored hash → `(algorithm, digest)`, or `None` when it is not a recognizable digest. A bare 64-hex digest is read as SHA-256 |
+
+Exported so no consumer has to reimplement the tolerance rules from prose —
+which is how two writers end up disagreeing about whether the same file is the
+same file. See the asset-identity guideline in HANDOFF.md §1.
+
+## Command line
+
+The wheel installs a `usap` console script, so a package can be checked without
+writing Python:
+
+```bash
+usap validate <package.usap.gpkg> [--level basic|deep|external]
+                                  [--json] [--fail-on-warning]
+```
+
+Exit code 0 when the package passes, 1 when it does not, 2 for a usage error
+(no subcommand, unknown `--level`). `--fail-on-warning` counts warnings as
+failures; the default follows `is_ok`, which counts errors only.
+
+`--json` writes the report to stdout for a CI gate:
+
+```json
+{ "is_ok": true, "failed": false, "issues": [] }
+```
+
+- `is_ok` — errors only, exactly as `validate_report()` defines it.
+- `failed` — what the exit code reflects. Under `--fail-on-warning` a
+  warnings-only package is `is_ok: true` **and** `failed: true`, so read this
+  one rather than inferring the outcome from `is_ok`.
+- `issues` — every `ValidationIssue` field: `severity`, `code`, `message`,
+  `table`, `row_id`, `details`.
+- `error` — present **only** when the run could not start at all (no such file,
+  a profile this build does not support, not a USAP package). The other keys
+  are still there, so one parser handles both cases; `issues` is empty because
+  validation never ran.
+
+The failure path is JSON too, which is the point of the flag: a gate that pipes
+stdout to a parser should meet a reason it can read, not a decode error.
 
 ---
 

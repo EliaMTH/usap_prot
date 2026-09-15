@@ -370,6 +370,14 @@ CREATE TABLE usap_annotation (
 
     status                 TEXT NOT NULL DEFAULT 'accepted',
     confidence             REAL,
+
+    -- A human-readable name for this claim, for display. Deliberately NOT an
+    -- identifier: no UNIQUE, no index, and no resolve_* or get_annotation
+    -- lookup accepts it. That rule is what keeps it from becoming a fourth
+    -- name to reconcile beside annotation_uid, object_uid and gml_id -- it is
+    -- a caption, and two annotations may legitimately share one.
+    label                  TEXT,
+
     attributes_json        TEXT,
 
     -- UTC ISO-8601 with the 'Z' offset, not SQLite's CURRENT_TIMESTAMP
@@ -615,6 +623,7 @@ CREATE VIEW usap_annotations_view AS
 SELECT
     a.annotation_id AS OGC_FID,
     a.annotation_uid,
+    a.label,
     sc.local_name AS concept,
     sc.class_uri AS concept_uri,
     sc.scheme,

@@ -62,6 +62,25 @@ So:
 `register_asset_part` on `(asset_id, part_path, element_kind)`; a re-run with
 different values raises rather than returning a row describing something else.
 
+The pair is a uniqueness key, not a lookup you have to reproduce exactly, so
+`content_hash` follows the same omission rule as every other field:
+
+- **omitting it still finds the row.** `register_asset(uri, kind)` against an
+  asset you registered with a hash returns that asset's id. You do not have to
+  re-digest a 10 GB file to ask for an id you already own;
+- **supplying one against a row that has none fills it in**, so a first pass
+  with `compute_hash=False` and a later one that computes it end with a single
+  record that `verify_assets` can check — not two;
+- **supplying one that differs registers a separate asset.** That is a new
+  version of the file, and keeping the rows apart is what the uniqueness key is
+  for: the annotations indexed against the old geometry stay indexed against it.
+
+Once a uri is on file at more than one hash it no longer names a single asset,
+so a call that omits the hash raises `USAPAmbiguityError` rather than choosing —
+pass the hash, or use `asset_id`. A package that already holds a uri split
+across a hashed and an unhashed row reports `DUPLICATE_ASSET_URI` (warning):
+re-register with the hash to merge the records.
+
 ### Detecting that the file changed
 
 Annotations are bound to one immutable version of an external file.
@@ -88,6 +107,63 @@ pkg.register_asset(uri="meshes/catania.obj", ...)   # in a subfolder
 
 The uri is also the string an annotation batch references as `asset_uri`, so
 whatever you choose here is what the rest of the pipeline names the asset by.
+
+A `file://` uri is understood — `file://catania.obj` resolves beside the package
+exactly like the bare filename — and stored as written. Any other scheme
+(`http://`, `s3://`, …) is refused at registration: USAP resolves asset uris as
+paths and fetches nothing, so such a row could only ever verify as `missing`.
+
+### Is the file the user just opened the one this package was built on?
+
+`verify_assets` answers the opposite question — it starts from the registered
+uri and checks the file it finds there. In an interactive application the user
+picks the file, and the registered uri is *not* an identity: the file may have
+been moved or renamed. The rule:
+
+- **When the package carries a `content_hash`, decide on the hash.** Compare it
+  against the hash of the chosen file, in the documented form. Do not compare
+  file names — a rename defeats that, and it looks like a check while being none.
+- **When it does not, say so.** Report *unverified* to the user rather than
+  falling back to a name comparison dressed up as verification. `content_hash`
+  is `None` more often than you would expect: the generic `register_asset` above
+  defaults it that way, so this is the common path, not the edge case.
+
+Use the exported helpers rather than reimplementing the tolerance rules:
+
+```python
+from usap import canonical_hash, parse_content_hash
+
+# Compare parsed, not as text. A stored hash is not guaranteed to be in the
+# canonical 'sha256:<lowercase hex>' form -- a bare 64-hex digest is also
+# valid and is read as SHA-256 -- so `==` on the raw strings silently misses
+# a match that is really there. parse_content_hash is the tolerance rule.
+wanted = parse_content_hash(canonical_hash(chosen_file))
+
+match = next(
+    (
+        a for a in pkg.list_assets()
+        if a["content_hash"] is not None
+        and parse_content_hash(a["content_hash"]) == wanted
+    ),
+    None,
+)
+
+if match is not None:
+    # The step worth not stopping short of: record where the file actually is,
+    # so the package verifies from here on instead of reporting `missing`
+    # every time it is opened.
+    pkg.update_asset(match["asset_id"], uri=str(chosen_file))
+```
+
+`canonical_hash` and `parse_content_hash` are part of the public API precisely
+so every application does not invent its own reading of the spec. `None` from
+`parse_content_hash` means the stored value is not a recognizable digest at all
+— `validate_report()` reports those as `NON_CANONICAL_CONTENT_HASH` — and such
+a row can never be matched, which is a case to report rather than to skip past.
+
+A uri you write back is held to the same rule as one you register: a scheme
+USAP cannot resolve (`http://`, `s3://`, …) is refused, since a record repaired
+into one that can only ever verify as `missing` is not repaired.
 
 ---
 
@@ -125,17 +201,56 @@ about different things, and the second one belongs on the annotation.
 
 Pass `semantic_class_id=None` when creating carriers. As of 0.4.2, passing a
 *different* class for an existing `object_uid` raises rather than discarding it
-— but the fix is to not pass one, not to catch the error.
+— but the fix is to not pass one, not to catch the error. The annotation batch
+now follows the same rule: carriers it creates with
+`create_missing_city_objects` are classless, and the entry's `concept` classes
+the annotation only.
 
-The same now holds for `gml_id`, `source_asset_id`, `source_object_id` and
-`attributes_json`: supplying a value that contradicts the stored row raises.
+The same holds for `gml_id`, `source_asset_id`, `source_object_id` and
+`attributes_json`: supplying a value that *contradicts* the stored row raises.
 Fields you omit are not compared, so `create_city_object(uid)` remains a valid
 "give me the id for this uid" call.
+
+**Supplying a value for a field that is still empty fills it in.**
+that is an enrichment, not a conflict — it is how a carrier acquires its class,
+its `gml_id` and its provenance when the CityGML that owns them arrives. The
+distinction is exactly: NULL → value fills, value → different value raises.
+
+An empty string counts as empty for `gml_id` and `source_object_id`. If your
+writer emits `""` for "unknown", it is stored as NULL, and rows an older build
+already wrote that way complete on the next call supplying a real value — you do
+not need a migration or raw SQL to repair them.
+
+**Do not write `attributes_json` onto a carrier.** This is the one column where
+the fill-what-is-empty rule works against you, and the failure is much larger
+than the row. `import_citygml_semantics` writes its own provenance there
+(`source`, `citygml_local_name`, `citygml_namespace`), so a carrier already
+holding a value the import would have to change raises — and because the import
+runs as one transaction, that **aborts the entire import**. No other object in
+the file is aligned either, however many thousands were fine. There is no API to
+clear the column (see §2.3), so the package cannot then be aligned through the
+SDK at all.
+
+Per-object notes belong on the annotation, not the object: an annotation has a
+`label` for a human-readable name and an `attributes` field of its own. Leave
+the city object's `attributes_json` to the semantic source that owns it.
 
 ### 2.3 There is no `update_city_object`
 
 By design. To change what an object *is*, change the CityGML. USAP is not the
-place that fact lives.
+place that fact lives. A stored value that is simply wrong means the package
+disagrees with its source: rebuild it rather than editing it here.
+
+**One narrow exception, and it does not change what the object is.**
+`accept_city_object(uid)` moves `object_status` from `temporary` to `accepted`.
+It records that the alignment *happened* — the class, the `gml_id` and the
+provenance arrive through `create_city_object` backfill, from the semantic
+source that owns them; this only clears the marker saying one was still
+expected. It is one-way and idempotent, and `import_citygml_semantics` calls it
+for you when it aligns a carrier. Call it yourself when something other than the
+CityGML importer is what settled the object's identity — otherwise the object
+stays listed by `list_city_objects(object_status="temporary")`, "still awaiting
+alignment", for the life of the package.
 
 ---
 
@@ -197,9 +312,19 @@ Re-asserting a *different* non-NULL category raises rather than overwriting.
 
 ## 4. Display labels
 
-Where the user stories say "label", they mean the concept and the object identity, composed for display:
+An annotation carries a `label`: a free-text caption, yours to set and edit,
+returned by every read path. Where the user stories say "label", that column is
+what they mean.
 
-| Case | Label |
+It is deliberately **not** an identifier. No UNIQUE constraint, no index, and no
+lookup accepts it — `get_annotation` takes an `annotation_id` or an
+`annotation_uid` and nothing else. Two annotations may carry the same caption,
+and USAP will not disambiguate them for you.
+
+**A label is optional, so have a fallback.** It is NULL until something sets it,
+and nothing sets it implicitly. Compose the fallback from what is always there:
+
+| Case | Fallback when `label` is NULL |
 |---|---|
 | annotation linked to a city object | `semantic_class` + `primary_city_object_gml_id` |
 | not linked | `semantic_class` + `annotation_uid` |
@@ -210,15 +335,9 @@ is explicitly permitted, and **every** value-field annotation has
 geometry, not of an object.
 
 All three read paths — `get_annotation`, `list_annotations`,
-`annotations_for_elements` — return both `primary_city_object_uid` and
-`primary_city_object_gml_id`, so the lasso result list and the detail panel can
-render the identical string. (Before 0.4.2 the reverse query returned only the
-uid; if you are reading an older build, that is why.)
-
-Uniqueness of displayed labels is the application's problem. Two annotations
-may legitimately carry the same concept on the same object; USAP returns both
-and does not disambiguate them, because a raw answer is useful and a
-de-duplicated one is not recoverable.
+`annotations_for_elements` — return `label` alongside `primary_city_object_uid`
+and `primary_city_object_gml_id`, so the lasso result list and the detail panel
+render the identical string without a second query per row.
 
 ---
 
@@ -360,7 +479,7 @@ re-hashes files. Two results worth deciding about in advance:
 - [ ] `object_uid == gml:id`, derived in exactly one place
 - [ ] carriers are created with `semantic_class_id=None`
 - [ ] subtree queries use `elements_for_city_objects` (plural)
-- [ ] labels are composed from concept + gml:id, with an unlinked fallback
+- [ ] a NULL `label` falls back to concept + gml:id, and to concept + uid when unlinked
 - [ ] the CityGML XSDs ship with the installer
 - [ ] the CityGML write and the USAP commit follow the temp-file protocol
 - [ ] `USAPAmbiguityError` is caught wherever re-assessment is possible

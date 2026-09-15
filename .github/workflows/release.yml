@@ -1,0 +1,55 @@
+# Attach a wheel and an sdist to the GitHub release for a tag.
+#
+# Its own file rather than a job in ci.yml, because ci.yml triggers on
+# `push: branches: [main]`, `pull_request` and `workflow_dispatch` — none of
+# which fire on a tag, so a release job added there would never run.
+#
+# An Actions artifact (ci.yml's "Publish the wheel") is scoped to one run,
+# expires, and needs a logged-in account with repo access to fetch. A release
+# asset is permanent and has a direct URL that can go in a requirements file:
+#
+#   pip install https://github.com/<owner>/usap/releases/download/v0.5.0/usap-0.5.0-py3-none-any.whl
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# The default GITHUB_TOKEN is read-only; creating a release needs write.
+# Omitting this is the usual reason a first release job fails.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build and attach
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build          # no --wheel: makes both
+
+      # A release page shows four downloads, not two: GitHub auto-attaches
+      # "Source code (zip)" and "Source code (tar.gz)" to every tag. Those are
+      # the git tree; the sdist is a packaging subset and the wheel is the
+      # runtime only. Worth saying in the notes so nobody installs the wrong
+      # tarball.
+      # The body is left empty on purpose. CHANGELOG.md is a local working
+      # document and is not in the repository, so this job cannot read it, and
+      # GitHub's generated notes are a list of commit titles -- which is not
+      # what anyone upgrading needs. Fill it in from the checkout that has the
+      # file:
+      #
+      #   gh release edit v0.5.0 --notes-file CHANGELOG.md
+      - name: Attach them to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

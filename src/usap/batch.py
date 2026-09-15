@@ -5,11 +5,35 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ._util import require_str
+from ._util import _check_keys, require_str
 from .core import USAPPackage
 from .errors import USAPAmbiguityError, USAPError
 from .domain_vocab import seed_vocabulary_file
 from .constants import normalize_element_kind
+
+
+# Every key a batch payload understands. A batch is generated, not hand-typed,
+# so a key the importer does not read is a key whose intent is dropped on every
+# entry of every run -- silently, since nothing downstream reads it either. The
+# same check project_builder applies to configs; see _util._check_keys.
+_BATCH_KEYS = frozenset({
+    "vocabularies", "annotations", "create_missing_city_objects",
+})
+_ITEM_KEYS = frozenset({
+    "annotation_uid", "city_object_id", "city_object_uid",
+    "gml_id", "source_object_id",
+    "concept", "scheme", "label", "status", "confidence",
+    "attributes", "attributes_json", "assessed_at",
+    "memberships", "value_fields",
+})
+_MEMBERSHIP_KEYS = frozenset({
+    "asset_part_id", "asset_uri", "part_path",
+    "element_kind", "element_indices",
+})
+_VALUE_FIELD_KEYS = frozenset({
+    "asset_part_id", "asset_uri", "part_path",
+    "element_kind", "values", "value_dtype",
+})
 
 
 @dataclass(frozen=True)
@@ -78,6 +102,7 @@ def apply_annotation_batch(
           "concept": "EnergyRoof",              # optional when the linked
                                                 # object already has a class
           "city_object_uid": "building_1_roof_1",
+          "label": "Via Etnea, tratto 4",  # optional: display name
           "status": "draft",
           "confidence": 0.8,
           "attributes": {...},
@@ -103,10 +128,19 @@ def apply_annotation_batch(
 
     With "create_missing_city_objects": true (the minimal-vocabulary
     procedure), an unknown city_object_uid creates a carrier city object on
-    the fly: classed by the entry's concept, object_status='temporary' (the
-    marker for later alignment with a CityGML-backed object), nothing else.
+    the fly: an identity, object_status='temporary' (the marker for later
+    alignment with a CityGML-backed object), nothing more. It is deliberately
+    **classless** — an object's class belongs to the semantic source, and
+    arrives when the CityGML import that aligns the carrier backfills it.
     Without the flag, unknown names fail loudly — which is the guardrail
     against mixing ad-hoc names into a CityGML-built package.
+
+    An entry's "gml_id" and "source_object_id" say what the *object* is in the
+    CityGML, and are written whether the object is created here or already
+    existed — on the same terms as create_city_object itself: a column still
+    empty is filled, a column already holding something else raises. They are
+    not conditional on "create_missing_city_objects", since an object that is
+    already there is exactly the case that flag does not cover.
     """
     base_path = Path(base_dir)
 
@@ -121,6 +155,11 @@ def apply_annotation_batch(
 
     if not isinstance(annotations, list):
         raise ValueError("Batch data must contain an 'annotations' list.")
+
+    # Before the transaction opens, not inside it: a typo in the last of 8,869
+    # entries should not roll back the first 8,868. One pass over the payload
+    # is cheap next to the writes it guards.
+    _check_batch_keys(data, annotations)
 
     result = BatchImportResult()
 
@@ -158,6 +197,72 @@ def apply_annotation_batch(
     return result
 
 
+def _check_batch_keys(
+    data: dict[str, Any],
+    annotations: list[Any],
+) -> None:
+    """
+    Refuse field names nothing in the batch importer reads.
+
+    Values are already checked where they are used — an unknown concept, an
+    index past the part's element_count and a malformed assessed_at all raise
+    today. What escapes is a key the importer never looks for: a value you
+    never read is a value you cannot validate.
+    """
+    _check_keys(data, _BATCH_KEYS, where="the batch")
+
+    for position, item in enumerate(annotations, start=1):
+        if not isinstance(item, dict):
+            # Shape is _apply_one_annotation's to report, with its own message.
+            continue
+
+        where = item.get("annotation_uid") or item.get("city_object_uid")
+        where = (
+            f"annotation entry {where!r}"
+            if isinstance(where, str)
+            else f"annotation entry {position}"
+        )
+
+        _check_keys(item, _ITEM_KEYS, where=where)
+
+        for field_name, known in (
+            ("memberships", _MEMBERSHIP_KEYS),
+            ("value_fields", _VALUE_FIELD_KEYS),
+        ):
+            blocks = item.get(field_name)
+
+            if not isinstance(blocks, list):
+                continue
+
+            for block in blocks:
+                if isinstance(block, dict):
+                    _check_keys(
+                        block,
+                        known,
+                        where=f"a {field_name!r} block of {where}",
+                    )
+
+
+def _object_uid_for(pkg: USAPPackage, city_object_id: int) -> str:
+    """
+    The object_uid of a city object named by its id.
+
+    An entry may reference its object either way, but `create_city_object` is
+    keyed on the uid -- that column is the row's identity -- so the int form
+    needs this before it can write anything back.
+    """
+    return str(
+        pkg.conn.execute(
+            """
+            SELECT object_uid
+            FROM usap_city_object
+            WHERE city_object_id = ?
+            """,
+            (city_object_id,),
+        ).fetchone()["object_uid"]
+    )
+
+
 def _apply_one_annotation(
     pkg: USAPPackage,
     item: dict[str, Any],
@@ -186,10 +291,35 @@ def _apply_one_annotation(
 
     resolved_city_object_id: int | None = None
 
+    # What the entry says about the object's own identity, as opposed to the
+    # annotation's. Omitting a field claims nothing; create_city_object below
+    # treats a None the same way, but filtering here keeps the "did this entry
+    # say anything at all" test in one place.
+    identity = {
+        key: item[key]
+        for key in ("gml_id", "source_object_id")
+        if item.get(key) is not None
+    }
+
     if city_object_id is not None:
         resolved_city_object_id = pkg.resolve_city_object(int(city_object_id))
 
+        if identity:
+            # create_city_object is keyed on object_uid, so the int form needs
+            # the uid before it can write. One SELECT, so an entry referencing
+            # its object by id is not quietly worse than one naming it.
+            pkg.create_city_object(
+                object_uid=_object_uid_for(pkg, resolved_city_object_id),
+                **identity,
+            )
+
     if city_object_uid is not None:
+        # Only the lookup belongs in the try. An identity write raises
+        # USAPError on a contradiction, and catching that here would read a
+        # genuine conflict as "no such object" and mint a carrier for a name
+        # that already exists.
+        object_existed = True
+
         try:
             resolved_city_object_id = pkg.resolve_city_object(
                 str(city_object_uid)
@@ -197,27 +327,56 @@ def _apply_one_annotation(
         except USAPAmbiguityError:
             raise
         except USAPError:
+            object_existed = False
+
             if not create_missing_city_objects:
                 raise
 
+            # The carrier itself is classless; the concept is still needed,
+            # because it is what classes the *annotation* being written.
             if concept is None:
                 raise ValueError(
                     f"{entry_label}: creating city object "
-                    f"{city_object_uid!r} needs 'concept' to say what it is."
+                    f"{city_object_uid!r} needs 'concept' to class the "
+                    "annotation. The carrier object is created classless: its "
+                    "own class belongs to the CityGML that later aligns it."
                 )
 
-            # Carrier object for the minimal-vocabulary procedure: classed
-            # by "what it is", marked temporary for later alignment with a
-            # CityGML-backed object, nothing else.
+            # Carrier object for the minimal-vocabulary procedure: an
+            # identity and nothing more. Deliberately classless -- not because
+            # an annotation's concept is the wrong *kind* of value here (any
+            # registered concept is legal in this column, and nothing
+            # validates the pairing), but because the column is the CityGML's
+            # to fill and the annotator is not the CityGML. Guessing it is
+            # silent: the package validates clean at every level, and the
+            # contradiction surfaces only when the import that should align
+            # this carrier meets a class already stored and has to refuse. The
+            # class, and anything else still missing, arrives with that
+            # alignment (create_city_object backfills).
             resolved_city_object_id = pkg.create_city_object(
                 object_uid=str(city_object_uid),
-                semantic_class_id=pkg.resolve_semantic_class(
-                    concept,
-                    scheme=item.get("scheme"),
-                ),
                 object_status="temporary",
+                **identity,
             )
             created_city_object_uids.append(str(city_object_uid))
+
+        # The object already existed, which is every re-run and every object
+        # something else pre-created. What the entry knows about the CityGML
+        # behind it is exactly as true here as on first creation; writing it
+        # only in the branch above is how the identity went missing for every
+        # entry that was not the first to name its object.
+        if object_existed and identity:
+            # Keyed by the row resolve actually matched, not by the string the
+            # entry gave. resolve_city_object matches object_uid OR gml_id,
+            # while create_city_object is keyed on object_uid alone and inserts
+            # when it finds nothing -- so an entry naming its object by gml_id
+            # would miss the resolved row and mint a second one, leaving two
+            # rows claiming one gml_id (DUPLICATE_GML_ID) and every later
+            # reference to that value permanently ambiguous.
+            pkg.create_city_object(
+                object_uid=_object_uid_for(pkg, resolved_city_object_id),
+                **identity,
+            )
 
     # The annotation's concept: explicit wins; otherwise it is inherited
     # from the linked city object's class (semantics from the CityGML side).
@@ -239,7 +398,9 @@ def _apply_one_annotation(
         if row is None or row["semantic_class_id"] is None:
             raise ValueError(
                 f"{entry_label}: linked city object has no semantic class; "
-                "provide 'concept'."
+                "provide 'concept'. A carrier object created by this batch is "
+                "deliberately classless, so items that reference one must "
+                "carry their own 'concept'."
             )
 
         semantic_class_id = int(row["semantic_class_id"])
@@ -305,6 +466,7 @@ def _apply_one_annotation(
             concept=semantic_class_id,
             annotation_uid=annotation_uid,
             city_object_id=resolved_city_object_id,
+            label=item.get("label"),
             status=item.get("status", "draft"),
             confidence=item.get("confidence"),
             attributes=attributes,
@@ -320,6 +482,9 @@ def _apply_one_annotation(
         update_kwargs: dict[str, Any] = {
             "semantic_class_id": semantic_class_id,
         }
+
+        if "label" in item:
+            update_kwargs["label"] = item.get("label")
 
         if "status" in item:
             update_kwargs["status"] = item.get("status")

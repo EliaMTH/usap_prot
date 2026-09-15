@@ -599,6 +599,14 @@ def _collect_objects(
             ),
         )
 
+        # This import IS the alignment a carrier was waiting for: it supplies
+        # the class, the gml_id and the provenance that create_city_object has
+        # just backfilled. Promote the marker to match, or the object stays
+        # listed by list_city_objects(object_status="temporary") -- "still
+        # awaiting alignment" -- for the life of the package. A row that was
+        # already 'accepted' is left alone.
+        pkg.accept_city_object(city_object_id)
+
         entry = ImportedCityObject(
             city_object_id=city_object_id,
             object_uid=object_uid,

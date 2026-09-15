@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from ._util import parse_content_hash, sha256_file
+from ._util import parse_content_hash, path_from_uri, sha256_file
 from .constants import (
     ANNOTATION_STATUSES,
     CITY_OBJECT_STATUSES,
@@ -157,6 +157,8 @@ def validate_connection(
         _validate_membership_blocks(conn, report, decode_payloads=deep)
         _validate_value_blocks(conn, report, decode_payloads=deep)
         _validate_semantic_class_closure(conn, report)
+        _validate_city_object_identity(conn, report)
+        _validate_asset_identity(conn, report)
         _validate_city_object_relationships(conn, report)
         _validate_relationship_types(conn, report)
 
@@ -1340,6 +1342,168 @@ def _validate_annotation_domain(
         )
 
 
+def _validate_city_object_identity(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    """
+    A gml_id names one object in the CityGML, so it must name one row here.
+
+    Two rows sharing one break lookup for good: resolve_city_object matches on
+    object_uid OR gml_id, so a reference that resolved before the second row
+    was written starts raising USAPAmbiguityError and never stops. Nothing in
+    the schema prevents it -- gml_id carries no UNIQUE constraint, because a
+    row is allowed not to have one at all -- so it is caught here.
+
+    The usual way in is an annotation batch whose entries carry a gml_id under
+    a city_object_uid of their own invention: the CityGML import that should
+    have aligned those carriers instead creates siblings, since it matches
+    carriers by object_uid. HANDOFF 2.1 asks for object_uid to *be* the gml:id
+    for exactly this reason.
+
+    Empty strings are not identities and are skipped. create_city_object
+    normalises "" to NULL, but rows written before it did may still hold one,
+    and those mean "unknown", not "the same object as that other row".
+    """
+    duplicates = conn.execute(
+        """
+        SELECT
+            gml_id,
+            COUNT(*) AS row_count,
+            MIN(city_object_id) AS first_city_object_id
+        FROM usap_city_object
+        WHERE gml_id IS NOT NULL
+        AND gml_id != ''
+        GROUP BY gml_id
+        HAVING COUNT(*) > 1
+        ORDER BY gml_id
+        """
+    ).fetchall()
+
+    for duplicate in duplicates:
+        sharing = conn.execute(
+            """
+            SELECT city_object_id, object_uid
+            FROM usap_city_object
+            WHERE gml_id = ?
+            ORDER BY city_object_id
+            """,
+            (duplicate["gml_id"],),
+        ).fetchall()
+
+        object_uids = [row["object_uid"] for row in sharing]
+
+        report.add(
+            severity="error",
+            code="DUPLICATE_GML_ID",
+            message=(
+                f"gml_id {duplicate['gml_id']!r} is claimed by "
+                f"{duplicate['row_count']} city objects "
+                f"({', '.join(repr(uid) for uid in object_uids)}). "
+                "A gml_id identifies one object in the semantic source, and "
+                "resolve_city_object matches on it, so every reference to this "
+                "value is now ambiguous. Give the object one row: the usual "
+                "cause is a carrier created under a name of its own that the "
+                "CityGML import could not recognise as the same object."
+            ),
+            table="usap_city_object",
+            row_id=int(duplicate["first_city_object_id"]),
+            details={
+                "gml_id": duplicate["gml_id"],
+                "object_uids": object_uids,
+                "city_object_ids": [
+                    int(row["city_object_id"]) for row in sharing
+                ],
+            },
+        )
+
+
+def _validate_asset_identity(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> None:
+    """
+    One uri, one row -- except where two rows are two versions of the file.
+
+    usap_asset is unique on (uri, content_hash), so the same uri at two
+    different hashes is legal and deliberate: it is the old file and the new
+    one, kept apart so the annotations indexed against each stay indexed
+    against the right geometry. That shape is NOT reported here.
+
+    What is reported is a uri whose rows include one with no content_hash at
+    all. That pairing is never intentional. It is what register_asset produced
+    before it learned to fall back to a uri-only lookup: a call that omitted
+    the hash -- or supplied one the stored row lacked -- missed the row and
+    inserted a sibling. The documented compute_hash=False path on a large
+    asset (INGESTION.md) reaches it in two ordinary runs.
+
+    It costs more than tidiness. resolve_asset matches on uri and raises
+    USAPAmbiguityError once a second row appears, so every reference by uri
+    stops working. Worse, each row takes its own asset parts --
+    UNIQUE(asset_id, part_path, element_kind) permits the same part_path under
+    a different asset_id -- so annotations written against one row's parts are
+    invisible to a reverse query run against the other's, and the package
+    validates clean at every other check while that is true.
+
+    A current build can no longer create this; the check is for packages that
+    already hold it.
+    """
+    duplicates = conn.execute(
+        """
+        SELECT
+            uri,
+            COUNT(*) AS row_count,
+            MIN(asset_id) AS first_asset_id
+        FROM usap_asset
+        GROUP BY uri
+        HAVING COUNT(*) > 1
+           AND SUM(CASE WHEN content_hash IS NULL THEN 1 ELSE 0 END) > 0
+        ORDER BY uri
+        """
+    ).fetchall()
+
+    for duplicate in duplicates:
+        sharing = conn.execute(
+            """
+            SELECT asset_id, content_hash
+            FROM usap_asset
+            WHERE uri = ?
+            ORDER BY asset_id
+            """,
+            (duplicate["uri"],),
+        ).fetchall()
+
+        unhashed = [
+            int(row["asset_id"])
+            for row in sharing
+            if row["content_hash"] is None
+        ]
+
+        report.add(
+            severity="warning",
+            code="DUPLICATE_ASSET_URI",
+            message=(
+                f"uri {duplicate['uri']!r} is claimed by "
+                f"{duplicate['row_count']} asset rows, "
+                f"{len(unhashed)} of them with no content_hash "
+                f"(asset_id {', '.join(str(i) for i in unhashed)}). "
+                "Rows differing only by a missing hash are one file recorded "
+                "twice, not two versions of it: resolve_asset raises "
+                "USAPAmbiguityError for this uri, and annotations written "
+                "against one row's parts cannot be found from the other's. "
+                "Re-register the asset with its content_hash so the records "
+                "merge, or rebuild the package."
+            ),
+            table="usap_asset",
+            row_id=int(duplicate["first_asset_id"]),
+            details={
+                "uri": duplicate["uri"],
+                "asset_ids": [int(row["asset_id"]) for row in sharing],
+                "unhashed_asset_ids": unhashed,
+            },
+        )
+
+
 def _package_directory(conn: sqlite3.Connection) -> Path | None:
     """
     The directory holding this package's file, or None for an in-memory one.
@@ -1364,7 +1528,7 @@ def _package_directory(conn: sqlite3.Connection) -> Path | None:
 
 def _resolve_asset_uri(uri: str, base: Path | None) -> Path:
     """Where an asset uri points, relative uris being relative to the package."""
-    path = Path(uri)
+    path = path_from_uri(uri)
 
     if base is None or path.is_absolute():
         return path

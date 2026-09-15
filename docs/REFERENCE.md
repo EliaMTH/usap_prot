@@ -28,12 +28,13 @@ The motivation and mental model are in [README.md](../README.md); this file is t
 
 This repository contains a working MVP. The file format, schema, and API may still change, and packages created with this version should be treated as experimental.
 
-The current schema is profile version **0.4.0**. There is no migration path from
-either older profile: 0.3.0 renamed the relationship endpoints and made the link
-type a foreign key into a new table, and 0.4.0 moved membership and value blocks
-under `usap_assessment` and dropped `usap_annotation.label`. `USAPPackage.open`
-refuses an older package with an explicit "unsupported profile version" error
-rather than misreading it. Rebuild rather than migrate.
+The current schema is profile version **0.5.0**. There is no migration path from
+any older profile: 0.3.0 renamed the relationship endpoints and made the link
+type a foreign key into a new table, 0.4.0 moved membership and value blocks
+under `usap_assessment` and dropped `usap_annotation.label`, and 0.5.0 brought
+that label back as a column. `USAPPackage.open` refuses an older package with an
+explicit "unsupported profile version" error rather than misreading it. Rebuild
+rather than migrate.
 
 What the prototype can do, end to end:
 
@@ -156,6 +157,38 @@ reports anything that is not a recognizable digest as
 `NON_CANONICAL_CONTENT_HASH` (a warning — such a value can never be verified
 against the file).
 
+**One uri, one row — unless the rows are two versions.** The uniqueness key
+makes the same uri at two *different* hashes legal and deliberate: the old file
+and the new one, kept apart so each keeps the annotations indexed against its
+own geometry. What is never intentional is a uri whose rows include one with no
+hash at all, which `basic` validation reports as `DUPLICATE_ASSET_URI` (a
+warning). The two rows are one file recorded twice: `resolve_asset` raises
+`USAPAmbiguityError` for that uri from then on, and because each row takes its
+own asset parts — `UNIQUE(asset_id, part_path, element_kind)` permits the same
+`part_path` under a different `asset_id` — annotations written against one row's
+parts cannot be found from a reverse query against the other's, while every
+other check still passes. Older builds produced it whenever a registration
+omitted a hash the stored row had, or supplied one it lacked; `register_asset`
+now resolves on the uri and fills or reuses the row instead. Re-register with
+the content hash to merge the records.
+
+**Reproducing the digest outside Python.** Readers in other languages have to
+compute the identical string, so the rules are exact:
+
+- **SHA-256 over the complete raw bytes of the file**, with no normalisation
+  whatsoever — no line-ending translation, no trailing-newline handling, no
+  encoding step. The file is bytes.
+- The digest is **lowercase hex**, and the algorithm token is **lowercase**.
+  `sha256:a48f…` parses; `sha256:A48F…` does **not**, and is reported as
+  non-canonical.
+- The one asymmetry worth knowing: a **bare** 64-hex digest is accepted in
+  either case and lowercased on read, because such values predate the canonical
+  form. Only the prefixed spelling is strict.
+
+`usap.canonical_hash(path)` returns exactly this string, and
+`usap.parse_content_hash(value)` applies exactly these rules — both are exported,
+so no consumer needs to reimplement them from this prose.
+
 ### 3D Asset part
 
 A stable indexable part of an asset. Each part stores its `element_kind` (point or face) and its `element_count` (number of points or faces). Element indices into a part are the coordinate system annotations live in.
@@ -277,8 +310,62 @@ carry secondary links (`concerns`, `derivedFrom`, …); city-object queries foll
 (`elements_for_city_object(..., link_types=(...))`).
 
 **What belongs in USAP vs the semantic source.** USAP is authoritative for the *claim layer*: which elements, under which concept, with what status, confidence, and provenance. The CityGML/ADE (or other semantic source) is authoritative for the *meaning layer*: which concepts and objects exist, their
-properties, and their hierarchy. Accordingly, an annotation's `attributes` must hold **claim-level metadata only** — how/when/by what the claim was produced (`method`, `source`, `assessed_at`, and for value fields `unit`, `validAt`).
+properties, and their hierarchy. Accordingly, an annotation's `attributes` must hold **claim-level metadata only** — how and by what the claim was produced (`method`, `source`, and for value fields `unit`, `validAt`). *When* it was made is the assessment's `assessed_at` column, not an attribute.
 Object properties (e.g., roof slope) stay in the semantic source, reachable through the linked city object, so there is exactly one authority for them and nothing to keep synchronized.
+
+**A `label` for display.** An annotation carries a `label`: free text, a caption
+for a human reading a list or a detail panel. It is returned by every read path
+— `get_annotation`, `list_annotations` and `annotations_for_elements` — so a
+selection result list can show a name per hit without a second query.
+
+It is deliberately **not** an identifier: no UNIQUE constraint, no index, and no
+`resolve_*` or `get_annotation` lookup accepts it. Two annotations may carry the
+same caption. That rule is the whole of what keeps it from becoming a fourth
+name to reconcile beside `annotation_uid`, `object_uid` and `gml_id`. It is also
+optional and never set implicitly, so an application wants a fallback — see
+[HANDOFF.md](HANDOFF.md) §4.
+
+**`attributes` is subordinate to the columns.** No key may duplicate a column,
+and where a package somehow carries both, the column is authoritative and the
+key is data USAP does not read. So a caption belongs in `label`, a state in
+`status`, a score in `confidence` and a date in the assessment's `assessed_at` —
+never in `attributes` as well. What is left for `attributes` is genuinely
+claim-level metadata the schema does not model: `method`, `source`, and for
+value fields `unit` and `validAt`.
+
+**The reserved `usap:` prefix.** Keys beginning `usap:` inside `attributes`
+belong to the format rather than to the writer, so a reader can interpret them
+without knowing which application wrote the package. Do not invent your own
+`usap:`-prefixed keys; use a prefix of your own. One key is reserved:
+
+- **`usap:path`** — an ordered sequence over the elements this annotation
+  covers, for a claim whose membership has a direction: a polyline, a
+  traversal, a centreline. A list of lists, one inner list per disjoint run,
+  holding absolute element indices:
+
+  ```json
+  "usap:path": [[41, 42, 43, 58, 59], [77, 78]]
+  ```
+
+  This exists because membership cannot express it. Membership is a roaring
+  bitmap — a *set* — so it comes back ascending and deduplicated, and the order
+  is destroyed by construction. **This key is the only copy of it.**
+
+  Three rules, none of them enforced by validation:
+
+  - every index must lie within the part's `element_count`;
+  - the path's element set must **equal** the membership set — sorting and
+    deduplicating the path must reproduce the membership exactly. The path is
+    the source; the membership is its index;
+  - it is well defined only when the annotation covers a single
+    `(asset part, element kind)` pair. Element indices are scoped to that pair,
+    and an annotation may span several; where one does, an ordered path has
+    nowhere to say which part it runs through.
+
+  Those last two are why this is an **interim** home. A dedicated sidecar table
+  — carrying the part, the element kind, a sequence ordinal and a compressed
+  payload, with membership derived from the path so the two cannot drift — is
+  planned, and `usap:path` is the spelling that will be migrated into it.
 
 Example:
 
@@ -365,6 +452,25 @@ asset part area.las points/all
 selected point indices [100, 101, 102]
 ```
 
+#### The historical `u32-zlib` encoding
+
+Packages written before roaring landed hold `encoding = 'u32-zlib'` instead, and
+they are still in circulation. This SDK no longer decodes it — `USAPPackage.open`
+refuses their profile outright (see [Project status](#project-status)) — but a
+third-party reader meeting one in the wild needs to know what it is:
+
+- the payload is a contiguous array of little-endian `uint32` **block-relative
+  offsets**, ascending and duplicate-free, exactly the values roaring now holds;
+- zlib-compressed at the default level, with a standard zlib header — **not** raw
+  deflate, and **not** gzip;
+- there is no count prefix, so the element count is `len(decompressed) / 4`.
+
+**The codec is not keyed on `profile_version`.** Roaring landed while
+`SUPPORTED_PROFILE_VERSIONS` was still `("0.1.0",)`, so a package stamped 0.1.0
+may hold *either* encoding. The per-row `encoding` column is the only correct
+discriminator — a reader that switches on the profile version will decode some
+0.1.0 packages as the wrong format.
+
 ### Value block (annotation on a whole 3D asset)
 
 A compressed dense array of per-element scalar values for one assessment and one asset part: element *i*'s value is `decoded[i - block_start]`. Membership stores *which* elements are a concept; value blocks store the *value* of a property at each element (e.g. shadow fraction per face). Rule of thumb: booleans and categories are **sets** (native membership, like "shadowed at 14:00", is just a concept plus the shadowed faces); reach for a value field only for genuinely **continuous** values. Value fields are bound to the geometry asset only, never to a city object, and must cover every element of the part (v1; NaN = "no value" in float fields). Stored little-endian, dtype per block (`f4` default; see `VALUE_DTYPES`), with per-block min/max for decode-free stats and query pruning.
@@ -424,9 +530,56 @@ own hierarchy and passes the set to `elements_for_city_objects([...])`.
 in the semantic source, by the same division of authority that keeps attributes
 there. This matters because an annotation's concept (`EnergyRoof`) is usually
 *not* the object's class (`RoofSurface`), so passing the former here is an easy
-mistake — one that used to be swallowed, and since 0.4.2 raises. Idempotency on
+mistake — one that used to be swallowed, and since 0.4.2 raises. The annotation
+batch follows this rule too: with `create_missing_city_objects`, the carriers it
+mints are classless, and the entry's concept classes the *annotation* only.
+
+Note that nothing *validates* the pairing — both are ordinary
+`usap_semantic_class` rows, and no rule anywhere constrains which concept may
+class a city object. The objection is provenance, not typing, which is exactly
+what makes a guessed class dangerous rather than merely wrong: the package
+validates clean at every level, and the contradiction surfaces only when the
+CityGML import that should align the carrier meets a class already stored.
+
+**Filling in a carrier later.** Creating an object that already exists fills in
+whatever is still NULL — its class, `gml_id`, `source_asset_id`,
+`source_object_id` and `attributes_json` — and raises only where a stored value
+would have to change. That is how a carrier acquires its real identity when the
+CityGML import arrives, in one `create_city_object` call. Idempotency on
 `object_uid` compares only the fields a call actually supplies, so the bare
 `create_city_object(uid)` lookup keeps working against a populated row.
+
+The exception worth knowing before it costs you an import: a carrier that
+already holds its own `attributes_json` cannot be aligned, because the CityGML
+import writes provenance into that column and a stored value it would have to
+change raises — aborting the whole import, not just that object. Leave a
+carrier's `attributes_json` alone; see HANDOFF.md §2.2.
+
+An empty string is treated as absent for `gml_id` and `source_object_id`: a
+writer that emits `""` for "unknown" gets the same treatment as one that omits
+the field, and a row already holding `""` is completed by the next call that
+supplies a real value.
+
+**Clearing the marker is a second call.** Backfilling does not touch
+`object_status`: a supplied status cannot be told from the default, so
+`create_city_object` never writes one to a row that exists.
+`accept_city_object(city_object)` moves a carrier from `temporary` to
+`accepted`, and `import_citygml_semantics` calls it for you on every object it
+aligns. It is one-way and idempotent, and it changes nothing about what the
+object *is* — that arrives through the backfill above, from the semantic source
+that owns it. Without it an aligned object stays listed by
+`list_city_objects(object_status="temporary")` — "still awaiting alignment" —
+for the life of the package. Call it yourself when something other than the
+CityGML importer settled the object's identity.
+
+**A `gml_id` names one object.** `resolve_city_object` matches on `object_uid`
+*or* `gml_id`, so two rows claiming the same `gml_id` make every reference to
+that value ambiguous from then on. `validate_report()` reports it as
+`DUPLICATE_GML_ID`, an error. The usual cause is a carrier minted under a name
+of the annotator's own while carrying someone else's `gml_id`: the CityGML
+import matches carriers by `object_uid`, so it creates a sibling rather than
+aligning the carrier — which is why §2.1 of the handoff asks for `object_uid`
+to *be* the `gml:id` wherever one exists.
 
 **Register the semantic source with `compute_hash=False`, or not at all.** If
 another system edits the CityGML, a hash recorded here reports
@@ -924,11 +1077,37 @@ JSON files. Several fields are derivable, so the minimal entry is just
 - `element_kind` — optional; defaults to the asset part's stored kind.
 - parts are referenced by `asset_part_id` (int) **or** `asset_uri`
   (+ `part_path` when the asset has several parts) — exactly one of the two.
+- `gml_id` and `source_object_id` — optional; what the entry knows about the
+  *object* in the CityGML, so the package is not orphaned with respect to the
+  source it was annotated against. Written on the same terms as
+  `create_city_object` itself — a column still empty is filled, a column
+  already holding something else raises — and written whether the entry created
+  the object or merely named one that already existed. They are not conditional
+  on `create_missing_city_objects`: an object that is already there is exactly
+  the case that flag does not cover, and it is the case every re-run takes.
+  Where the object has a `gml:id`, prefer using it *as* the `city_object_uid`;
+  a carrier named otherwise cannot be recognised by a later CityGML import, and
+  the two rows then collide on `DUPLICATE_GML_ID`.
 - top-level `"create_missing_city_objects": true` (minimal-vocabulary
   procedure only) lets unknown `city_object_uid`s create carrier city
-  objects: classed by the entry's concept, `object_status='temporary'`
-  (the marker for later CityGML alignment), nothing else. Without the flag,
-  unknown names fail loudly.
+  objects: an identity, `object_status='temporary'` (the marker for later
+  CityGML alignment), and whatever identity fields the entry supplies. They are
+  **classless** — the entry's concept classes the annotation, not the object —
+  so a later entry naming the same carrier must carry its own `concept`.
+  Without the flag, unknown names fail loudly.
+- `label` — optional; the annotation's display caption. On a re-run with
+  `--replace-existing` it follows the partial-update rule: an entry that does
+  not mention it leaves the stored one alone, and `"label": null` clears it.
+  So a caption a user typed in the application survives the next run of a
+  generator that knows nothing about it.
+- `attributes` **replaces** an existing annotation's attributes on a re-run with
+  `--replace-existing`; it does not merge. A key set from the application and
+  not carried in the entry is discarded by the next re-ingestion, so anything
+  that must survive a re-run has to be in the entry. (The Python API has both
+  forms: `update_annotation(attributes=…)` merges, `attributes_json=` replaces.
+  The batch payload has only the replacing one.)
+- a key this list does not name raises rather than being silently dropped;
+  prefix it with `_` to keep it as a comment.
 
 Full-form example:
 
@@ -939,6 +1118,7 @@ Full-form example:
       "annotation_uid": "ann_energy_roof_001",
       "concept": "EnergyRoof",
       "city_object_uid": "building_1_roof_1",
+      "label": "Roof plane, north wing",
       "status": "draft",
       "assessed_at": "2026-06-30T14:00:00Z",
       "confidence": 0.8,
@@ -1340,12 +1520,19 @@ report = pkg.validate_report()          # level="deep" by default
 report.print()
 ```
 
-Or run an example validator:
+Or run the command-line validator, which the wheel installs on PATH — no
+Python needed to check a package:
 
 ```bash
-python examples/validate_package.py outputs/example_project.usap.gpkg
-python examples/validate_package.py outputs/example_project.usap.gpkg --level external
+usap validate outputs/example_project.usap.gpkg
+usap validate outputs/example_project.usap.gpkg --level external
 ```
+
+For a pipeline, `--json` emits the report as
+`{"is_ok": bool, "issues": [{"severity", "code", "message", "table", "row_id",
+"details"}]}` on stdout, and `--fail-on-warning` exits non-zero on warnings too
+(the default follows `is_ok`, which counts errors only). The exit code is 0 when
+the package passes and 1 when it does not.
 
 ### Levels
 
@@ -1375,6 +1562,9 @@ basic     GeoPackage metadata and registered layers
             assessment covering nothing  (ASSESSMENT_WITHOUT_MEMBERSHIP, warning)
           semantic class closure
           concept registry duplicates
+          two city objects claiming one gml_id (DUPLICATE_GML_ID)
+          one asset uri split across a hashed and an unhashed row
+                                        (DUPLICATE_ASSET_URI, warning)
           annotation primary object / 'represents' link agreement
           duplicate relationship edges (warning)
           unclassified relationship types in use (warning)
@@ -1424,6 +1614,7 @@ the `deep` validation level for packages written another way:
 annotation status    draft | accepted | rejected | superseded
 city object status   accepted | temporary
 confidence           NULL, or a number in [0, 1]
+label                NULL, or any text. Not unique, not an identifier
 attributes_json      NULL, or text that parses as JSON
 ```
 

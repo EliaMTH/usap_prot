@@ -63,6 +63,16 @@ CONFIDENCE_RANGE = (0.0, 1.0)
 
 # The version stamped on packages this build creates.
 #
+# 0.5.0 added usap_annotation.label, a display name for a claim. 0.4.0 had
+# dropped it; it comes back because every view an application builds shows it
+# (US-SELECT-02, US-ANN-06) and because the objection that removed it -- that a
+# column would assert the label is part of the semantic claim -- is answered by
+# status and confidence, which are columns and are not the claim either. It is
+# not an identifier: no UNIQUE, no index, and no lookup accepts it.
+#
+# 0.4.0 moved membership and value blocks under usap_assessment, so a claim can
+# carry several dated evaluations, and dropped usap_annotation.label.
+#
 # 0.3.0 replaced the parent/child edge with a direction-neutral, typed one:
 # usap_relationship_type as the link vocabulary, from_/to_city_object_id,
 # to_external_uri for an xlink that leaves the document, and traversal driven
@@ -74,15 +84,17 @@ CONFIDENCE_RANGE = (0.0, 1.0)
 # content hash, UTC ISO-8601 timestamps, concept provenance columns, and
 # usap_asset_part.indexing_profile.
 #
-# Neither step has a migration path: the endpoint columns are renamed and the
-# type is now a foreign key, so an older package cannot be read as a newer one.
-# Packages are experimental and are rebuilt rather than migrated.
+# No step has a migration path: columns were renamed, a type became a foreign
+# key, blocks moved table, and a column came back -- so an older package cannot
+# be read as a newer one. Packages are experimental and are rebuilt rather than
+# migrated.
 #
 # NOT the SDK version. pyproject.toml's `version` moves with every release;
 # this one moves only when schema.sql changes, because SUPPORTED_PROFILE_
 # VERSIONS below carries no migration path — bumping it in step with a bugfix
-# release would make this build refuse every package already written.
-CURRENT_PROFILE_VERSION = "0.4.0"
+# release would make this build refuse every package already written. The two
+# happen to read 0.5.0 together right now; that is a coincidence, not a rule.
+CURRENT_PROFILE_VERSION = "0.5.0"
 
 # Only packages written by a profile version this build understands can be
 # opened; there is no migration path yet, so opening a newer one would

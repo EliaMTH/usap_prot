@@ -10,6 +10,12 @@ from .constants import (
     VALUE_DTYPES,
 )
 from .core import DEFAULT_SCHEMA_PATH, USAPPackage
+
+# The content-hash helpers are re-exported because every consumer needs the
+# exact tolerance rules -- canonical 'algorithm:digest', a bare 64-hex digest
+# still read as SHA-256 -- and reimplementing them from prose is how two
+# writers end up disagreeing about whether the same file is the same file.
+from ._util import canonical_hash, parse_content_hash
 from .errors import USAPAmbiguityError, USAPError
 from .synthetic import SyntheticConfig, SyntheticResult, create_synthetic_package
 from .validation import (
@@ -67,6 +73,8 @@ __all__ = [
     "DEFAULT_SCHEMA_PATH",
     "USAPError",
     "USAPAmbiguityError",
+    "canonical_hash",
+    "parse_content_hash",
     "ELEMENT_KIND_FACE",
     "ELEMENT_KIND_POINT",
     "ELEMENT_KIND_VERTEX",

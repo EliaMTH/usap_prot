@@ -1,0 +1,13 @@
+# setuptools collects .py files into the sdist but not data files, so without
+# this the sdist carries the test modules and none of what they read: no
+# conftest fixtures, no CityGML subset, no sample configs. "Download the sdist
+# and run the suite" then fails on the first fixture. The wheel is unaffected —
+# its runtime data comes from [tool.setuptools.package-data].
+#
+# CHANGELOG.md is deliberately absent: it is a local working document, not a
+# tracked file, so including it would match nothing in CI and would quietly
+# copy a private file into the tarball when the sdist is built by hand. The
+# release notes reach a release through `gh release edit --notes-file`.
+recursive-include tests *.py
+recursive-include tests/fixtures *
+include docs/*.md

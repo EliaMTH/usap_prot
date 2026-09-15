@@ -13,7 +13,7 @@ from .adapters import (
     register_las_asset,
     register_mesh_asset,
 )
-from ._util import require_str
+from ._util import _check_keys, require_str
 from .batch import BatchImportResult, apply_annotation_batch_file
 from .constants import DEFAULT_GRAPH_NAME
 from .core import DEFAULT_SCHEMA_PATH, USAPPackage
@@ -42,27 +42,6 @@ _LAS_KEYS = frozenset({"path", "uri", "compute_hash", "part_path"})
 _MESH_KEYS = frozenset({"path", "uri", "representation_name",
                         "representation_kind", "lod", "compute_hash"})
 _RELATIONSHIP_KEYS = frozenset({"local_name", "code_space", "category"})
-
-
-def _check_keys(block: dict[str, Any], known: frozenset[str], *, where: str) -> None:
-    """
-    Refuse keys this builder does not read.
-
-    Values are already validated where they are used; what escaped was the key
-    *name*. Anything starting with '_' is a comment and is skipped.
-    """
-    unknown = sorted(
-        key for key in block
-        if not key.startswith("_") and key not in known
-    )
-
-    if unknown:
-        raise USAPError(
-            f"Unrecognised key(s) in {where}: {', '.join(repr(k) for k in unknown)}. "
-            f"Known keys are: {', '.join(sorted(known))}. Nothing reads an "
-            "unknown key, so leaving it would silently drop whatever it meant; "
-            "prefix a key with '_' to keep it as a comment."
-        )
 
 
 @dataclass(frozen=True)

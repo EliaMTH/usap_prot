@@ -14,6 +14,7 @@ from usap.constants import (
 from usap import (
     ELEMENT_KIND_FACE,
     ELEMENT_KIND_POINT,
+    USAPAmbiguityError,
     USAPError,
     USAPPackage,
 )
@@ -711,6 +712,96 @@ def test_reregistering_an_asset_with_different_values_raises(pkg: USAPPackage) -
     ) != first
 
 
+# Asset identity: the (uri, content_hash) pair is a uniqueness key, not a
+# lookup the caller has to reproduce exactly.
+
+
+def _asset_rows(pkg: USAPPackage, uri: str) -> list[sqlite3.Row]:
+    return pkg.conn.execute(
+        "SELECT asset_id, content_hash FROM usap_asset WHERE uri = ? "
+        "ORDER BY asset_id",
+        (uri,),
+    ).fetchall()
+
+
+def test_omitting_the_hash_finds_a_hashed_row(pkg: USAPPackage) -> None:
+    # The "give me the id" call. It used to miss the row and insert a sibling,
+    # which split the asset's parts and hid each row's annotations from the
+    # other while every validation level still passed. Requiring the hash to
+    # ask for the id would also mean re-digesting a 10 GB file to ask a
+    # question about a row.
+    first = pkg.register_asset(
+        uri="area.ply",
+        asset_kind="mesh",
+        content_hash="sha256:" + "a1" * 32,
+    )
+
+    assert pkg.register_asset(uri="area.ply", asset_kind="mesh") == first
+    assert len(_asset_rows(pkg, "area.ply")) == 1
+
+
+def test_supplying_a_hash_fills_a_row_that_has_none(pkg: USAPPackage) -> None:
+    # The mirror case, and the one the documented compute_hash=False path on a
+    # large asset reaches: registered without a digest, hashed on a later run.
+    # A NULL content_hash is an empty field, so it is filled rather than
+    # contradicted -- create_city_object's rule, applied to the same problem.
+    first = pkg.register_asset(uri="area.ply", asset_kind="mesh")
+
+    assert _asset_rows(pkg, "area.ply")[0]["content_hash"] is None
+
+    again = pkg.register_asset(
+        uri="area.ply",
+        asset_kind="mesh",
+        content_hash="sha256:" + "a1" * 32,
+    )
+
+    rows = _asset_rows(pkg, "area.ply")
+    assert again == first
+    assert len(rows) == 1
+    assert rows[0]["content_hash"] == "sha256:" + "a1" * 32
+
+
+def test_a_different_hash_is_still_a_separate_asset(pkg: USAPPackage) -> None:
+    # The fallback must not reach so far that it merges two versions of a
+    # file. A stored hash that disagrees is the old version, and the rows stay
+    # apart so each keeps the annotations indexed against its own geometry.
+    first = pkg.register_asset(
+        uri="area.ply",
+        asset_kind="mesh",
+        content_hash="sha256:" + "a1" * 32,
+    )
+
+    second = pkg.register_asset(
+        uri="area.ply",
+        asset_kind="mesh",
+        content_hash="sha256:" + "b2" * 32,
+    )
+
+    assert second != first
+    assert len(_asset_rows(pkg, "area.ply")) == 2
+
+
+def test_a_uri_at_several_hashes_cannot_be_named_without_one(
+    pkg: USAPPackage,
+) -> None:
+    # Once two versions are on file the uri alone no longer picks a row, so
+    # the bare call raises rather than guessing -- the same answer
+    # resolve_asset gives for the same shape.
+    pkg.register_asset(
+        uri="area.ply",
+        asset_kind="mesh",
+        content_hash="sha256:" + "a1" * 32,
+    )
+    pkg.register_asset(
+        uri="area.ply",
+        asset_kind="mesh",
+        content_hash="sha256:" + "b2" * 32,
+    )
+
+    with pytest.raises(USAPAmbiguityError, match="ambiguous"):
+        pkg.register_asset(uri="area.ply", asset_kind="mesh")
+
+
 def test_reregistering_a_part_with_a_different_count_raises(pkg: USAPPackage) -> None:
     # element_count is the index space every membership on the part is
     # validated against. Silently keeping the old count while the caller
@@ -773,13 +864,13 @@ def test_recreating_a_city_object_with_a_different_class_raises(
         gml_id="building_1_roof_1",
     ) == first
 
-    with pytest.raises(USAPError, match="already exists with different"):
+    with pytest.raises(USAPError, match="already exists with a different"):
         pkg.create_city_object(
             object_uid="building_1_roof_1",
             semantic_class_id=energy_roof,
         )
 
-    with pytest.raises(USAPError, match="already exists with different"):
+    with pytest.raises(USAPError, match="already exists with a different"):
         pkg.create_city_object(
             object_uid="building_1_roof_1",
             gml_id="some_other_gml_id",

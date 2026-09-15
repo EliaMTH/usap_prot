@@ -659,3 +659,228 @@ def test_update_annotation_repairs_missing_primary_object_link(
 
         assert _represents_links(pkg, annotation_id) == [object_a]
         assert_package_valid(pkg)
+
+
+def _annotated(pkg, attributes_json: str | None = None) -> int:
+    """One annotation, optionally carrying attributes already."""
+    class_id = pkg.create_semantic_class(
+        scheme="local",
+        class_uri="local:Roof",
+        local_name="Roof",
+    )
+
+    return pkg.create_annotation(
+        annotation_uid="ann_merge",
+        semantic_class_id=class_id,
+        attributes_json=attributes_json,
+    )
+
+
+def _attributes(pkg, annotation_id: int) -> dict:
+    stored = pkg.get_annotation(annotation_id)["attributes_json"]
+    return {} if stored is None else json.loads(stored)
+
+
+def test_update_annotation_attributes_merges_rather_than_replacing(
+    tmp_path: Path,
+) -> None:
+    # The whole point of the kwarg. attributes_json is a multi-key field whose
+    # contents are prescribed (method, source, the reserved usap: keys), so
+    # setting one key by rewriting the column silently discards the rest --
+    # which is what every caller had to do before this existed.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id = _annotated(
+            pkg, json.dumps({"method": "roof_detector_v2", "source": "survey"})
+        )
+
+        pkg.update_annotation(
+            annotation_id,
+            attributes={"usap:label": "Via Etnea, tratto 4"},
+        )
+
+        assert _attributes(pkg, annotation_id) == {
+            "method": "roof_detector_v2",
+            "source": "survey",
+            "usap:label": "Via Etnea, tratto 4",
+        }
+
+
+def test_update_annotation_attributes_replaces_a_key_it_names(
+    tmp_path: Path,
+) -> None:
+    with make_pkg(tmp_path) as pkg:
+        annotation_id = _annotated(
+            pkg, json.dumps({"method": "v2", "source": "survey"})
+        )
+
+        pkg.update_annotation(annotation_id, attributes={"method": "v3"})
+
+        assert _attributes(pkg, annotation_id) == {
+            "method": "v3",
+            "source": "survey",
+        }
+
+
+def test_update_annotation_attributes_none_removes_a_key(tmp_path: Path) -> None:
+    # None removes the key rather than storing a JSON null: a key whose value
+    # is null still reads as present, which is a different claim.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id = _annotated(
+            pkg, json.dumps({"method": "v2", "source": "survey"})
+        )
+
+        pkg.update_annotation(annotation_id, attributes={"method": None})
+
+        assert _attributes(pkg, annotation_id) == {"source": "survey"}
+
+
+def test_update_annotation_attributes_merges_into_an_empty_field(
+    tmp_path: Path,
+) -> None:
+    # A fresh annotation stores NULL, and merging into nothing is the first
+    # thing an application that sets a label will ever do.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id = _annotated(pkg)
+
+        assert pkg.get_annotation(annotation_id)["attributes_json"] is None
+
+        pkg.update_annotation(annotation_id, attributes={"usap:label": "L"})
+
+        assert _attributes(pkg, annotation_id) == {"usap:label": "L"}
+
+
+def test_update_annotation_attributes_emptied_stays_an_object(
+    tmp_path: Path,
+) -> None:
+    # Removing the last key leaves '{}', not NULL. Blanking the field outright
+    # is attributes_json=None's job, and the two mean different things.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id = _annotated(pkg, json.dumps({"method": "v2"}))
+
+        pkg.update_annotation(annotation_id, attributes={"method": None})
+
+        assert pkg.get_annotation(annotation_id)["attributes_json"] == "{}"
+
+
+def test_update_annotation_refuses_attributes_and_attributes_json_together(
+    tmp_path: Path,
+) -> None:
+    # Merging and replacing are different intentions; picking a winner would
+    # silently do one of them.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id = _annotated(pkg, json.dumps({"method": "v2"}))
+
+        with pytest.raises(USAPError, match="not both"):
+            pkg.update_annotation(
+                annotation_id,
+                attributes={"usap:label": "L"},
+                attributes_json='{"usap:label": "L"}',
+            )
+
+        # And the refused call wrote nothing.
+        assert _attributes(pkg, annotation_id) == {"method": "v2"}
+
+
+def test_update_annotation_attributes_refuses_a_non_object_stored_value(
+    tmp_path: Path,
+) -> None:
+    # A stored JSON array is valid JSON and passes the column's own check, but
+    # there is no sane way to merge keys into it -- and quietly replacing it
+    # would lose whatever it held.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id = _annotated(pkg, "[1, 2, 3]")
+
+        with pytest.raises(USAPError, match="rather than an object"):
+            pkg.update_annotation(annotation_id, attributes={"k": "v"})
+
+        assert pkg.get_annotation(annotation_id)["attributes_json"] == "[1, 2, 3]"
+
+
+def test_update_annotation_attributes_requires_a_dict(tmp_path: Path) -> None:
+    with make_pkg(tmp_path) as pkg:
+        annotation_id = _annotated(pkg)
+
+        with pytest.raises(USAPError, match="must be a dict"):
+            pkg.update_annotation(annotation_id, attributes="usap:label=L")
+
+
+def test_label_round_trips_through_every_read_path(tmp_path: Path) -> None:
+    # US.md wants the label in the detail view (line 182), the list (198) and
+    # the selection result list (US-SELECT-02). All three are separate SELECTs,
+    # so all three are asserted: a column added to one of them and forgotten in
+    # another is exactly how the 0.4.2 gml_id/object_uid mismatch happened.
+    with make_pkg(tmp_path) as pkg:
+        part = make_mesh_part(pkg)
+        pkg.create_semantic_class(
+            scheme="local", class_uri="local:Road", local_name="Road"
+        )
+
+        annotation = pkg.annotate_elements(
+            concept="Road",
+            asset_part_id=part,
+            element_kind="face",
+            element_indices=[41, 42, 43],
+            label="Via Etnea, tratto 4",
+        )
+        annotation_id = annotation["annotation_id"]
+
+        assert pkg.get_annotation(annotation_id)["label"] == "Via Etnea, tratto 4"
+        assert pkg.list_annotations()[0]["label"] == "Via Etnea, tratto 4"
+
+        hits = pkg.annotations_for_elements(part, ELEMENT_KIND_FACE, [41])
+        assert hits[0]["label"] == "Via Etnea, tratto 4"
+
+        assert_package_valid(pkg)
+
+
+def test_label_is_editable_and_clearable(tmp_path: Path) -> None:
+    # US-ANN-06 requires it editable. Clearing is a separate case from editing:
+    # a caption someone typed by mistake has to be removable, not just
+    # replaceable with other text.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id = _annotated(pkg)
+
+        pkg.update_annotation(annotation_id, label="first")
+        assert pkg.get_annotation(annotation_id)["label"] == "first"
+
+        pkg.update_annotation(annotation_id, label="second")
+        assert pkg.get_annotation(annotation_id)["label"] == "second"
+
+        pkg.update_annotation(annotation_id, label=None)
+        assert pkg.get_annotation(annotation_id)["label"] is None
+
+
+def test_omitting_the_label_leaves_it_alone(tmp_path: Path) -> None:
+    # The _UNSET-by-omission rule, which is what lets the batch do a partial
+    # update: editing a status must not blank a caption.
+    with make_pkg(tmp_path) as pkg:
+        annotation_id = _annotated(pkg)
+        pkg.update_annotation(annotation_id, label="keep me")
+
+        pkg.update_annotation(annotation_id, status="accepted")
+
+        assert pkg.get_annotation(annotation_id)["label"] == "keep me"
+
+
+def test_the_label_is_not_an_identifier(tmp_path: Path) -> None:
+    # The whole reason a label column is safe to have. It carries no UNIQUE and
+    # no lookup accepts it, so it cannot become a fourth name to reconcile
+    # beside annotation_uid, object_uid and gml_id -- which is the objection
+    # that removed the original column in 0.4.0.
+    with make_pkg(tmp_path) as pkg:
+        first = _annotated(pkg)
+        pkg.update_annotation(first, label="not unique")
+
+        # Two annotations may legitimately carry one caption.
+        class_id = pkg.get_annotation(first)["semantic_class_id"]
+        second = pkg.create_annotation(
+            annotation_uid="ann_merge_2",
+            semantic_class_id=class_id,
+            label="not unique",
+        )
+
+        assert pkg.get_annotation(second)["label"] == "not unique"
+        assert_package_valid(pkg)
+
+        # And it is not a way to find anything.
+        assert pkg.get_annotation(annotation_uid="not unique") is None

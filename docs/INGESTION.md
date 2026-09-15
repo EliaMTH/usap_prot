@@ -134,17 +134,33 @@ no `citygml` section.
 }
 ```
 
-Each unknown `city_object_uid` creates a **carrier city object**: classed by
-the entry's concept, `object_status = 'temporary'`, nothing else. The
-resulting package answers the same queries as a CityGML-built one — by
-object (`elements_for_city_object("tower_A_roof")`), by concept and
-subclass (`elements_for_semantic_class("TempSurface",
-include_subclasses=True)` returns the roof via the vocabulary's parent
-link), and in reverse (`annotations_for_elements`).
+Each unknown `city_object_uid` creates a **carrier city object**: an identity,
+`object_status = 'temporary'`, plus `gml_id` and `source_object_id` when the
+entry supplies them. It is deliberately **classless** — the entry's `concept`
+classes the *annotation*, and an object's class belongs to the semantic source,
+not to whoever annotated it. The resulting package answers the same queries as a
+CityGML-built one — by object (`elements_for_city_object("tower_A_roof")`), by
+concept and subclass (`elements_for_semantic_class("TempSurface",
+include_subclasses=True)` returns the roof via the vocabulary's parent link),
+and in reverse (`annotations_for_elements`).
 
-Carriers are the alignment hook: when a proper CityGML-backed package
-arrives, find them with `object_status = 'temporary'` and map them onto real
-objects (alignment tooling is future work).
+Because the carrier carries no class of its own, a *later* entry naming the same
+`city_object_uid` must carry its own `concept` — there is nothing to inherit.
+
+Carriers are the alignment hook: when a proper CityGML-backed package arrives,
+find them with `object_status = 'temporary'`. Running
+`import_citygml_semantics` over a CityGML that names the same `gml:id` completes
+the alignment in one call: `create_city_object` fills in the class, the `gml_id`
+and the provenance that were still missing, and `accept_city_object` clears the
+`temporary` marker.
+
+**The import recognises a carrier by its `city_object_uid`**, which it derives
+from the `gml:id`. So name carriers after the `gml:id` they are waiting for.
+A carrier named something else is not recognised: the import creates a second
+object beside it, both rows end up claiming one `gml_id`, and validation reports
+`DUPLICATE_GML_ID`. Putting the `gml:id` in the entry's `gml_id` field does not
+substitute for this — that field records what the object *is* in the source; the
+`city_object_uid` is what the import matches on.
 
 ## Procedure 3 — edit an existing USAP package
 
@@ -197,7 +213,7 @@ declared without reading the files at all: `register_asset` +
 
 **Large assets.** Registration is the only normal ingestion step that opens an operational asset file. After registration, annotation editing and querying use the stored index-space metadata and USAP's membership/value blocks; they do not reopen the source geometry. Source-file size therefore no longer directly controls query cost. Package operations still scale with the number and density of stored memberships, value blocks, and returned results.
 
-Registration reads only what it stores: LAS/LAZ from the header alone, and meshes over 256 MB in a streaming pass rather than a full load (`stream=True`/`False` to override; see REFERENCE.md → Mesh support → Large meshes for supported formats). The remaining optional full-file read is `compute_hash`: it can take minutes on a 10 GB file, but it is what makes later source changes detectable, so disable it knowingly.
+Registration reads only what it stores: LAS/LAZ from the header alone, and meshes over 256 MB in a streaming pass rather than a full load (`stream=True`/`False` to override; see REFERENCE.md → Mesh support → Large meshes for supported formats). The remaining optional full-file read is `compute_hash`: it can take minutes on a 10 GB file, but it is what makes later source changes detectable, so disable it knowingly. Toggling it between runs on one uri is safe: a later run that computes the digest fills it into the record the earlier run wrote, and a later run that skips it finds that record rather than starting a second one. (Older builds inserted a sibling row in both directions — see REFERENCE.md → 3D Asset, `DUPLICATE_ASSET_URI`.)
 
 Keeping the annotations in USAP also means that creating, accepting, rejecting, or replacing a claim does not rewrite the CityGML authority, mesh, or point-cloud source. This separation is especially useful for large or shared assets, but it is not a claim that every CityGML workflow needs a USAP package.
 

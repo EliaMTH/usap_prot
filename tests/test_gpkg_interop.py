@@ -94,6 +94,9 @@ def test_annotations_view_is_readable(tmp_path: Path) -> None:
         assert row["city_object_uid"] == "b1_roof"
         assert row["selected_element_count"] == 3
         assert row["value_field_count"] == 0
+        # 0 for an unordered claim: this is how a plain-SQL reader tells an
+        # ordered annotation from an unordered one without decoding a payload.
+        assert row["path_run_count"] == 0
 
         # The GIS layer is where a human browses a package, so the one
         # human-readable column has to reach it.
@@ -546,6 +549,7 @@ def test_view_keys_and_aggregate_types(tmp_path: Path) -> None:
 
         assert isinstance(row["selected_element_count"], int)
         assert isinstance(row["value_field_count"], int)
+        assert isinstance(row["path_run_count"], int)
 
         concept_row = pkg.conn.execute(
             "SELECT * FROM usap_concepts_view WHERE local_name = 'Roof'"

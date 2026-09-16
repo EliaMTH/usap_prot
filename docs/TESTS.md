@@ -569,6 +569,18 @@ here to check.
 - `test_an_underscore_prefixed_key_is_a_comment` — the same escape project
   configs use.
 
+### Ordered paths in a batch
+
+- A **path-only entry** is applied: no `"memberships"` key at all, since the
+  membership is derived.
+- A batch path **preserves order**, and its membership reads back sorted.
+- `"path"` and `"memberships"` **on the same part raise**; on different parts
+  both apply.
+- On a **`--replace-existing` re-run**, an entry that drops the `"path"` key and
+  writes memberships raises rather than stranding the order; an entry that
+  carries the key rewrites it.
+- An **unknown key inside a path segment** raises, like every other block.
+
 ## Project builder — `test_project_builder.py`
 
 - `test_build_project_package_from_config` — the full config build: CityGML +
@@ -656,6 +668,25 @@ selection over a 10 GB point cloud is hundreds of millions of them).
 - `test_membership_write_accepts_a_numpy_selection` — end to end: an ndarray
   selection stores identically to the same selection as a list, and stored
   bounds are SQLite integers rather than numpy scalars smuggled in as BLOBs.
+
+### Ordered-path codec (`u32-seq-zlib`)
+
+- **Order and duplicates survive a round trip** — `[5, 3, 3, 9, 1]`. The single
+  most important assertion in the file: if `encode_path` ever routes through
+  `as_index_array`, nothing else catches it.
+- **`as_sequence_array` neither sorts nor de-duplicates**, asserted against
+  `as_index_array` on the same input so the contrast is explicit.
+- **The payload is little-endian `uint32` with no count prefix**, checked by
+  hand rather than through `decode_path` — it is the byte-level contract a
+  third-party reader implements against.
+- **A negative index is refused wherever it sits.** `as_index_array` can test
+  the first element alone because it has already sorted; this one has not, so
+  `[5, -1]` would otherwise store `4294967295`.
+- **A truncated stream is corruption, not a count mismatch** — zlib returns what
+  it managed to inflate without raising, so the decoder checks `eof`.
+- **Decoding without a declared count reports no mismatch**, which is what lets
+  validation read a row that lies about its own `element_count` and report
+  `PATH_COUNT_MISMATCH` instead of corruption.
 
 ## Streaming mesh registration — `test_mesh_streaming.py`
 
@@ -836,6 +867,45 @@ Each test corrupts one invariant and asserts `validate_report()` names it:
   stop the check counting rows per uri. Two hashes is the old file and the new
   one, which the uniqueness key exists to keep apart; one unhashed row is an
   ordinary `compute_hash=False` registration.
+
+## Ordered paths — `test_ordered_paths.py`
+
+The contract from `docs/ORDERED_PATHS_DESIGN.md`. Every case is written against
+an input that sorting would change — an ascending path would round-trip even if
+the write had been routed through `as_index_array`, which is the one mistake
+that silently removes the feature.
+
+- **Round-trip in order, with repeats.** `[40, 12, 12, 7]` comes back exactly.
+- **Membership is the path's sorted, unique set.** The same path reads back from
+  `elements_for_annotation` as `[7, 12, 40]`: the path is the source, the
+  membership is its index, and existing readers see what they always saw.
+- **A run may cross asset parts.** The case the interim `usap:path` key could not
+  express at all, and the reason the table exists: two segments, one
+  `continues_previous`, and one run — plus a second, disjoint run after it.
+- **Each part's membership is derived separately**, since indices restart at zero
+  in every part.
+- **A membership write over a path is refused**, and the path survives the
+  refusal. With `drop_path=True` it succeeds and the order is gone.
+- **`set_annotation_path(..., None)`** drops the order and keeps the set.
+- **A reroute onto fewer parts leaves no stale membership** — otherwise the
+  dropped part keeps a membership nothing orders, which is the drift the design
+  exists to prevent arriving through the front door.
+- **A path may not span two assets**, and the refusal rolls back whole: no path
+  and no half-written membership.
+- **Two assessments each carry their own path**, never merged.
+- **`path_run_count` is reported without being asked for** — in
+  `get_annotation`, `list_assessments` and `usap_annotations_view`, the last
+  being the plain-SQL discovery path the C++ reader uses. An unordered
+  annotation reports `0`.
+- **Existing membership reads are unchanged by a path** — the compatibility
+  promise, pinned so a future change to the reverse query has to break it
+  deliberately.
+- **Bounds and shape refusals**: an index past the part's `element_count`, an
+  empty segment list, a segment without `asset_part_id`, an empty segment, a
+  first segment marked `continues_previous`, an unknown key.
+- **`usap:path` in attributes is refused** on create, on the merging
+  `attributes=` form and on the replacing `attributes_json=` form.
+- **Cascades**: deleting the assessment or the annotation removes the path.
 
 ## Synthetic generator — `test_synthetic.py`
 

@@ -404,6 +404,66 @@ indexed against it.
 
 ---
 
+## 6b. Ordered paths — reading a road centreline
+
+Most annotations are sets: `elements_for_annotation` gives you the faces, in
+ascending order, and the order carries no meaning. Some are **sequences** — a
+road centreline, a traversal — and for those the order *is* the data.
+
+**Telling the two apart costs you nothing.** Every read that returns an
+annotation or an assessment summary carries `path_run_count`, and so does the
+view:
+
+```sql
+SELECT annotation_uid, label, path_run_count
+FROM usap_annotations_view
+WHERE path_run_count > 0;
+```
+
+`0` means the claim is unordered and `elements_for_annotation` is the whole
+story. Above `0`, the sequence is in `usap_path_block`.
+
+**Reading it.** One row per *segment*, ordered by `segment_ordinal` within the
+assessment:
+
+```sql
+SELECT asset_part_id, segment_ordinal, continues_previous,
+       element_count, encoding, payload
+FROM usap_path_block
+WHERE assessment_id = ?
+ORDER BY segment_ordinal;
+```
+
+Concatenate segments in ordinal order. Start a new **run** — a disjoint stretch
+of the path — at every segment whose `continues_previous` is `0`. A run whose
+segments name different `asset_part_id`s is one continuous stretch crossing a
+part boundary; a new run is a genuine interruption.
+
+**The payload.** `encoding` is `u32-seq-zlib`: zlib-inflate, then read
+contiguous little-endian `uint32`. No count prefix, so the number of indices is
+`len(inflated) / 4`.
+
+The byte layout is identical to the `u32-zlib` you already decode, so reuse the
+inflater — but **not its assumptions**, because all three are inverted:
+
+- the values are **absolute element indices**, not offsets: there is no
+  `block_start` here and nothing to add;
+- they are in **sequence order**, not ascending — do not sort, and do not binary
+  search;
+- they may **repeat**, where a route doubles back over the same face.
+
+Switch on the per-row `encoding` column, as you already do for membership. Never
+on the profile version.
+
+**Do not write membership for an ordered claim.** The membership is derived from
+the path and rewriting it directly would leave the path describing a selection
+that no longer exists. Through the SDK that raises; writing SQL directly it will
+not, and `usap validate` reports it as `PATH_MEMBERSHIP_MISMATCH`.
+
+**If you meet `usap:path` in `attributes`**, the package predates the table. The
+key is no longer read, it cannot say which asset part its indices belong to, and
+`usap validate` reports it as `PATH_IN_ATTRIBUTES`. Rebuild the package.
+
 ## 7. The two-file commit protocol
 
 USAP guarantees its own half is atomic:

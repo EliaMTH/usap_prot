@@ -28,18 +28,45 @@ IndexArray = Sequence[int] | np.ndarray
 MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024
 
 
-def _decompress_bounded(payload: bytes, max_bytes: int) -> bytes:
+class _PayloadTooLarge(USAPError):
+    """The payload decompressed past the ceiling it was given."""
+
+
+class _PayloadTruncated(USAPError):
+    """The zlib stream ended mid-way."""
+
+
+def _decompress_bounded(
+    payload: bytes,
+    max_bytes: int,
+    *,
+    require_eof: bool = False,
+) -> bytes:
     """
     zlib.decompress with a hard ceiling on the output size.
+
+    `require_eof` additionally refuses a *truncated* stream. decompress()
+    returns whatever it managed to inflate without raising, so a payload cut
+    short mid-stream comes back short and plausible; a caller that then
+    compares the length against a declared count reports "wrong count" for what
+    is really corruption. Off by default so decode_value_block keeps the exact
+    behaviour it shipped with.
     """
     decompressor = zlib.decompressobj()
     raw = decompressor.decompress(payload, max_bytes)
 
     if decompressor.unconsumed_tail:
-        raise USAPError(
+        # A subclass, so every existing `except USAPError` still catches it;
+        # decode_path needs to tell "longer than declared" (a disagreement with
+        # the row) from "will not inflate" (corruption), and they must not
+        # arrive as the same message.
+        raise _PayloadTooLarge(
             f"Payload decompresses to more than {max_bytes} bytes; refusing "
             "to continue."
         )
+
+    if require_eof and not decompressor.eof:
+        raise _PayloadTruncated("Payload is a truncated zlib stream.")
 
     return raw
 
@@ -92,6 +119,126 @@ def as_index_array(indices: IndexArray) -> np.ndarray:
         raise USAPError(f"Element index too large for uint32: {int(values[-1])}")
 
     return values.astype(np.uint32, copy=False)
+
+
+def as_sequence_array(indices: IndexArray) -> np.ndarray:
+    """
+    Normalize element indices to a uint32 array, preserving order.
+
+    The deliberate opposite of as_index_array: same bounds rules, but it does
+    NOT sort and does NOT de-duplicate. Those two operations are exactly what a
+    path stores itself to survive -- a road centreline is faces in traversal
+    order, and it may cross the same face twice.
+
+    Never call as_index_array on a path. It would return the right *set* and a
+    plausible array, and the feature would be silently gone: a round-trip test
+    on an already-ascending path still passes.
+    """
+    values = np.asarray(indices)
+
+    if values.size == 0:
+        return np.empty(0, dtype=np.uint32)
+
+    if not np.issubdtype(values.dtype, np.integer):
+        # Reject 3.5 as an index rather than silently truncating it to 3.
+        rounded = np.asarray(values, dtype=np.int64)
+
+        if not np.array_equal(rounded, values):
+            raise USAPError("Element indices must be integers.")
+
+        values = rounded
+
+    if values.ndim != 1:
+        values = values.reshape(-1)
+
+    # Scanned, not values[0] < 0: as_index_array can test the first element
+    # alone only because it has already sorted. Here [5, -1] would otherwise
+    # pass the check and store 4294967295.
+    if np.any(values < 0):
+        first = int(values[np.argmax(values < 0)])
+        raise USAPError(f"Negative element index: {first}")
+
+    if int(values.max()) > 2**32 - 1:
+        raise USAPError(
+            f"Element index too large for uint32: {int(values.max())}"
+        )
+
+    return values.astype(np.uint32, copy=False)
+
+
+def encode_path(indices: IndexArray) -> bytes:
+    """
+    Encode an ordered element sequence as 'u32-seq-zlib'.
+
+    Contiguous little-endian uint32, zlib at the default level, standard zlib
+    header, no count prefix -- byte-identical to the historical 'u32-zlib'
+    membership layout, which is why a reader that already decodes that one has
+    almost nothing to add. What differs is what the values mean: absolute
+    element indices, in path order, duplicates allowed.
+    """
+    sequence = as_sequence_array(indices)
+
+    return zlib.compress(
+        np.ascontiguousarray(sequence, dtype=np.dtype("<u4")).tobytes()
+    )
+
+
+def decode_path(payload: bytes, element_count: int | None = None) -> np.ndarray:
+    """
+    Decode a 'u32-seq-zlib' payload back to element indices, in path order.
+
+    Two modes, and which one a caller wants depends on whether it is *trusting*
+    the row or *checking* it:
+
+    - `element_count` given: the declared count is an exact expected size, so
+      the decompression ceiling is exact too (as in decode_value_block) and any
+      disagreement raises. Every ordinary reader uses this -- handing back a
+      sequence whose length contradicts its own row would be worse than failing.
+
+    - `element_count` None: bounded by MAX_DECOMPRESSED_BYTES instead, and no
+      count is compared. This is for validation, which is by definition the one
+      caller that must tolerate a row lying about its payload, and so the one
+      caller that cannot use that row's number as its safety bound. It compares
+      the length itself and reports PATH_COUNT_MISMATCH rather than corruption.
+    """
+    if element_count is not None:
+        if element_count < 0:
+            raise USAPError(f"Negative element_count: {element_count}")
+
+        # One extra byte already means the payload disagrees with the row.
+        ceiling = element_count * 4 + 1
+    else:
+        ceiling = MAX_DECOMPRESSED_BYTES
+
+    try:
+        raw = _decompress_bounded(payload, ceiling, require_eof=True)
+    except _PayloadTooLarge as exc:
+        # Only reachable in trusting mode, and it is a disagreement with the
+        # row rather than corruption -- but the exact count is unknown, because
+        # decoding stopped one byte past what the row claimed instead of
+        # allocating whatever a hostile payload wanted.
+        raise USAPError(
+            f"Path payload holds more than {element_count} indices, which is "
+            f"its declared element_count."
+        ) from exc
+    except (zlib.error, USAPError) as exc:
+        # _PayloadTruncated from the eof check, zlib's own on a malformed
+        # stream. Both are corruption, and both must name the codec.
+        raise USAPError(f"Corrupt path payload: {exc}") from exc
+
+    if len(raw) % 4 != 0:
+        raise USAPError(
+            f"Corrupt path payload: {len(raw)} bytes is not a whole number of "
+            "uint32 values."
+        )
+
+    if element_count is not None and len(raw) != element_count * 4:
+        raise USAPError(
+            f"Path payload holds {len(raw) // 4} indices, declared "
+            f"element_count is {element_count}."
+        )
+
+    return np.frombuffer(raw, dtype=np.dtype("<u4"))
 
 
 def encode_roaring(offsets: IndexArray) -> bytes:

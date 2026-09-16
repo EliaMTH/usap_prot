@@ -48,6 +48,21 @@ DEFAULT_ENCODING = "roaring"
 # encodings separately.
 VALUE_BLOCK_ENCODING = "zlib"
 
+# How usap_path_block payloads are compressed (see encode_path).
+#
+# The byte layout is identical to the historical 'u32-zlib' membership codec --
+# contiguous little-endian uint32, zlib at the default level, no count prefix --
+# but the token deliberately differs, because three rules are inverted: the
+# values are absolute element indices rather than block-relative offsets, they
+# are in sequence order rather than ascending, and duplicates are allowed. A
+# reader meeting a familiar token in an unfamiliar column carries its familiar
+# assumptions in with it, and one of those assumptions is the property a path
+# exists to violate.
+#
+# 'u32-zlib' is also declared out of support (REFERENCE.md), so reusing the
+# spelling would make this build both refuse and require it.
+PATH_ENCODING = "u32-seq-zlib"
+
 # An annotation is a revisable claim, so its lifecycle state is part of the
 # format rather than free text: readers filter on it (list_annotations),
 # and an unrecognised value silently drops out of every such filter.
@@ -62,6 +77,14 @@ CITY_OBJECT_STATUSES = ("accepted", "temporary")
 CONFIDENCE_RANGE = (0.0, 1.0)
 
 # The version stamped on packages this build creates.
+#
+# 0.5.0 also added usap_path_block, the ordered-sequence sidecar. Membership is
+# a roaring bitmap and therefore a set, so a claim with a direction -- a road
+# centreline, a traversal -- had nowhere to keep its order. The interim home,
+# a reserved 'usap:path' key inside attributes, could not name the asset part
+# its indices belonged to, and element indices restart at zero in every part;
+# a route crossing a tile boundary was unreadable. That key is now refused on
+# write and reported as PATH_IN_ATTRIBUTES.
 #
 # 0.5.0 added usap_annotation.label, a display name for a claim. 0.4.0 had
 # dropped it; it comes back because every view an application builds shows it

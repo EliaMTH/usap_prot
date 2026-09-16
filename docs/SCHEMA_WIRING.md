@@ -24,6 +24,7 @@ flowchart TB
     ASM[usap_assessment]
     MB[usap_membership_block]
     VB[usap_value_block]
+    PB[usap_path_block]
     PROF[usap_profile]
     LOG[usap_edit_log]
     APART -->|asset_id| ASSET
@@ -47,6 +48,8 @@ flowchart TB
     VB -->|assessment_id| ASM
     VB -->|annotation_id| ANN
     VB -->|asset_part_id| APART
+    PB -->|assessment_id| ASM
+    PB -->|asset_part_id| APART
     classDef hub fill:#f2b134,stroke:#7a5a12,color:#1a1200,stroke-width:2px;
     classDef standalone fill:#e6ebf0,stroke:#8a97a3,color:#1a2028,stroke-dasharray:4 3;
     class ANN hub
@@ -58,6 +61,8 @@ flowchart TB
 This distinction is important: a city-object link identifies the semantic referent of a claim, whereas a membership or value block identifies concrete points, faces, or other indexed elements in a registered geometry asset. The schema connects the two through the annotation without treating the city object itself as another geometry membership.
 
 **Why the blocks hang off an assessment, not the annotation.** Re-surveying the same roof next year produces a second set of elements for the *same* claim. Without a level in between, recording it means either overwriting last year's extent or minting a second annotation that duplicates the concept and the city-object link — and can then drift from it. The assessment holds what varies between evaluations (the date, the asset, the extent, the method) so the annotation can hold what does not.
+
+`usap_path_block` is the third table hanging off an assessment, and the only one that carries **order**. Membership and value blocks are both indexed *by* element; a path block holds a sequence *of* elements, so its payload is an ordered `uint32` array rather than a bitmap or a dense field. Note it points at `usap_assessment` and `usap_asset_part` and at nothing else: it deliberately carries neither `annotation_id` nor `element_kind`, both of which its siblings denormalise. Those copies exist to keep a tuned single-index plan over millions of block rows — a path is a handful of rows per annotation, so the join costs nothing, and not storing them removes the two checks (`ASSESSMENT_ANNOTATION_MISMATCH`, `MEMBERSHIP_ELEMENT_KIND_MISMATCH`) that exist only to police them. `asset_part_id` is the one column that cannot be derived: an assessment binds to an *asset*, which may register many parts, and element indices restart at zero in every one.
 
 Note the two arrows from each block table. `assessment_id` is the owner; `annotation_id` is denormalised from it, so forward queries (`elements_for_annotation`, the delete cascade) stay a single indexed lookup instead of a join — the plan `docs/ACCELERATOR_ABLATION.md` measures. `validate_report()` re-checks that the two agree (`ASSESSMENT_ANNOTATION_MISMATCH`), because a denormalised column is only safe while something enforces it.
 
@@ -94,6 +99,8 @@ Note the object graph is a *graph*, not a tree. `from`/`to` record the direction
 | `usap_value_block` | `assessment_id` | `usap_assessment(assessment_id)` |
 | `usap_value_block` | `annotation_id` | `usap_annotation(annotation_id)` (denormalised) |
 | `usap_value_block` | `asset_part_id` | `usap_asset_part(asset_part_id)` |
+| `usap_path_block` | `assessment_id` | `usap_assessment(assessment_id)` |
+| `usap_path_block` | `asset_part_id` | `usap_asset_part(asset_part_id)` |
 
 `usap_profile`, `usap_edit_log` and `usap_relationship_type` have no foreign keys.
 
@@ -109,6 +116,10 @@ something that cannot be reconstructed later from the rest of the package:
 | `usap_asset_part` | `indexing_profile` | which convention assigned the element indices — a hash proves the bytes, not the ordering |
 | `usap_semantic_class` | `source_namespace`, `concept_iri` | where a concept came from in its authority; `class_uri` stays the internal key |
 | `usap_value_block` | `encoding` | payload compression, mirroring `usap_membership_block.encoding` |
+| `usap_path_block` | `encoding` | `u32-seq-zlib`. The `u32-zlib` byte layout under a different token, because the values are absolute rather than block-relative, in sequence order rather than ascending, and may repeat |
+| `usap_path_block` | `segment_ordinal` | position of this segment in the whole assessment's sequence, contiguous from 0. Scoped to the assessment, not the part, or nothing could say that the run in one part precedes the run in another |
+| `usap_path_block` | `continues_previous` | whether this segment carries on the previous one's run or starts a new one — the only thing distinguishing a route crossing a part boundary from a genuine interruption |
+| `usap_path_block` | `element_count` | positions in the payload, which may exceed the membership the segment derives, because a path may revisit an element |
 | `usap_assessment` | `assessed_at` | when this evaluation was made. Free-form text, stored as given: the format belongs to the caller, and refusing an unfamiliar spelling would be worse than storing it. NULL means *undated*, of which there can be at most one per (annotation, asset) — enforced by a partial unique index, because SQLite treats NULLs as distinct and the plain `UNIQUE` would not constrain them |
 | `usap_relationship_type` | `code_space` | the namespace the link property came from; with `local_name` it is the QName the source document wrote, and the only way a reader resolves a link type back to its definition |
 | `usap_relationship_type` | `category` | whether the link means part-of. No CityGML artifact states this — not the XSD, not the conceptual model, not an OWL rendering — so it is asserted by whoever builds the package. NULL is a real value meaning *unclassified*, reported by `validate_report()` |
@@ -137,6 +148,7 @@ flowchart LR
     ANNV --> CO[usap_city_object]
     ANNV --> MB[usap_membership_block]
     ANNV --> VB[usap_value_block]
+    ANNV --> PB[usap_path_block]
     ANNV --> ASM[usap_assessment]
     ASMV --> ASM
     ASMV --> ANN
@@ -194,5 +206,8 @@ Fast-lookup structures on non-primary-key columns:
 | `usap_mb_by_element_block` | `usap_membership_block` | `asset_part_id, element_kind, block_start` |
 | `usap_vb_by_annotation` | `usap_value_block` | `annotation_id, asset_part_id, element_kind, block_start` |
 | `usap_vb_by_part` | `usap_value_block` | `asset_part_id, element_kind` |
+| `usap_path_by_part` | `usap_path_block` | `asset_part_id` |
+
+`usap_path_block` has no counterpart to those, and needs none: it carries no `annotation_id` to index, its forward read (`WHERE assessment_id = ? ORDER BY segment_ordinal`) is served by the `UNIQUE(assessment_id, segment_ordinal)` autoindex, and a path is a handful of rows per annotation rather than millions. `usap_path_by_part` exists only for the `ON DELETE CASCADE` scan from `usap_asset_part`, and is deliberately narrow — widening it to match the UNIQUE would be flagged by `test_no_explicit_index_duplicates_a_unique_autoindex`.
 
 The two `*_by_annotation` block indexes are not decoration. Before 0.4.0 the `UNIQUE(annotation_id, ...)` constraint on each block table supplied an annotation-first index for free; that constraint is now scoped to `assessment_id` (two evaluations of one annotation may cover the same part), so the annotation-first lookup every forward query and delete cascade depends on has to be declared explicitly.

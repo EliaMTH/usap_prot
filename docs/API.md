@@ -128,13 +128,29 @@ implicitly and behave exactly as before they existed.
 
 | Call | Does |
 |---|---|
-| `attach_annotation_elements(annotation_id=..., asset_part_id=..., element_kind=..., element_indices=..., assessment=None)` | set the selection for one part; other parts and other assessments are untouched |
-| `replace_annotation_membership(annotation_id, asset_part_id, element_kind, element_indices, assessment=None)` | the same operation under its lower-level name |
+| `attach_annotation_elements(annotation_id=..., asset_part_id=..., element_kind=..., element_indices=..., assessment=None, drop_path=False)` | set the selection for one part; other parts and other assessments are untouched |
+| `replace_annotation_membership(annotation_id, asset_part_id, element_kind, element_indices, assessment=None, drop_path=False)` | the same operation under its lower-level name |
 | `elements_for_annotation(annotation_id, expand=True, assessment=None, asset_part_id=None)` | forward query: a claim → its element indices |
 | `annotations_for_elements(asset_part_id, element_kind, selected_indices, assessment=None)` | **reverse query**: a viewport selection → the claims covering it, one row per (annotation, assessment) |
 | `elements_for_city_object(object_uid, include_descendants=True, ...)` | every element an object (and optionally its parts) covers |
 | `elements_for_city_objects([object_uids], ...)` | the same over a set, de-duplicated — for walking your own hierarchy |
 | `elements_for_semantic_class(semantic_class_id, include_subclasses=True)` | every element annotated under a concept and its subclasses |
+
+## Ordered paths — in which order a claim traverses them
+
+Membership is a set; a path is the order over it that a set cannot hold. The
+path is the source and the membership is derived from it in one transaction, so
+a membership write onto a path-bearing assessment raises unless `drop_path=True`.
+
+| Call | Does |
+|---|---|
+| `set_annotation_path(annotation_id, segments, assessment=None)` | write the order and derive the membership; `segments=None` drops the order and keeps the set |
+| `path_for_annotation(annotation_id, assessment=None, expand=True)` | the runs, in path order, each with its segments |
+
+A segment is `{"asset_part_id": ..., "element_indices": [...], "continues_previous": False}`.
+Order and repeats are preserved exactly. `path_run_count` is reported by
+`get_annotation`, `list_annotations`, `get_assessment`, `list_assessments` and
+the `usap_annotations_view` without being asked for — `0` means unordered.
 
 ## Value fields — one scalar per element
 
@@ -231,8 +247,8 @@ will actually hold:
 | `UnresolvedTarget` | `from_uid`, `relationship_type`, `href` — an xlink leaving the document |
 | `VocabularyResult` | `by_name`, `by_uri` — concept name/URI → id |
 | `OntologyResult` | `relationship_types`, `concepts`, `categorised`, `imports` |
-| `BatchImportResult` | `annotation_count`, `membership_count`, `value_field_count`, `created_city_object_count`, `created_city_object_uids`, `annotations` |
-| `BatchAnnotationResult` | `annotation_id`, `annotation_uid`, `concept`, `membership_count`, `value_field_count` |
+| `BatchImportResult` | `annotation_count`, `membership_count`, `value_field_count`, `path_segment_count`, `created_city_object_count`, `created_city_object_uids`, `annotations` |
+| `BatchAnnotationResult` | `annotation_id`, `annotation_uid`, `concept`, `membership_count`, `value_field_count`, `path_segment_count` |
 | `ProjectBuildResult` | `db_path`, `manifest_path`, `citygml`, `las_assets`, `mesh_assets`, `accepted_concept_count`, `batches` |
 | `SyntheticConfig` / `SyntheticResult` | generator inputs / what it produced |
 

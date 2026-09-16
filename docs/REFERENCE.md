@@ -32,7 +32,8 @@ The current schema is profile version **0.5.0**. There is no migration path from
 any older profile: 0.3.0 renamed the relationship endpoints and made the link
 type a foreign key into a new table, 0.4.0 moved membership and value blocks
 under `usap_assessment` and dropped `usap_annotation.label`, and 0.5.0 brought
-that label back as a column. `USAPPackage.open` refuses an older package with an
+that label back as a column and added `usap_path_block`, the ordered-sequence
+sidecar. `USAPPackage.open` refuses an older package with an
 explicit "unsupported profile version" error rather than misreading it. Rebuild
 rather than migrate.
 
@@ -336,36 +337,26 @@ value fields `unit` and `validAt`.
 **The reserved `usap:` prefix.** Keys beginning `usap:` inside `attributes`
 belong to the format rather than to the writer, so a reader can interpret them
 without knowing which application wrote the package. Do not invent your own
-`usap:`-prefixed keys; use a prefix of your own. One key is reserved:
+`usap:`-prefixed keys; use a prefix of your own.
 
-- **`usap:path`** — an ordered sequence over the elements this annotation
-  covers, for a claim whose membership has a direction: a polyline, a
-  traversal, a centreline. A list of lists, one inner list per disjoint run,
-  holding absolute element indices:
+- **`usap:path` is no longer a storage location, and is refused on write.** It
+  was the interim home for an ordered element sequence. An ordered sequence now
+  lives in [`usap_path_block`](#path-block), written with
+  `set_annotation_path()`.
 
-  ```json
-  "usap:path": [[41, 42, 43, 58, 59], [77, 78]]
-  ```
+  The reason it had to move is that its value is a list of bare integers, and
+  **element indices restart at zero in every asset part** — so the key could not
+  say which part it ran through, and was well defined only for an annotation
+  covering a single `(asset part, element kind)` pair. A road centreline
+  crossing a tile boundary, which is the commonest case for an ordered claim,
+  was exactly the case it could not express. A column can name the part; a JSON
+  list of integers cannot.
 
-  This exists because membership cannot express it. Membership is a roaring
-  bitmap — a *set* — so it comes back ascending and deduplicated, and the order
-  is destroyed by construction. **This key is the only copy of it.**
-
-  Three rules, none of them enforced by validation:
-
-  - every index must lie within the part's `element_count`;
-  - the path's element set must **equal** the membership set — sorting and
-    deduplicating the path must reproduce the membership exactly. The path is
-    the source; the membership is its index;
-  - it is well defined only when the annotation covers a single
-    `(asset part, element kind)` pair. Element indices are scoped to that pair,
-    and an annotation may span several; where one does, an ordered path has
-    nowhere to say which part it runs through.
-
-  Those last two are why this is an **interim** home. A dedicated sidecar table
-  — carrying the part, the element kind, a sequence ordinal and a compressed
-  payload, with membership derived from the path so the two cannot drift — is
-  planned, and `usap:path` is the spelling that will be migrated into it.
+  A package written under 0.5.0's interim rule may still carry the key.
+  `validate_report()` reports it as `PATH_IN_ATTRIBUTES` (a warning — the
+  package is not broken, but the order in it is stranded and nothing reads it).
+  There is no automatic conversion: it cannot name the part when an annotation
+  spans several, which is the whole reason for the table.
 
 Example:
 
@@ -484,6 +475,90 @@ values float32 [0.0, 0.73, 0.5, ...]   one per face
 ```
 
 ---
+
+### Path block
+
+An **ordered** element sequence for one assessment: the claim membership cannot
+express. Membership is a roaring bitmap — a *set* — so it comes back ascending
+and deduplicated, and the order is destroyed at write time, not merely
+unstored. That is right for a roof and wrong for a road: a centreline is faces
+in traversal order, from one end to the other.
+
+A row is one **segment**: a contiguous stretch of the sequence whose indices all
+live in one asset part. Read order is `segment_ordinal`. A **run** — one
+disjoint stretch of the path — is a maximal span of segments in which every
+segment after the first carries `continues_previous = 1`.
+
+```text
+segment_ordinal  0   part 7 (tile A)   [..., 49998, 49999]   continues 0  ┐ run 0
+segment_ordinal  1   part 8 (tile B)   [0, 1, 2, ...]        continues 1  ┘
+segment_ordinal  2   part 8 (tile B)   [500, 501]            continues 0    run 1
+```
+
+`continues_previous` is the only thing distinguishing "the road carried on into
+the next tile" from "the road stopped, and a separate stretch begins here". When
+nothing crosses a part boundary every value is `0`, one row is one run, and
+`segment_ordinal` simply numbers the runs.
+
+**The path is the source; the membership is its index.** `set_annotation_path()`
+writes both in one transaction: the membership of each part is the sorted,
+de-duplicated set of that part's path indices. So a path may legitimately
+revisit an element — a route doubling back over the same face — and its
+`element_count` (positions) may exceed the membership it derives.
+
+Because the two must not drift, a membership write onto an assessment that
+carries a path **raises**. Pass `drop_path=True` to discard the order
+deliberately and keep a plain set; that drops the assessment's path entirely,
+since removing the middle of a sequence leaves the segments either side no
+longer joined up. `validate_report()` re-checks the invariant as
+`PATH_MEMBERSHIP_MISMATCH`, which is the half of the rule that reaches a
+third-party writer going straight to SQL.
+
+**No existing read changes.** Membership still comes back ascending from every
+reader that returns it. Discovery is unconditional instead: `get_annotation`,
+`list_annotations`, `get_assessment`, `list_assessments` and the
+`usap_annotations_view` all report `path_run_count`, so an application learns an
+annotation is ordered from the call it already makes — `0` means there is
+nothing to fetch.
+
+| Call | Does |
+|---|---|
+| `pkg.set_annotation_path(annotation_id, segments, assessment=…)` | write the order, derive the membership |
+| `pkg.set_annotation_path(annotation_id, None)` | drop the order, keep the membership |
+| `pkg.path_for_annotation(id, assessment=…, expand=…)` | the runs, in order |
+
+```python
+pkg.set_annotation_path(annotation_id, [
+    {"asset_part_id": tile_a, "element_indices": [49998, 49999]},
+    {"asset_part_id": tile_b, "element_indices": [0, 1, 2],
+     "continues_previous": True},
+    {"asset_part_id": tile_b, "element_indices": [500, 501]},
+])
+```
+
+Every segment must name a part of the assessment's own asset: a path spanning
+two assets would need two assessments, and one ordinal sequence cannot span
+them.
+
+#### The `u32-seq-zlib` encoding
+
+A path payload is a contiguous array of little-endian `uint32`, zlib-compressed
+at the default level with a standard zlib header, and no count prefix — so the
+number of indices is `len(decompressed) / 4`.
+
+That is **byte-identical to the historical `u32-zlib` layout** described above,
+and the token deliberately differs anyway, because three rules are inverted:
+
+| | `u32-zlib` (historical membership) | `u32-seq-zlib` (path) |
+|---|---|---|
+| values are | offsets relative to `block_start` | **absolute** element indices |
+| order | strictly ascending | **sequence order** |
+| duplicates | forbidden | **allowed** |
+
+A reader that already decodes `u32-zlib` has almost nothing to add, but it must
+not reuse its assumptions: there is no `block_start` to add, and the result is
+not sorted. The per-row `encoding` column is the discriminator, as it is for
+membership. `u32-zlib` itself remains out of support.
 
 ## Integrating USAP into an application
 
@@ -1160,8 +1235,8 @@ python examples/apply_annotation_batch.py \
   --replace-existing
 ```
 
-An annotation may carry `"value_fields"` instead of (or alongside) `"memberships"` —
-at least one of the two is required. Values are listed inline, one per element of the
+An annotation may carry `"value_fields"` or `"path"` instead of (or alongside)
+`"memberships"` — at least one of the three is required. Values are listed inline, one per element of the
 asset part, with JSON `null` meaning "no value" (stored as NaN; float dtypes only):
 
 ```json
@@ -1184,6 +1259,36 @@ asset part, with JSON `null` meaning "no value" (stored as NaN; float dtypes onl
 }
 ```
 
+A `"path"` is an **ordered** sequence, and a sibling of `"memberships"` rather
+than a key inside one — a memberships entry is per-part, and a path is
+cross-part. Each segment names its own part; `continues_previous` marks a
+segment that carries on the previous one's run instead of starting a new one.
+The membership is derived from the path, so an entry may carry `"path"` and no
+`"memberships"` at all — and listing both for the same part raises, since that
+states the same geometry twice:
+
+```json
+{
+  "annotations": [
+    {
+      "annotation_uid": "ann_road_via_roma",
+      "concept": "RoadCentreline",
+      "label": "Via Roma, centreline",
+      "path": [
+        { "asset_part_id": 7, "element_indices": [49998, 49999] },
+        { "asset_part_id": 8, "element_indices": [0, 1, 2],
+          "continues_previous": true }
+      ]
+    }
+  ]
+}
+```
+
+On a re-run with `--replace-existing`, an entry that writes `"memberships"` onto
+an assessment that already carries a path **raises** rather than stranding the
+order. Carry the `"path"` key in the re-run too, or drop the path deliberately
+through the Python API.
+
 The batch importer validates:
 
 ```text
@@ -1191,6 +1296,7 @@ concept is registered (or inheritable from the linked object's class)
 city object exists (unless create_missing_city_objects is set)
 asset part exists and the asset_uri reference is unambiguous
 element kind matches asset part (when given; defaulted otherwise)
+path segments name a part of one asset; no part is both a path and a membership
 element indices are in range
 value fields cover the whole asset part; dtype is supported
 annotation UID is not duplicated unless replacement is requested
@@ -1544,7 +1650,7 @@ for**" — a clean `basic` report is not a claim about payloads, and a clean
 | Level | Reads | Use it for |
 |---|---|---|
 | `basic` | SQL columns only — never a block payload | packages with millions of membership blocks, or a fast pre-flight |
-| `deep` *(default)* | + every membership/value payload | the normal correctness check |
+| `deep` *(default)* | + every membership/value/path payload | the normal correctness check |
 | `external` | + every registered asset file (SHA-256) | before trusting a package whose sources may have moved or changed |
 
 ```text
@@ -1552,6 +1658,13 @@ basic     GeoPackage metadata and registered layers
           USAP profile presence and package_iri (INVALID_PACKAGE_IRI)
           orphan references
           membership/value block structure (counts, bounds, element kinds)
+          path segment structure:
+            encoding                     (UNSUPPORTED_PATH_ENCODING)
+            empty segment                (EMPTY_PATH_SEGMENT)
+            ordinals contiguous from 0   (PATH_SEGMENT_ORDINAL_GAP)
+            first segment continues none (PATH_FIRST_SEGMENT_CONTINUES)
+            segment inside its assessment's asset
+                                        (PATH_OUTSIDE_ASSESSMENT_ASSET)
           assessment integrity:
             block annotation matches its assessment's
                                         (ASSESSMENT_ANNOTATION_MISMATCH)
@@ -1572,6 +1685,10 @@ basic     GeoPackage metadata and registered layers
 
 deep      + membership payload decoding, offsets, stored min/max agreement
           + value payload decoding and stored min/max agreement
+          + path payload decoding (CORRUPT_PATH_PAYLOAD, PATH_COUNT_MISMATCH,
+            PATH_OUT_OF_ASSET_PART_RANGE) and the path/membership invariant
+            (PATH_MEMBERSHIP_MISMATCH)
+          + a stranded 'usap:path' attributes key (PATH_IN_ATTRIBUTES, warning)
           + asset extent recomputation
           + more than one CRS across the registered assets
                                          (MIXED_ASSET_CRS, warning)

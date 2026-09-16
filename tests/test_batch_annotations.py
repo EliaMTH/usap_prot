@@ -847,3 +847,270 @@ def test_an_underscore_prefixed_key_is_a_comment(tmp_path: Path) -> None:
         })
 
         assert result.annotation_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Ordered paths in a batch (docs/ORDERED_PATHS_DESIGN.md §4.6)
+#
+# "path" is a sibling of "memberships", not a key inside one: a memberships
+# entry is per-part, and a path is cross-part by construction.
+# ---------------------------------------------------------------------------
+
+
+def _path_batch_package(tmp_path: Path):
+    pkg = make_pkg(tmp_path, name="pathbatch.usap.gpkg")
+    asset_id = pkg.register_asset(uri="road.ply", asset_kind="mesh")
+    parts = [
+        pkg.register_asset_part(
+            asset_id=asset_id,
+            part_path=f"geometry/{index}",
+            element_kind=1,
+            element_count=1000,
+            indexing_profile="usap:test-face-order-v1",
+        )
+        for index in range(2)
+    ]
+    pkg.create_semantic_class(
+        scheme="local",
+        class_uri="local:RoadCentreline",
+        local_name="RoadCentreline",
+    )
+
+    return pkg, parts
+
+
+def test_a_path_only_entry_is_applied(tmp_path: Path) -> None:
+    # No "memberships" key at all: the membership is derived from the path, so
+    # requiring one would make the ordinary road entry illegal.
+    pkg, (tile_a, tile_b) = _path_batch_package(tmp_path)
+
+    with pkg:
+        result = apply_annotation_batch(
+            pkg,
+            {
+                "annotations": [
+                    {
+                        "annotation_uid": "ann_via_roma",
+                        "concept": "RoadCentreline",
+                        "label": "Via Roma, centreline",
+                        "path": [
+                            {
+                                "asset_part_id": tile_a,
+                                "element_indices": [998, 999],
+                            },
+                            {
+                                "asset_part_id": tile_b,
+                                "element_indices": [0, 1, 2],
+                                "continues_previous": True,
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+
+        assert result.path_segment_count == 2
+        assert result.annotations[0].path_segment_count == 2
+
+        annotation_id = result.annotations[0].annotation_id
+        runs = pkg.path_for_annotation(annotation_id)
+
+        assert len(runs) == 1
+        assert [s["element_indices"] for s in runs[0]["segments"]] == [
+            [998, 999],
+            [0, 1, 2],
+        ]
+
+        report = pkg.validate_report()
+        assert report.is_ok, [i.format() for i in report.issues]
+
+
+def test_a_batch_path_preserves_order(tmp_path: Path) -> None:
+    pkg, (tile_a, _tile_b) = _path_batch_package(tmp_path)
+
+    with pkg:
+        result = apply_annotation_batch(
+            pkg,
+            {
+                "annotations": [
+                    {
+                        "annotation_uid": "ann_road",
+                        "concept": "RoadCentreline",
+                        "path": [
+                            {
+                                "asset_part_id": tile_a,
+                                "element_indices": [40, 12, 12, 7],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        annotation_id = result.annotations[0].annotation_id
+        runs = pkg.path_for_annotation(annotation_id)
+
+        assert runs[0]["segments"][0]["element_indices"] == [40, 12, 12, 7]
+
+        blocks = pkg.elements_for_annotation(annotation_id, expand=True)
+        assert [e for b in blocks for e in b["elements"]] == [7, 12, 40]
+
+
+def test_path_and_membership_on_the_same_part_is_refused(
+    tmp_path: Path,
+) -> None:
+    pkg, (tile_a, _tile_b) = _path_batch_package(tmp_path)
+
+    with pkg:
+        # ValueError, like every other entry-shape error in this importer.
+        with pytest.raises(ValueError, match="covered by both"):
+            apply_annotation_batch(
+                pkg,
+                {
+                    "annotations": [
+                        {
+                            "annotation_uid": "ann_road",
+                            "concept": "RoadCentreline",
+                            "memberships": [
+                                {
+                                    "asset_part_id": tile_a,
+                                    "element_indices": [1, 2],
+                                }
+                            ],
+                            "path": [
+                                {
+                                    "asset_part_id": tile_a,
+                                    "element_indices": [40, 12],
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+
+
+def test_path_and_membership_on_different_parts_is_fine(
+    tmp_path: Path,
+) -> None:
+    pkg, (tile_a, tile_b) = _path_batch_package(tmp_path)
+
+    with pkg:
+        result = apply_annotation_batch(
+            pkg,
+            {
+                "annotations": [
+                    {
+                        "annotation_uid": "ann_road",
+                        "concept": "RoadCentreline",
+                        "memberships": [
+                            {"asset_part_id": tile_b, "element_indices": [1, 2]}
+                        ],
+                        "path": [
+                            {
+                                "asset_part_id": tile_a,
+                                "element_indices": [40, 12],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        assert result.membership_count == 1
+        assert result.path_segment_count == 1
+        assert pkg.validate_report().is_ok
+
+
+def test_a_rerun_that_drops_the_path_key_is_refused(tmp_path: Path) -> None:
+    # The --replace-existing case: an entry writing memberships onto an
+    # assessment that carries a path inherits the drop_path rule rather than
+    # silently stranding the order.
+    pkg, (tile_a, _tile_b) = _path_batch_package(tmp_path)
+
+    with pkg:
+        payload = {
+            "annotations": [
+                {
+                    "annotation_uid": "ann_road",
+                    "concept": "RoadCentreline",
+                    "path": [
+                        {"asset_part_id": tile_a, "element_indices": [40, 12]}
+                    ],
+                }
+            ]
+        }
+        apply_annotation_batch(pkg, payload)
+
+        without_path = {
+            "annotations": [
+                {
+                    "annotation_uid": "ann_road",
+                    "concept": "RoadCentreline",
+                    "memberships": [
+                        {"asset_part_id": tile_a, "element_indices": [1, 2]}
+                    ],
+                }
+            ]
+        }
+
+        with pytest.raises(USAPError, match="carries an ordered path"):
+            apply_annotation_batch(
+                pkg, without_path, replace_existing=True
+            )
+
+
+def test_a_rerun_with_a_path_rewrites_it(tmp_path: Path) -> None:
+    pkg, (tile_a, _tile_b) = _path_batch_package(tmp_path)
+
+    with pkg:
+        def payload(indices):
+            return {
+                "annotations": [
+                    {
+                        "annotation_uid": "ann_road",
+                        "concept": "RoadCentreline",
+                        "path": [
+                            {
+                                "asset_part_id": tile_a,
+                                "element_indices": indices,
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        apply_annotation_batch(pkg, payload([40, 12]))
+        result = apply_annotation_batch(
+            pkg, payload([7, 8, 9]), replace_existing=True
+        )
+
+        annotation_id = result.annotations[0].annotation_id
+        runs = pkg.path_for_annotation(annotation_id)
+
+        assert runs[0]["segments"][0]["element_indices"] == [7, 8, 9]
+        assert pkg.validate_report().is_ok
+
+
+def test_an_unknown_key_in_a_path_segment_is_refused(tmp_path: Path) -> None:
+    pkg, (tile_a, _tile_b) = _path_batch_package(tmp_path)
+
+    with pkg:
+        with pytest.raises(USAPError, match="Unrecognised key"):
+            apply_annotation_batch(
+                pkg,
+                {
+                    "annotations": [
+                        {
+                            "annotation_uid": "ann_road",
+                            "concept": "RoadCentreline",
+                            "path": [
+                                {
+                                    "asset_part_id": tile_a,
+                                    "element_indices": [1],
+                                    "continues": True,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )

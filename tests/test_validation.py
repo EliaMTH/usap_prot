@@ -719,3 +719,334 @@ def test_re_registering_an_asset_part_may_omit_fields(tmp_path: Path) -> None:
         # existing membership on this part was validated against.
         with pytest.raises(USAPError, match="different"):
             pkg.register_asset_part(asset_id, "g/0", "face", 200)
+
+
+# ---------------------------------------------------------------------------
+# Ordered paths (docs/ORDERED_PATHS_DESIGN.md §4.5)
+#
+# Every package here is built by hand with raw SQL rather than through
+# set_annotation_path. That is deliberate and it is the case these checks exist
+# for: the SDK writes the path and its derived membership in one transaction
+# and cannot drift, but the consumer writes GeoPackages from C++, so validation
+# is the only half of the invariant that reaches them.
+# ---------------------------------------------------------------------------
+
+
+def _package_with_a_hand_written_path(
+    tmp_path: Path,
+    *,
+    segments,
+    membership=None,
+):
+    """
+    Build a package whose path is written straight to SQL.
+
+    `segments` is [(segment_ordinal, continues_previous, element_indices)].
+    `membership` defaults to the set the path derives, i.e. a correct package;
+    pass something else to break exactly one invariant.
+    """
+    from usap.constants import PATH_ENCODING
+    from usap.encoding import encode_path
+
+    pkg = make_pkg(tmp_path, name="paths.usap.gpkg")
+
+    asset_id = pkg.register_asset(uri="road.ply", asset_kind="mesh")
+    part = pkg.register_asset_part(
+        asset_id=asset_id,
+        part_path="geometry/0",
+        element_kind=ELEMENT_KIND_FACE,
+        element_count=1000,
+        # Set so the positive control below can assert an entirely empty
+        # report: without it the package carries an unrelated
+        # ASSET_PART_NO_INDEXING_PROFILE warning.
+        indexing_profile="usap:test-face-order-v1",
+    )
+    semantic_class_id = pkg.create_semantic_class(
+        scheme="local",
+        class_uri="local:RoadCentreline",
+        local_name="RoadCentreline",
+    )
+    annotation_id = pkg.create_annotation(
+        annotation_uid="ann-road",
+        semantic_class_id=semantic_class_id,
+    )
+
+    if membership is None:
+        membership = sorted({i for _, _, indices in segments for i in indices})
+
+    # Created explicitly rather than left to the membership write: the
+    # empty-membership case has to be expressible, and that is precisely the
+    # broken shape PATH_MEMBERSHIP_MISMATCH must still catch.
+    assessment_id = int(
+        pkg.create_assessment(annotation_id, asset_id)["assessment_id"]
+    )
+
+    if membership:
+        pkg.replace_annotation_membership(
+            annotation_id, part, ELEMENT_KIND_FACE, membership
+        )
+
+    with pkg.transaction():
+        for ordinal, continues, indices in segments:
+            pkg.conn.execute(
+                """
+                INSERT INTO usap_path_block (
+                    assessment_id, asset_part_id, segment_ordinal,
+                    continues_previous, element_count, encoding, payload
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    assessment_id,
+                    part,
+                    ordinal,
+                    continues,
+                    len(indices),
+                    PATH_ENCODING,
+                    encode_path(indices),
+                ),
+            )
+
+    return pkg, part, assessment_id
+
+
+def test_a_hand_written_path_validates_clean(tmp_path: Path) -> None:
+    # The positive control. Without it every other test in this section could
+    # pass against a check that fires unconditionally.
+    pkg, _part, _assessment = _package_with_a_hand_written_path(
+        tmp_path, segments=[(0, 0, [12, 11, 11, 40])]
+    )
+
+    with pkg:
+        report = pkg.validate_report()
+
+        assert report.is_ok, [issue.format() for issue in report.issues]
+        assert report.issues == []
+
+
+def test_a_path_that_does_not_reproduce_its_membership_is_reported(
+    tmp_path: Path,
+) -> None:
+    pkg, _part, _assessment = _package_with_a_hand_written_path(
+        tmp_path,
+        segments=[(0, 0, [10, 11, 12])],
+        membership=[10, 11, 12, 99],
+    )
+
+    with pkg:
+        report = pkg.validate_report()
+        issues = [i for i in report.issues if i.code == "PATH_MEMBERSHIP_MISMATCH"]
+
+        assert not report.is_ok
+        assert len(issues) == 1
+        assert issues[0].details["only_in_membership"] == [99]
+        assert issues[0].details["only_in_path"] == []
+
+
+def test_a_path_with_no_membership_at_all_is_reported(tmp_path: Path) -> None:
+    # The degenerate case of the same rule, and the one an inner join would
+    # silently match nothing for.
+    pkg, _part, _assessment = _package_with_a_hand_written_path(
+        tmp_path,
+        segments=[(0, 0, [10, 11, 12])],
+        membership=[],
+    )
+
+    with pkg:
+        assert "PATH_MEMBERSHIP_MISMATCH" in _codes(pkg.validate_report())
+
+
+def test_path_segment_ordinals_must_be_contiguous_from_zero(
+    tmp_path: Path,
+) -> None:
+    pkg, _part, _assessment = _package_with_a_hand_written_path(
+        tmp_path, segments=[(0, 0, [10, 11]), (2, 0, [20, 21])]
+    )
+
+    with pkg:
+        report = pkg.validate_report()
+
+        assert "PATH_SEGMENT_ORDINAL_GAP" in _codes(report)
+        # Pure SQL, so a caller who asked for the cheap check still learns the
+        # sequence has a hole in it.
+        assert "PATH_SEGMENT_ORDINAL_GAP" in _codes(
+            pkg.validate_report(level="basic")
+        )
+
+
+def test_the_first_path_segment_may_not_continue_a_previous_one(
+    tmp_path: Path,
+) -> None:
+    pkg, _part, _assessment = _package_with_a_hand_written_path(
+        tmp_path, segments=[(0, 1, [10, 11])]
+    )
+
+    with pkg:
+        assert "PATH_FIRST_SEGMENT_CONTINUES" in _codes(pkg.validate_report())
+
+
+def test_an_unknown_path_encoding_is_reported_once(tmp_path: Path) -> None:
+    # Specifically not also as CORRUPT_PATH_PAYLOAD: one fault, one code.
+    pkg, _part, _assessment = _package_with_a_hand_written_path(
+        tmp_path, segments=[(0, 0, [10, 11])]
+    )
+
+    with pkg:
+        with pkg.transaction():
+            pkg.conn.execute(
+                "UPDATE usap_path_block SET encoding = 'u32-zlib'"
+            )
+
+        codes = _codes(pkg.validate_report())
+
+        assert "UNSUPPORTED_PATH_ENCODING" in codes
+        assert "CORRUPT_PATH_PAYLOAD" not in codes
+
+
+def test_a_corrupt_path_payload_is_reported(tmp_path: Path) -> None:
+    pkg, _part, _assessment = _package_with_a_hand_written_path(
+        tmp_path, segments=[(0, 0, [10, 11])]
+    )
+
+    with pkg:
+        with pkg.transaction():
+            pkg.conn.execute("UPDATE usap_path_block SET payload = X'000102'")
+
+        assert "CORRUPT_PATH_PAYLOAD" in _codes(pkg.validate_report())
+
+
+def test_a_count_that_disagrees_is_not_reported_as_corruption(
+    tmp_path: Path,
+) -> None:
+    # Pins the decode_path(element_count=None) decision: validation must be
+    # able to read a row that lies about its own count, or PATH_COUNT_MISMATCH
+    # is unreachable and every such row reports as corruption instead.
+    pkg, _part, _assessment = _package_with_a_hand_written_path(
+        tmp_path, segments=[(0, 0, [10, 11, 12])]
+    )
+
+    with pkg:
+        with pkg.transaction():
+            pkg.conn.execute("UPDATE usap_path_block SET element_count = 2")
+
+        codes = _codes(pkg.validate_report())
+
+        assert "PATH_COUNT_MISMATCH" in codes
+        assert "CORRUPT_PATH_PAYLOAD" not in codes
+
+
+def test_a_path_index_past_the_asset_part_is_reported(tmp_path: Path) -> None:
+    # The interim usap:path key's other failure: an index refused instantly as
+    # membership was stored silently inside the JSON.
+    pkg, _part, _assessment = _package_with_a_hand_written_path(
+        tmp_path,
+        segments=[(0, 0, [10, 5000])],
+        membership=[10],
+    )
+
+    with pkg:
+        assert "PATH_OUT_OF_ASSET_PART_RANGE" in _codes(pkg.validate_report())
+
+
+def test_a_path_segment_in_another_assets_part_is_reported(
+    tmp_path: Path,
+) -> None:
+    pkg, _part, assessment_id = _package_with_a_hand_written_path(
+        tmp_path, segments=[(0, 0, [10, 11])]
+    )
+
+    with pkg:
+        other_asset = pkg.register_asset(uri="other.ply", asset_kind="mesh")
+        other_part = pkg.register_asset_part(
+            asset_id=other_asset,
+            part_path="geometry/0",
+            element_kind=ELEMENT_KIND_FACE,
+            element_count=100,
+        )
+
+        with pkg.transaction():
+            pkg.conn.execute(
+                "UPDATE usap_path_block SET asset_part_id = ?", (other_part,)
+            )
+
+        report = pkg.validate_report()
+
+        assert "PATH_OUTSIDE_ASSESSMENT_ASSET" in _codes(report)
+        assert "PATH_OUTSIDE_ASSESSMENT_ASSET" in _codes(
+            pkg.validate_report(level="basic")
+        )
+
+
+def test_an_empty_path_segment_is_reported(tmp_path: Path) -> None:
+    pkg, _part, _assessment = _package_with_a_hand_written_path(
+        tmp_path, segments=[(0, 0, [10, 11])]
+    )
+
+    with pkg:
+        with pkg.transaction():
+            pkg.conn.execute("UPDATE usap_path_block SET element_count = 0")
+
+        assert "EMPTY_PATH_SEGMENT" in _codes(pkg.validate_report())
+
+
+def test_orphan_path_rows_are_reported(tmp_path: Path) -> None:
+    pkg, part, _assessment = _package_with_a_hand_written_path(
+        tmp_path, segments=[(0, 0, [10, 11])]
+    )
+
+    with pkg:
+        # Foreign keys are ON per connection (core.py), so the orphan has to be
+        # made with them off -- and the pragma is silently ignored inside a
+        # transaction, hence the explicit toggle outside one.
+        pkg.conn.execute("PRAGMA foreign_keys = OFF")
+        pkg.conn.execute("UPDATE usap_path_block SET assessment_id = 9999")
+        pkg.conn.commit()
+        pkg.conn.execute("PRAGMA foreign_keys = ON")
+
+        assert "ORPHAN_PATH_ASSESSMENT" in _codes(pkg.validate_report())
+
+
+def test_basic_level_does_not_decode_path_payloads(tmp_path: Path) -> None:
+    pkg, _part, _assessment = _package_with_a_hand_written_path(
+        tmp_path, segments=[(0, 0, [10, 11])]
+    )
+
+    with pkg:
+        with pkg.transaction():
+            pkg.conn.execute("UPDATE usap_path_block SET payload = X'000102'")
+
+        assert "CORRUPT_PATH_PAYLOAD" not in _codes(
+            pkg.validate_report(level="basic")
+        )
+        assert "CORRUPT_PATH_PAYLOAD" in _codes(pkg.validate_report(level="deep"))
+
+
+def test_usap_path_in_attributes_is_a_warning(tmp_path: Path) -> None:
+    with make_pkg(tmp_path) as pkg:
+        semantic_class_id = pkg.create_semantic_class(
+            scheme="local", class_uri="local:Road", local_name="Road"
+        )
+        annotation_id = pkg.create_annotation(
+            annotation_uid="ann-legacy-path",
+            semantic_class_id=semantic_class_id,
+        )
+
+        # Written behind the API's back: the SDK now refuses this key on write,
+        # so the only way to hold one is to have been written before it did.
+        with pkg.transaction():
+            pkg.conn.execute(
+                """
+                UPDATE usap_annotation
+                SET attributes_json = '{"usap:path": [[1, 2, 3]]}'
+                WHERE annotation_id = ?
+                """,
+                (annotation_id,),
+            )
+
+        report = pkg.validate_report()
+        issues = [i for i in report.issues if i.code == "PATH_IN_ATTRIBUTES"]
+
+        assert len(issues) == 1
+        assert issues[0].severity == "warning"
+        # A stranded order is not a broken package.
+        assert report.is_ok

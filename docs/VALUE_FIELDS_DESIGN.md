@@ -120,6 +120,14 @@ A new table that mirrors the membership block exactly, carrying *values* instead
 
 ---
 
+> **Profile 0.5.0 note.** Section 1 opens "USAP today stores exactly one kind of
+> element-level data: set membership". There are now three: membership
+> (`usap_membership_block`, a set), value fields (`usap_value_block`, a dense
+> array) and ordered paths (`usap_path_block`, a sequence). The membership/value
+> contrast this document draws is unchanged and still the reason value blocks
+> keep the plain `zlib` path; ordered paths are a third axis, covered by
+> `docs/ORDERED_PATHS_DESIGN.md`.
+>
 > **Profile 0.4.0 note.** The column list in section 4.1 is the one in force
 > when this was written. `usap_value_block` now carries an `assessment_id` as
 > well, and its `UNIQUE` is scoped to that rather than to `annotation_id`: a

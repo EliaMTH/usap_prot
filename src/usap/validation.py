@@ -13,9 +13,15 @@ from .constants import (
     CITY_OBJECT_STATUSES,
     CONFIDENCE_RANGE,
     DEFAULT_ENCODING,
+    PATH_ENCODING,
     VALUE_DTYPES,
 )
-from .encoding import decode_roaring_bitmap, decode_value_block
+from .encoding import (
+    decode_path,
+    decode_roaring_array,
+    decode_roaring_bitmap,
+    decode_value_block,
+)
 from .errors import USAPError
 from .geopackage import (
     GPKG_APPLICATION_ID,
@@ -116,11 +122,12 @@ def validate_connection(
                   closure. Never reads a block payload, so it stays cheap on
                   a package with millions of membership blocks.
 
-    ``deep``      (default) everything in ``basic``, plus every membership
-                  and value payload decoded and checked against its stored
-                  counts/bounds, containment acyclicity, asset-extent
-                  recomputation, and annotation domain constraints
-                  (status/confidence/attributes JSON).
+    ``deep``      (default) everything in ``basic``, plus every membership,
+                  value and path payload decoded and checked against its
+                  stored counts/bounds, each path checked against the
+                  membership it derives, containment acyclicity,
+                  asset-extent recomputation, and annotation domain
+                  constraints (status/confidence/attributes JSON).
 
     ``external``  everything in ``deep``, plus each registered asset file:
                   does it still exist, and does its SHA-256 still match the
@@ -156,6 +163,7 @@ def validate_connection(
         _validate_annotation_object_links(conn, report)
         _validate_membership_blocks(conn, report, decode_payloads=deep)
         _validate_value_blocks(conn, report, decode_payloads=deep)
+        _validate_path_blocks(conn, report, decode_payloads=deep)
         _validate_semantic_class_closure(conn, report)
         _validate_city_object_identity(conn, report)
         _validate_asset_identity(conn, report)
@@ -754,6 +762,30 @@ def _validate_orphans(conn: sqlite3.Connection, report: ValidationReport) -> Non
             """,
             "City-object relationship references a missing relationship type.",
         ),
+        (
+            "ORPHAN_PATH_ASSESSMENT",
+            "usap_path_block",
+            """
+            SELECT COUNT(*) AS n
+            FROM usap_path_block AS pb
+            LEFT JOIN usap_assessment AS asm
+                ON asm.assessment_id = pb.assessment_id
+            WHERE asm.assessment_id IS NULL
+            """,
+            "Path segment references a missing assessment.",
+        ),
+        (
+            "ORPHAN_PATH_ASSET_PART",
+            "usap_path_block",
+            """
+            SELECT COUNT(*) AS n
+            FROM usap_path_block AS pb
+            LEFT JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = pb.asset_part_id
+            WHERE ap.asset_part_id IS NULL
+            """,
+            "Path segment references a missing asset part.",
+        ),
     ]
 
     for code, table, sql, message in checks:
@@ -1341,6 +1373,44 @@ def _validate_annotation_domain(
             },
         )
 
+    # A warning, not an error, and a standalone block rather than a row in the
+    # checks list above, whose driver hardcodes severity="error".
+    #
+    # 'usap:path' was the 0.5.0 interim home for an ordered sequence. It is now
+    # refused on write and the sequence lives in usap_path_block, but a package
+    # written before that -- or by a third-party writer still following the old
+    # REFERENCE.md -- still carries the key, and it is the only copy of an order
+    # nothing reads any more. The package is not broken; the order is stranded.
+    #
+    # json_valid() guards json_extract, which raises on a column that is not
+    # JSON at all; that case is already reported as ANNOTATION_ATTRIBUTES_NOT_JSON.
+    # The path is quoted because the key contains a colon.
+    stranded_paths = conn.execute(
+        """
+        SELECT annotation_id, annotation_uid
+        FROM usap_annotation
+        WHERE attributes_json IS NOT NULL
+          AND json_valid(attributes_json) = 1
+          AND json_extract(attributes_json, '$."usap:path"') IS NOT NULL
+        """
+    ).fetchall()
+
+    for row in stranded_paths:
+        report.add(
+            severity="warning",
+            code="PATH_IN_ATTRIBUTES",
+            message=(
+                "Annotation carries a 'usap:path' key in its attributes. That "
+                "was the interim home for an ordered sequence and is no longer "
+                "read: the order belongs in usap_path_block, via "
+                "set_annotation_path(). The key is now the only copy of an "
+                "order nothing interprets."
+            ),
+            table="usap_annotation",
+            row_id=int(row["annotation_id"]),
+            details={"annotation_uid": row["annotation_uid"]},
+        )
+
 
 def _validate_city_object_identity(
     conn: sqlite3.Connection,
@@ -1657,6 +1727,313 @@ def _validate_external_assets(
                 row_id=item["asset_id"],
                 details={"uri": item["uri"]},
             )
+
+
+def _membership_sets_for_assessments(
+    conn: sqlite3.Connection,
+    assessment_ids: list[int],
+) -> dict[tuple[int, int], np.ndarray]:
+    """
+    The absolute membership indices of the given assessments, per asset part.
+
+    Scoped to the assessments that actually carry a path, never to the whole
+    table: a package annotating a 10 GB point cloud holds tens of thousands of
+    membership blocks and usually no paths at all, and decoding all of them to
+    check a feature it does not use is the kind of cost 'deep' is already
+    accused of.
+    """
+    if not assessment_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in assessment_ids)
+
+    rows = conn.execute(
+        f"""
+        SELECT assessment_id, asset_part_id, block_start, payload
+        FROM usap_membership_block
+        WHERE assessment_id IN ({placeholders})
+        ORDER BY assessment_id, asset_part_id, block_start
+        """,
+        assessment_ids,
+    ).fetchall()
+
+    per_part: dict[tuple[int, int], list[np.ndarray]] = {}
+
+    for row in rows:
+        key = (int(row["assessment_id"]), int(row["asset_part_id"]))
+
+        try:
+            offsets = decode_roaring_array(row["payload"])
+        except USAPError:
+            # Already reported by _validate_membership_blocks; skipping the
+            # block here keeps one corrupt payload from also being announced
+            # as a path/membership disagreement.
+            continue
+
+        per_part.setdefault(key, []).append(
+            offsets.astype(np.int64) + int(row["block_start"])
+        )
+
+    return {
+        key: np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
+        for key, chunks in per_part.items()
+    }
+
+
+def _validate_path_blocks(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+    *,
+    decode_payloads: bool,
+) -> None:
+    """
+    Check ordered path segments (docs/ORDERED_PATHS_DESIGN.md).
+
+    A path is the source and its membership is the index derived from it, so
+    the load-bearing check here is that the two still agree: sorting and
+    de-duplicating the path must reproduce the membership exactly. The SDK
+    writes both in one transaction and cannot drift, but a third-party writer
+    going straight to SQL can, and that is the case this exists for.
+
+    See _validate_membership_blocks on decode_payloads.
+    """
+    payload_column = "pb.payload," if decode_payloads else "NULL AS payload,"
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            pb.path_block_id,
+            pb.assessment_id,
+            pb.asset_part_id,
+            pb.segment_ordinal,
+            pb.continues_previous,
+            pb.element_count,
+            pb.encoding,
+            {payload_column}
+
+            asm.asset_id AS assessment_asset_id,
+            ap.asset_id AS asset_part_asset_id,
+            ap.element_count AS asset_part_element_count
+        FROM usap_path_block AS pb
+        LEFT JOIN usap_assessment AS asm
+            ON asm.assessment_id = pb.assessment_id
+        LEFT JOIN usap_asset_part AS ap
+            ON ap.asset_part_id = pb.asset_part_id
+        ORDER BY pb.assessment_id, pb.segment_ordinal
+        """
+    ).fetchall()
+
+    if not rows:
+        # The overwhelmingly common case. Returning here is what keeps a
+        # package with no paths from paying anything for this check.
+        return
+
+    by_assessment: dict[int, list[sqlite3.Row]] = {}
+
+    for row in rows:
+        by_assessment.setdefault(int(row["assessment_id"]), []).append(row)
+
+    # Decoded path indices per (assessment, asset part), accumulated across
+    # segments so the membership comparison sees the whole path in that part.
+    decoded_by_part: dict[tuple[int, int], list[np.ndarray]] = {}
+
+    for row in rows:
+        block_id = int(row["path_block_id"])
+        element_count = int(row["element_count"])
+
+        if row["encoding"] != PATH_ENCODING:
+            report.add(
+                severity="error",
+                code="UNSUPPORTED_PATH_ENCODING",
+                message=(
+                    f"Path segment encoding {row['encoding']!r} is not "
+                    f"{PATH_ENCODING!r}. Note this is deliberately not "
+                    "'u32-zlib': a path holds absolute indices in sequence "
+                    "order and may repeat them."
+                ),
+                table="usap_path_block",
+                row_id=block_id,
+            )
+            # Nothing below can read the payload, and reporting it as corrupt
+            # as well would name one fault twice.
+            continue
+
+        if element_count <= 0:
+            report.add(
+                severity="error",
+                code="EMPTY_PATH_SEGMENT",
+                message="Path segment has zero or negative element_count.",
+                table="usap_path_block",
+                row_id=block_id,
+            )
+            continue
+
+        assessment_asset_id = row["assessment_asset_id"]
+        asset_part_asset_id = row["asset_part_asset_id"]
+
+        if (
+            assessment_asset_id is not None
+            and asset_part_asset_id is not None
+            and int(assessment_asset_id) != int(asset_part_asset_id)
+        ):
+            report.add(
+                severity="error",
+                code="PATH_OUTSIDE_ASSESSMENT_ASSET",
+                message=(
+                    f"Path segment indexes asset part {int(row['asset_part_id'])}, "
+                    f"which belongs to asset {int(asset_part_asset_id)}, but its "
+                    f"assessment evaluates asset {int(assessment_asset_id)}."
+                ),
+                table="usap_path_block",
+                row_id=block_id,
+                details={
+                    "asset_part_id": int(row["asset_part_id"]),
+                    "asset_part_asset_id": int(asset_part_asset_id),
+                    "assessment_asset_id": int(assessment_asset_id),
+                },
+            )
+
+        if not decode_payloads:
+            continue
+
+        try:
+            # Decoded WITHOUT the declared count, so a row that lies about its
+            # own element_count is reported as a mismatch rather than having
+            # the decoder refuse it as corruption first.
+            indices = decode_path(row["payload"])
+        except Exception as exc:
+            report.add(
+                severity="error",
+                code="CORRUPT_PATH_PAYLOAD",
+                message=f"Could not decode path payload: {exc}",
+                table="usap_path_block",
+                row_id=block_id,
+            )
+            continue
+
+        if indices.size != element_count:
+            report.add(
+                severity="error",
+                code="PATH_COUNT_MISMATCH",
+                message=(
+                    f"Path segment payload holds {int(indices.size)} indices, "
+                    f"declared element_count is {element_count}."
+                ),
+                table="usap_path_block",
+                row_id=block_id,
+                details={
+                    "declared": element_count,
+                    "decoded": int(indices.size),
+                },
+            )
+            # No continue: the indices are still usable, and one wrong count
+            # must not hide an out-of-range index or a broken membership.
+
+        part_element_count = row["asset_part_element_count"]
+
+        if (
+            part_element_count is not None
+            and indices.size
+            and int(indices.max()) >= int(part_element_count)
+        ):
+            report.add(
+                severity="error",
+                code="PATH_OUT_OF_ASSET_PART_RANGE",
+                message=(
+                    f"Path segment holds element index {int(indices.max())}, "
+                    f"but asset part {int(row['asset_part_id'])} has "
+                    f"{int(part_element_count)} elements."
+                ),
+                table="usap_path_block",
+                row_id=block_id,
+                details={
+                    "max_element_index": int(indices.max()),
+                    "asset_part_element_count": int(part_element_count),
+                },
+            )
+
+        decoded_by_part.setdefault(
+            (int(row["assessment_id"]), int(row["asset_part_id"])), []
+        ).append(indices.astype(np.int64))
+
+    for assessment_id, segments in by_assessment.items():
+        ordinals = [int(segment["segment_ordinal"]) for segment in segments]
+
+        # Contiguous from zero: a gap means a segment was deleted out of the
+        # middle, and the sequence either side of it no longer joins up.
+        if ordinals != list(range(len(ordinals))):
+            report.add(
+                severity="error",
+                code="PATH_SEGMENT_ORDINAL_GAP",
+                message=(
+                    f"Assessment {assessment_id} has path segment ordinals "
+                    f"{ordinals}, which are not contiguous from 0. A path is "
+                    "one ordered object; a hole in it has no reading."
+                ),
+                table="usap_path_block",
+                details={
+                    "assessment_id": assessment_id,
+                    "segment_ordinals": ordinals,
+                },
+            )
+
+        if segments and int(segments[0]["continues_previous"]) != 0:
+            report.add(
+                severity="error",
+                code="PATH_FIRST_SEGMENT_CONTINUES",
+                message=(
+                    f"The first path segment of assessment {assessment_id} is "
+                    "marked as continuing a previous one, but there is none."
+                ),
+                table="usap_path_block",
+                row_id=int(segments[0]["path_block_id"]),
+                details={"assessment_id": assessment_id},
+            )
+
+    if not decode_payloads:
+        return
+
+    memberships = _membership_sets_for_assessments(
+        conn, sorted(by_assessment)
+    )
+
+    for (assessment_id, asset_part_id), chunks in sorted(decoded_by_part.items()):
+        path_set = np.unique(np.concatenate(chunks))
+        membership = memberships.get((assessment_id, asset_part_id))
+
+        if membership is None:
+            membership_set = np.empty(0, dtype=np.int64)
+        else:
+            membership_set = np.unique(membership)
+
+        if np.array_equal(path_set, membership_set):
+            continue
+
+        report.add(
+            severity="error",
+            code="PATH_MEMBERSHIP_MISMATCH",
+            message=(
+                f"The path of assessment {assessment_id} on asset part "
+                f"{asset_part_id} covers {int(path_set.size)} distinct "
+                f"element(s), but its membership holds "
+                f"{int(membership_set.size)}. Sorting and de-duplicating the "
+                "path must reproduce the membership exactly: the path is the "
+                "source, the membership is its index."
+            ),
+            table="usap_path_block",
+            details={
+                "assessment_id": assessment_id,
+                "asset_part_id": asset_part_id,
+                "path_distinct_count": int(path_set.size),
+                "membership_count": int(membership_set.size),
+                "only_in_path": np.setdiff1d(
+                    path_set, membership_set
+                )[:16].tolist(),
+                "only_in_membership": np.setdiff1d(
+                    membership_set, path_set
+                )[:16].tolist(),
+            },
+        )
 
 
 def _validate_semantic_class_closure(

@@ -85,7 +85,13 @@ What is derived when omitted:
 
 Optional per entry: `status`, `confidence`, `attributes` (claim-level metadata
 only — method, source), `value_fields` (dense per-element values, see
-REFERENCE.md), and `assessed_at`.
+REFERENCE.md), `path` (an ordered element sequence, for a claim with a
+direction — see REFERENCE.md § Path block), and `assessed_at`.
+
+`memberships`, `value_fields` and `path` are siblings and at least one is
+required. An entry carrying only a `path` is complete: the membership is
+derived from it. Listing both a `path` and a `memberships` entry for the same
+asset part raises, since that states the same geometry twice.
 
 **`assessed_at` dates the evaluation**, and is what makes a re-survey importable.
 An entry without it writes into the annotation's undated assessment, so a
@@ -185,7 +191,10 @@ build_project_package_from_file("update.json", update=True)
 - **Edit annotations**: list batches in `annotation_batches`; in update mode
   they run with `replace_existing=True` — an entry with an existing
   `annotation_uid` (given or derived) updates the fields it carries and
-  replaces the memberships/value fields it lists, leaving the rest intact.
+  replaces the memberships/value fields/path it lists, leaving the rest intact.
+  An entry that writes `memberships` onto an assessment already carrying an
+  ordered path raises rather than stranding the order: carry the `path` key in
+  the re-run too, or drop the path deliberately through the Python API.
 - Standalone editing without a config also works:
   `apply_annotation_batch_file(pkg, "edit.json", replace_existing=True)`.
 

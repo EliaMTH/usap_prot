@@ -30,6 +30,7 @@ A `*.usap.gpkg` file stores, for one study area:
 - an optional link to the authoritative **city-object instance** represented or concerned by the claim;
 - editable **annotation records** with a display label, status, confidence, and claim-level attributes such as method and source, each carrying one or more dated **assessments** (one evaluation of the claim against one 3D asset);
 - optional **per-element value fields**, stored as compressed typed blocks and queryable by value;
+- optional **ordered element paths**, for a claim whose elements have a direction — a road centreline, a traversal — which a membership set cannot hold;
 - a lightweight mirror of **city-object identity** and a typed, directed **relationship graph** used to retrieve annotations across an object and its parts, or across whatever else the source says it relates to.
 
 The division of authority is deliberate:
@@ -104,6 +105,27 @@ Besides membership sets ("these faces are a `RoofSurface`"), an annotation can c
 
 **Where the metadata lives:** the concept definition remains in the semantic source or vocabulary. The claim's own tags (`unit`, `method`) remain in the annotation or assessment attributes. A field measured again at a later date is a second **assessment** of the same annotation — one claim, one concept, one city object, several dated evaluations — not a second annotation per timestep. An external application schema may also catalog the analysis; that complements rather than replaces the in-package claim metadata.
 
+## Ordered element paths
+
+Membership is a *set*: it comes back ascending and deduplicated, which is right
+for a roof and wrong for a road. A centreline is faces **in traversal order**,
+and that order is destroyed at write time, not merely unstored.
+
+An annotation can therefore carry an **ordered path** as well: a sequence of
+element indices, in order, repeats allowed, split into disjoint runs. Each row
+names the asset part its indices belong to — element indices restart at zero in
+every part, so a route crossing a tile boundary needs that column, and it is the
+reason the path is a table rather than a convention inside `attributes`.
+
+The path is the source and the membership is **derived** from it in the same
+transaction, so the two cannot drift, and every existing reverse query keeps
+reading membership unchanged. `path_run_count` is reported by every annotation
+and assessment read, and by `usap_annotations_view`, so an application can tell
+an ordered claim from an unordered one without decoding anything.
+
+See [ORDERED_PATHS_DESIGN.md](docs/ORDERED_PATHS_DESIGN.md) for why it is shaped
+this way.
+
 ---
 ## How it relates to existing work
 
@@ -134,6 +156,7 @@ What is already in place are the parts that could not be added afterwards withou
 ## Limitations
 
 - **Once processed, 3D assets are supposed to be immutable.** An annotation is bound to one immutable version of an external file. LAS point order and mesh face order are not guaranteed to survive reprojection, re-tiling, thinning, remeshing, re-export, or conversion to COPC, which reorders points by design. USAP records a content hash to detect that a file changed, but it cannot rebind annotations.
+- **An ordered path is stored separately from its membership**, because a roaring bitmap cannot hold order. The two are written together and validated against each other, but a reader that only decodes membership sees the claim's elements without its direction.
 - **Membership is stored as roaring bitmaps**, in blocks of 16384 elements, using CRoaring's portable serialization. The payload is therefore readable by Java, Go, C++, Rust, and other compatible roaring implementations rather than being a private Python blob. Block width is a deliberate compromise: wider blocks usually compress better, while narrower blocks give the reverse query more precise pruning.
 - **Trusted inputs only.** Nothing here is hardened against hostile files. A CityGML document is parsed as a full tree in memory and walked twice, and an arbitrary SQLite file is refused only by a profile check. Compressed payloads are bounded on decode, but treat a `.usap.gpkg` from a third party as you would any other untrusted file.
 - **GIS tools see a summary, not the complete annotation model.** A `.usap.gpkg` opens in QGIS/GDAL as a real GeoPackage: four read-only attribute layers (annotations, assessments, concepts, city objects) and one feature layer drawing a derived 2D bounding box per registered asset. Fine-grained memberships and value fields still require the SDK, and USAP is not a registered OGC extension.
@@ -149,9 +172,11 @@ Explore USAP in more detail with:
 - [SCHEMA_WIRING.md](docs/SCHEMA_WIRING.md) — how the tables, views and indexes connect;
 - [TESTS.md](docs/TESTS.md) — what the test suite covers and why.
 
-Two documents record decisions rather than describe the current state:
+Three documents record decisions rather than describe the current state:
 [ACCELERATOR_ABLATION.md](docs/ACCELERATOR_ABLATION.md) (are the query tables
-worth their cost) and [VALUE_FIELDS_DESIGN.md](docs/VALUE_FIELDS_DESIGN.md).
+worth their cost), [VALUE_FIELDS_DESIGN.md](docs/VALUE_FIELDS_DESIGN.md), and
+[ORDERED_PATHS_DESIGN.md](docs/ORDERED_PATHS_DESIGN.md) (agreed, not yet
+implemented).
 
 ---
 

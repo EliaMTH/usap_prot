@@ -24,7 +24,7 @@ _ITEM_KEYS = frozenset({
     "gml_id", "source_object_id",
     "concept", "scheme", "label", "status", "confidence",
     "attributes", "attributes_json", "assessed_at",
-    "memberships", "value_fields",
+    "memberships", "value_fields", "path",
 })
 _MEMBERSHIP_KEYS = frozenset({
     "asset_part_id", "asset_uri", "part_path",
@@ -33,6 +33,14 @@ _MEMBERSHIP_KEYS = frozenset({
 _VALUE_FIELD_KEYS = frozenset({
     "asset_part_id", "asset_uri", "part_path",
     "element_kind", "values", "value_dtype",
+})
+# A path segment names its own part, because element indices restart at zero in
+# every one -- which is the whole reason the sequence is a table and not a key
+# in attributes. 'continues_previous' marks a segment that carries on the
+# previous one's run rather than starting a new one.
+_PATH_SEGMENT_KEYS = frozenset({
+    "asset_part_id", "asset_uri", "part_path",
+    "element_kind", "element_indices", "continues_previous",
 })
 
 
@@ -43,6 +51,7 @@ class BatchAnnotationResult:
     concept: str
     membership_count: int
     value_field_count: int = 0
+    path_segment_count: int = 0
 
 
 @dataclass
@@ -50,6 +59,7 @@ class BatchImportResult:
     annotation_count: int = 0
     membership_count: int = 0
     value_field_count: int = 0
+    path_segment_count: int = 0
     created_city_object_count: int = 0
     created_city_object_uids: list[str] = field(default_factory=list)
     annotations: list[BatchAnnotationResult] = field(default_factory=list)
@@ -191,6 +201,7 @@ def apply_annotation_batch(
             result.annotation_count += 1
             result.membership_count += annotation_result.membership_count
             result.value_field_count += annotation_result.value_field_count
+            result.path_segment_count += annotation_result.path_segment_count
 
         result.created_city_object_count = len(result.created_city_object_uids)
 
@@ -228,6 +239,7 @@ def _check_batch_keys(
         for field_name, known in (
             ("memberships", _MEMBERSHIP_KEYS),
             ("value_fields", _VALUE_FIELD_KEYS),
+            ("path", _PATH_SEGMENT_KEYS),
         ):
             blocks = item.get(field_name)
 
@@ -513,6 +525,7 @@ def _apply_one_annotation(
 
     memberships = item.get("memberships")
     value_fields = item.get("value_fields")
+    path = item.get("path")
 
     if memberships is not None and (
         not isinstance(memberships, list) or not memberships
@@ -530,10 +543,15 @@ def _apply_one_annotation(
             "when provided."
         )
 
-    if memberships is None and value_fields is None:
+    if path is not None and (not isinstance(path, list) or not path):
         raise ValueError(
-            f"{annotation_uid}: provide at least one of 'memberships' "
-            "or 'value_fields'."
+            f"{annotation_uid}: 'path' must be a non-empty list when provided."
+        )
+
+    if memberships is None and value_fields is None and path is None:
+        raise ValueError(
+            f"{annotation_uid}: provide at least one of 'memberships', "
+            "'value_fields' or 'path'."
         )
 
     # One date for the whole entry: memberships and value fields written by the
@@ -566,12 +584,28 @@ def _apply_one_annotation(
 
         value_field_count += 1
 
+    path_segment_count = 0
+
+    if path is not None:
+        # Applied last, and in one call rather than one per segment: a path is
+        # cross-part by construction, and its ordinals are contiguous across
+        # the whole assessment.
+        path_segment_count = _apply_path(
+            pkg,
+            annotation_id=annotation_id,
+            annotation_uid=annotation_uid,
+            path=path,
+            memberships=memberships,
+            assessed_at=assessed_at,
+        )
+
     return BatchAnnotationResult(
         annotation_id=annotation_id,
         annotation_uid=annotation_uid,
         concept=concept if isinstance(concept, str) else concept_local_name,
         membership_count=membership_count,
         value_field_count=value_field_count,
+        path_segment_count=path_segment_count,
     )
 
 
@@ -684,6 +718,104 @@ def _apply_one_membership(
             assessed_at=assessed_at,
         ),
     )
+
+
+def _apply_path(
+    pkg: USAPPackage,
+    *,
+    annotation_id: int,
+    annotation_uid: str,
+    path: list,
+    memberships: list | None,
+    assessed_at: str | None = None,
+) -> int:
+    """
+    Apply an entry's ordered path, in one call.
+
+    Unlike memberships and value fields, this is not per-block: a path's
+    segment ordinals run across the whole assessment, so the segments have to
+    arrive together. The membership is derived from it by set_annotation_path,
+    which is why an entry may carry `path` and no `memberships` at all.
+    """
+    segments = []
+
+    for position, segment in enumerate(path):
+        if not isinstance(segment, dict):
+            raise ValueError(
+                f"{annotation_uid}: path segment {position} must be an object: "
+                f"{segment!r}"
+            )
+
+        asset_part_id, _element_kind = _resolve_part_reference(
+            pkg,
+            annotation_uid=annotation_uid,
+            payload=segment,
+            field_name="path",
+        )
+
+        element_indices = segment.get("element_indices")
+
+        if not isinstance(element_indices, list) or not element_indices:
+            raise ValueError(
+                f"{annotation_uid}: path segment {position} needs a non-empty "
+                "'element_indices' list."
+            )
+
+        if not all(isinstance(i, int) for i in element_indices):
+            raise ValueError(
+                f"{annotation_uid}: path segment {position} element_indices "
+                "must contain only ints."
+            )
+
+        segments.append(
+            {
+                "asset_part_id": asset_part_id,
+                "element_indices": element_indices,
+                "continues_previous": bool(
+                    segment.get("continues_previous", False)
+                ),
+            }
+        )
+
+    # An entry that also writes membership for a part the path covers is
+    # asserting the same geometry twice, and the derived one would win. That is
+    # the drift this design exists to prevent, so it is refused here rather
+    # than resolved silently -- and refused before anything is written, so the
+    # entry is not half-applied.
+    path_parts = {segment["asset_part_id"] for segment in segments}
+
+    for membership in memberships or []:
+        if not isinstance(membership, dict):
+            continue
+
+        membership_part, _kind = _resolve_part_reference(
+            pkg,
+            annotation_uid=annotation_uid,
+            payload=membership,
+            field_name="membership",
+        )
+
+        if membership_part in path_parts:
+            raise ValueError(
+                f"{annotation_uid}: asset part {membership_part} is covered by "
+                "both 'path' and 'memberships'. The membership is derived from "
+                "the path, so listing both states the same geometry twice. "
+                "Drop the 'memberships' entry for that part."
+            )
+
+    # One assessment for the whole path, not one per segment: the ordinals are
+    # scoped to the assessment, and segments in parts of different assets would
+    # otherwise resolve to different ones.
+    assessment = _assessment_for_entry(
+        pkg,
+        annotation_id=annotation_id,
+        asset_part_id=segments[0]["asset_part_id"],
+        assessed_at=assessed_at,
+    )
+
+    pkg.set_annotation_path(annotation_id, segments, assessment=assessment)
+
+    return len(segments)
 
 
 def _assessment_for_entry(

@@ -19,8 +19,9 @@
 -- 12. usap_annotation_object
 -- 13. usap_membership_block
 -- 14. usap_value_block
--- 15. usap_edit_log
--- 16. GIS-facing views (attributes + features layers for QGIS/GDAL)
+-- 15. usap_path_block
+-- 16. usap_edit_log
+-- 17. GIS-facing views (attributes + features layers for QGIS/GDAL)
 --
 -- Indexes are declared immediately after the table they serve.
 
@@ -594,6 +595,87 @@ ON usap_value_block(
     element_kind
 );
 
+-- Ordered element sequences: the claim membership cannot express.
+--
+-- Membership is a roaring bitmap -- a *set*, ascending and deduplicated by
+-- construction -- which is right for a roof and wrong for a road. A centreline
+-- is faces in traversal order, and that order is destroyed at write time, not
+-- merely unstored. This table is the only copy of it.
+--
+-- A row is one SEGMENT: a contiguous stretch of the sequence whose indices all
+-- live in one asset part. Read order is ORDER BY segment_ordinal. A RUN -- one
+-- disjoint stretch of the path -- is a maximal span of segments in which every
+-- segment after the first carries continues_previous = 1.
+--
+-- Why a table and not a JSON key (the 0.5.0 interim 'usap:path'): element
+-- indices restart at zero in every asset part, so a bare list of integers
+-- cannot say which part it runs through, and a route crossing a tile boundary
+-- is unreadable. asset_part_id is a column here for exactly that reason, and it
+-- is the one column that cannot be derived -- an assessment binds to an ASSET,
+-- which may register many parts.
+--
+-- Deliberately carries neither annotation_id nor element_kind, unlike its
+-- sibling block tables. Both are recoverable (through usap_assessment and
+-- usap_asset_part respectively), and the siblings denormalise them only to keep
+-- a tuned single-index plan over millions of rows -- which a path, a handful of
+-- rows per annotation, does not have. Not storing them also removes the two
+-- checks (ASSESSMENT_ANNOTATION_MISMATCH, MEMBERSHIP_ELEMENT_KIND_MISMATCH)
+-- that exist solely to police those copies.
+--
+-- The membership is DERIVED from the path and written in the same transaction
+-- (set_annotation_path), so the two cannot drift; validate_report re-checks it
+-- as PATH_MEMBERSHIP_MISMATCH, which is the half that reaches a third-party
+-- writer going straight to SQL.
+--
+-- See docs/ORDERED_PATHS_DESIGN.md for the full rationale.
+CREATE TABLE usap_path_block (
+    path_block_id       INTEGER PRIMARY KEY,
+
+    assessment_id       INTEGER NOT NULL
+        REFERENCES usap_assessment(assessment_id)
+        ON DELETE CASCADE,
+
+    asset_part_id       INTEGER NOT NULL
+        REFERENCES usap_asset_part(asset_part_id)
+        ON DELETE CASCADE,
+
+    -- Position of this segment in the whole path, 0..n-1 within the
+    -- assessment. Scoped to the assessment rather than to the part, or nothing
+    -- could say that the run in tile A precedes the run in tile B.
+    segment_ordinal     INTEGER NOT NULL,
+
+    -- 1 = this segment continues the previous segment's run; 0 = it starts a
+    -- new run. The only thing distinguishing "the road carried on into the
+    -- next tile" from "the road stopped, and a separate stretch begins here".
+    -- Segment 0 must be 0 (PATH_FIRST_SEGMENT_CONTINUES).
+    continues_previous  INTEGER NOT NULL DEFAULT 0
+        CHECK (continues_previous IN (0, 1)),
+
+    -- Positions in the payload, which may EXCEED the membership this segment
+    -- derives: a path may revisit an element. Also the exact expected
+    -- decompressed size, so the decode ceiling can be exact.
+    element_count       INTEGER NOT NULL,
+
+    -- 'u32-seq-zlib': absolute little-endian uint32 in sequence order,
+    -- zlib-compressed, no count prefix. The byte layout of the historical
+    -- 'u32-zlib' membership codec, under a different name because the values
+    -- are absolute rather than block-relative, unsorted, and may repeat.
+    encoding            TEXT NOT NULL DEFAULT 'u32-seq-zlib',
+
+    payload             BLOB NOT NULL,
+
+    UNIQUE(assessment_id, segment_ordinal)
+);
+
+-- Serves the ON DELETE CASCADE scan from usap_asset_part. The forward read
+-- (WHERE assessment_id = ? ORDER BY segment_ordinal) is served by the UNIQUE
+-- autoindex above, so indexing that tuple again would be caught by
+-- test_no_explicit_index_duplicates_a_unique_autoindex.
+CREATE INDEX usap_path_by_part
+ON usap_path_block(
+    asset_part_id
+);
+
 CREATE TABLE usap_edit_log (
     edit_id       INTEGER PRIMARY KEY,
     operation     TEXT NOT NULL,
@@ -645,6 +727,18 @@ SELECT
         FROM usap_value_block AS vb
         WHERE vb.annotation_id = a.annotation_id
     ) AS INTEGER) AS value_field_count,
+    -- How many disjoint runs this claim's path has, 0 for an unordered one.
+    -- A run starts at every segment with continues_previous = 0, so counting
+    -- those counts runs. This is how a plain-SQL reader tells an ordered
+    -- annotation from an unordered one without decoding any payload.
+    CAST((
+        SELECT COUNT(*)
+        FROM usap_path_block AS pb
+        JOIN usap_assessment AS pasm
+            ON pasm.assessment_id = pb.assessment_id
+        WHERE pasm.annotation_id = a.annotation_id
+          AND pb.continues_previous = 0
+    ) AS INTEGER) AS path_run_count,
     a.attributes_json,
     a.created_at,
     a.updated_at

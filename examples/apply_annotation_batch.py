@@ -32,6 +32,8 @@ def main() -> None:
         print("Applied annotation batch")
         print("  annotations:", result.annotation_count)
         print("  memberships:", result.membership_count)
+        print("  value fields:", result.value_field_count)
+        print("  path segments:", result.path_segment_count)
 
         for item in result.annotations:
             print(
@@ -41,6 +43,10 @@ def main() -> None:
                 item.concept,
                 "memberships=",
                 item.membership_count,
+                "value_fields=",
+                item.value_field_count,
+                "path_segments=",
+                item.path_segment_count,
             )
 
         print()

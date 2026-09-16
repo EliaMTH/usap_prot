@@ -51,6 +51,7 @@ USAP_EXTENSION_TABLES = [
     "usap_assessment",
     "usap_membership_block",
     "usap_value_block",
+    "usap_path_block",
     "usap_edit_log",
 ]
 

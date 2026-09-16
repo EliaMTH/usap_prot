@@ -112,6 +112,7 @@ from .constants import (
     DEFAULT_GRAPH_NAME,
     DEFAULT_TRAVERSAL_CATEGORIES,
     DEFAULT_VALUE_DTYPE,
+    PATH_ENCODING,
     RELATIONSHIP_CATEGORIES,
     RELATIONSHIP_DIRECTIONS,
     SUPPORTED_PROFILE_VERSIONS,
@@ -124,10 +125,13 @@ from .constants import (
 from .encoding import (
     IndexArray,
     as_index_array,
+    as_sequence_array,
     block_start_for_index,
+    decode_path,
     decode_roaring_array,
     decode_roaring_bitmap,
     decode_value_block,
+    encode_path,
     encode_roaring,
     encode_value_block,
     roaring_to_array,
@@ -262,11 +266,26 @@ def _check_annotation_fields(
 
     if attributes_json is not _UNSET and attributes_json is not None:
         try:
-            json.loads(attributes_json)
+            parsed = json.loads(attributes_json)
         except (TypeError, ValueError) as exc:
             raise USAPError(
                 f"attributes_json is not valid JSON: {exc}"
             ) from exc
+
+        # 'usap:path' was the 0.5.0 interim home for an ordered sequence, and
+        # storing one there again would strand it: nothing reads the key, and
+        # it cannot say which asset part its indices are counted in -- the
+        # whole reason usap_path_block exists. Refused on the way in rather
+        # than reported later, because the writer is the only party that still
+        # has the part to hand.
+        if isinstance(parsed, dict) and "usap:path" in parsed:
+            raise USAPError(
+                "attributes must not carry 'usap:path'. An ordered element "
+                "sequence lives in usap_path_block: use "
+                "set_annotation_path(annotation_id, segments), which writes "
+                "the order and derives the membership from it in one "
+                "transaction."
+            )
 
 
 def _descendants_cte(edge_type_count: int, direction: str = "out") -> str:
@@ -2988,6 +3007,7 @@ class USAPPackage:
         item["value_field_summary"] = self._annotation_value_field_summary(
             annotation_id
         )
+        item["path_summary"] = self._annotation_path_summary(annotation_id)
 
 
     def create_annotation(
@@ -3320,6 +3340,12 @@ class USAPPackage:
                 asm.assessed_at,
                 asm.status,
                 asm.confidence,
+                CAST(COALESCE((
+                    SELECT COUNT(*)
+                    FROM usap_path_block AS pb
+                    WHERE pb.assessment_id = asm.assessment_id
+                      AND pb.continues_previous = 0
+                ), 0) AS INTEGER) AS path_run_count,
                 asm.attributes_json,
                 asm.created_at,
                 asm.updated_at
@@ -3389,6 +3415,15 @@ class USAPPackage:
                 asm.assessed_at,
                 asm.status,
                 asm.confidence,
+                -- Reported unconditionally, like every other summary column:
+                -- an application must be able to tell an ordered evaluation
+                -- from an unordered one without knowing to ask.
+                CAST(COALESCE((
+                    SELECT COUNT(*)
+                    FROM usap_path_block AS pb
+                    WHERE pb.assessment_id = asm.assessment_id
+                      AND pb.continues_previous = 0
+                ), 0) AS INTEGER) AS path_run_count,
                 asm.attributes_json,
                 asm.created_at,
                 asm.updated_at
@@ -3551,7 +3586,13 @@ class USAPPackage:
                 ap.part_path,
                 ap.element_kind,
                 SUM(mb.element_count) AS selected_count,
-                COUNT(*) AS block_count
+                COUNT(*) AS block_count,
+                CAST(COALESCE((
+                    SELECT COUNT(*)
+                    FROM usap_path_block AS pb
+                    WHERE pb.assessment_id = mb.assessment_id
+                      AND pb.asset_part_id = mb.asset_part_id
+                ), 0) AS INTEGER) AS path_segment_count
             FROM usap_membership_block AS mb
             JOIN usap_asset_part AS ap
                 ON ap.asset_part_id = mb.asset_part_id
@@ -3581,7 +3622,16 @@ class USAPPackage:
                     SELECT SUM(mb.element_count)
                     FROM usap_membership_block AS mb
                     WHERE mb.assessment_id = asm.assessment_id
-                ), 0) AS INTEGER) AS selected_count
+                ), 0) AS INTEGER) AS selected_count,
+                -- A run starts at every segment that does not continue the
+                -- previous one, so counting those counts runs. 0 means this
+                -- evaluation carries no order, which is the ordinary case.
+                CAST(COALESCE((
+                    SELECT COUNT(*)
+                    FROM usap_path_block AS pb
+                    WHERE pb.assessment_id = asm.assessment_id
+                      AND pb.continues_previous = 0
+                ), 0) AS INTEGER) AS path_run_count
             FROM usap_assessment AS asm
             JOIN usap_asset AS asset
                 ON asset.asset_id = asm.asset_id
@@ -3810,6 +3860,7 @@ class USAPPackage:
         encoding: str = DEFAULT_ENCODING,
         *,
         assessment: int | str | None = None,
+        drop_path: bool = False,
     ) -> None:
         """
         Replace all membership blocks for one assessment in one asset part.
@@ -3827,6 +3878,13 @@ class USAPPackage:
         annotations_for_elements derives block boundaries from that single
         global size, so membership must not be written at any other size or the
         reverse lookup would silently miss it.
+
+        Raises if the target assessment carries an ordered path, because the
+        path would be left describing a selection that no longer exists. Pass
+        `drop_path=True` to discard the order deliberately and keep a plain
+        set. That discards the assessment's path *entirely*, not just the
+        segments in this part: a path is one ordered object, and removing its
+        middle would leave the segments either side no longer joined up.
         """
         element_kind = normalize_element_kind(element_kind)
         if encoding != DEFAULT_ENCODING:
@@ -3859,6 +3917,12 @@ class USAPPackage:
                 annotation_id=annotation_id,
                 asset_part_id=asset_part_id,
                 assessment=assessment,
+            )
+
+            self._guard_annotation_path(
+                assessment_id=assessment_id,
+                asset_part_id=asset_part_id,
+                drop_path=drop_path,
             )
 
             self.conn.execute(
@@ -3924,6 +3988,575 @@ class USAPPackage:
                 f'"element_kind": {element_kind}, '
                 f'"element_count": {len(unique_indices)}}}',
             )
+
+    # ---------------------------------------------------------------------
+    # Ordered paths
+    # ---------------------------------------------------------------------
+    #
+    # Membership is a set; a path is the order over it that a set cannot hold.
+    # The path is the source and the membership is derived from it in the same
+    # transaction, so the two cannot drift -- which is why every membership
+    # write onto a path-bearing assessment has to go through the guard below
+    # rather than quietly leaving the order describing a selection that is gone.
+    #
+    # See docs/ORDERED_PATHS_DESIGN.md.
+
+    def _guard_annotation_path(
+        self,
+        *,
+        assessment_id: int,
+        asset_part_id: int,
+        drop_path: bool,
+    ) -> None:
+        """
+        Refuse a membership write that would strand this assessment's path.
+
+        `drop_path=True` deletes the whole path, not the segments covering
+        `asset_part_id` alone: segment ordinals are contiguous across the
+        assessment, so removing the middle would leave the segments either side
+        no longer joined up (and PATH_SEGMENT_ORDINAL_GAP on a package this SDK
+        wrote itself).
+        """
+        row = self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS segment_count,
+                SUM(asset_part_id = ?) AS segments_here
+            FROM usap_path_block
+            WHERE assessment_id = ?
+            """,
+            (asset_part_id, assessment_id),
+        ).fetchone()
+
+        segment_count = int(row["segment_count"] or 0)
+
+        if segment_count == 0:
+            return
+
+        if not int(row["segments_here"] or 0):
+            # The path runs elsewhere in this assessment and this write does
+            # not touch it. Nothing to strand.
+            return
+
+        if not drop_path:
+            raise USAPError(
+                f"Assessment {assessment_id} carries an ordered path "
+                f"({segment_count} segment(s)) covering asset part "
+                f"{asset_part_id}. Replacing the membership would leave the "
+                "path describing a selection that no longer exists. Use "
+                "set_annotation_path(annotation_id, segments) to rewrite the "
+                "order and its membership together, or pass drop_path=True to "
+                "discard the whole path and keep an unordered set."
+            )
+
+        self.conn.execute(
+            "DELETE FROM usap_path_block WHERE assessment_id = ?",
+            (assessment_id,),
+        )
+
+        self.log_edit(
+            "drop_annotation_path",
+            "usap_assessment",
+            assessment_id,
+            f'{{"segment_count": {segment_count}, '
+            f'"reason": "membership replaced on asset_part {asset_part_id}"}}',
+        )
+
+    def _resolve_path_segments(
+        self,
+        segments: Any,
+    ) -> list[dict[str, Any]]:
+        """
+        Normalize and check a `segments` list, without touching the database
+        beyond resolving each part.
+        """
+        if not isinstance(segments, (list, tuple)) or not segments:
+            raise USAPError(
+                "segments must be a non-empty list of "
+                "{'asset_part_id': ..., 'element_indices': [...]} objects. "
+                "Pass None to drop the path."
+            )
+
+        resolved: list[dict[str, Any]] = []
+
+        for position, segment in enumerate(segments):
+            if not isinstance(segment, dict):
+                raise USAPError(
+                    f"Path segment {position} must be an object, got "
+                    f"{type(segment).__name__}."
+                )
+
+            unknown = sorted(
+                key
+                for key in segment
+                if key not in {
+                    "asset_part_id",
+                    "element_indices",
+                    "continues_previous",
+                }
+            )
+
+            if unknown:
+                raise USAPError(
+                    f"Unrecognised key(s) in path segment {position}: "
+                    f"{', '.join(repr(k) for k in unknown)}. Known keys are: "
+                    "asset_part_id, element_indices, continues_previous."
+                )
+
+            if "asset_part_id" not in segment:
+                raise USAPError(
+                    f"Path segment {position} has no 'asset_part_id'. Element "
+                    "indices restart at zero in every asset part, so a "
+                    "sequence that does not name its part cannot be read back."
+                )
+
+            indices = as_sequence_array(segment.get("element_indices"))
+
+            if indices.size == 0:
+                raise USAPError(
+                    f"Path segment {position} has no element indices. An empty "
+                    "segment orders nothing; leave it out."
+                )
+
+            continues = bool(segment.get("continues_previous", False))
+
+            if position == 0 and continues:
+                raise USAPError(
+                    "The first path segment cannot continue a previous one."
+                )
+
+            resolved.append(
+                {
+                    "asset_part_id": self.resolve_asset_part(
+                        segment["asset_part_id"]
+                    ),
+                    "element_indices": indices,
+                    "continues_previous": 1 if continues else 0,
+                }
+            )
+
+        return resolved
+
+    def set_annotation_path(
+        self,
+        annotation_id: int,
+        segments: Any,
+        *,
+        assessment: int | str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Write an ordered element sequence, and derive its membership.
+
+        `segments` is a flat list, in path order::
+
+            [
+                {"asset_part_id": 7, "element_indices": [49998, 49999]},
+                {"asset_part_id": 8, "element_indices": [0, 1, 2],
+                 "continues_previous": True},
+                {"asset_part_id": 8, "element_indices": [500, 501]},
+            ]
+
+        One row per segment. A segment is a contiguous stretch of the sequence
+        whose indices all live in one asset part, so a run crossing a tile
+        boundary is two segments with `continues_previous` set on the second --
+        which is the thing the interim `usap:path` attributes key could not say
+        and the reason this is a table.
+
+        Order is preserved exactly, repeats included: a route may cross the
+        same face twice. The membership is then derived as the sorted,
+        de-duplicated set of the indices in each part and written in the same
+        transaction, so the two cannot disagree. Every existing reverse query
+        keeps reading membership and is unaffected.
+
+        `segments=None` drops the path and leaves the membership as a plain
+        unordered set.
+
+        Every segment must name a part of the assessment's own asset. A path
+        spanning two assets would need two assessments, and one ordinal
+        sequence cannot span them.
+        """
+        annotation = self.conn.execute(
+            """
+            SELECT annotation_id
+            FROM usap_annotation
+            WHERE annotation_id = ?
+            """,
+            (annotation_id,),
+        ).fetchone()
+
+        if annotation is None:
+            raise USAPError(f"Annotation not found: {annotation_id}")
+
+        if segments is None:
+            with self.transaction():
+                assessment_id = self._resolve_drop_path_assessment(
+                    annotation_id, assessment
+                )
+
+                self.conn.execute(
+                    "DELETE FROM usap_path_block WHERE assessment_id = ?",
+                    (assessment_id,),
+                )
+
+                self.log_edit(
+                    "set_annotation_path",
+                    "usap_annotation",
+                    annotation_id,
+                    f'{{"assessment_id": {assessment_id}, "segments": 0}}',
+                )
+
+            return self._path_result(annotation_id, assessment_id)
+
+        resolved = self._resolve_path_segments(segments)
+
+        with self.transaction():
+            # Resolved inside the transaction: _default_assessment_for may
+            # CREATE an undated assessment, which must roll back with the path
+            # it was made for.
+            assessment_id = self._resolve_write_assessment(
+                annotation_id=annotation_id,
+                asset_part_id=resolved[0]["asset_part_id"],
+                assessment=assessment,
+            )
+
+            asset_id = int(
+                self.conn.execute(
+                    "SELECT asset_id FROM usap_assessment WHERE assessment_id = ?",
+                    (assessment_id,),
+                ).fetchone()["asset_id"]
+            )
+
+            by_part: dict[int, list[np.ndarray]] = {}
+
+            for position, segment in enumerate(resolved):
+                asset_part_id = segment["asset_part_id"]
+
+                part_asset_id = int(
+                    self.conn.execute(
+                        """
+                        SELECT asset_id
+                        FROM usap_asset_part
+                        WHERE asset_part_id = ?
+                        """,
+                        (asset_part_id,),
+                    ).fetchone()["asset_id"]
+                )
+
+                if part_asset_id != asset_id:
+                    raise USAPError(
+                        f"Path segment {position} indexes asset part "
+                        f"{asset_part_id}, which belongs to asset "
+                        f"{part_asset_id}, but this evaluation is of asset "
+                        f"{asset_id}. A path is one ordered sequence within "
+                        "one assessment, and an assessment evaluates one "
+                        "asset. Record a second assessment instead."
+                    )
+
+                by_part.setdefault(asset_part_id, []).append(
+                    segment["element_indices"]
+                )
+
+            # Which parts the old path covered, so a reroute onto fewer parts
+            # does not leave the dropped ones carrying membership that nothing
+            # orders any more -- the drift this design exists to prevent,
+            # arriving through the front door.
+            previous_parts = {
+                int(row["asset_part_id"])
+                for row in self.conn.execute(
+                    """
+                    SELECT DISTINCT asset_part_id
+                    FROM usap_path_block
+                    WHERE assessment_id = ?
+                    """,
+                    (assessment_id,),
+                ).fetchall()
+            }
+
+            self.conn.execute(
+                "DELETE FROM usap_path_block WHERE assessment_id = ?",
+                (assessment_id,),
+            )
+
+            for asset_part_id, chunks in by_part.items():
+                element_kind = int(
+                    self.conn.execute(
+                        """
+                        SELECT element_kind
+                        FROM usap_asset_part
+                        WHERE asset_part_id = ?
+                        """,
+                        (asset_part_id,),
+                    ).fetchone()["element_kind"]
+                )
+
+                # as_index_array inside sorts and de-duplicates, which is
+                # exactly the derivation: the membership is the path's index.
+                self.replace_annotation_membership(
+                    annotation_id=annotation_id,
+                    asset_part_id=asset_part_id,
+                    element_kind=element_kind,
+                    element_indices=np.concatenate(chunks),
+                    assessment=assessment_id,
+                    drop_path=True,
+                )
+
+            for asset_part_id in sorted(previous_parts - set(by_part)):
+                self.conn.execute(
+                    """
+                    DELETE FROM usap_membership_block
+                    WHERE assessment_id = ?
+                      AND asset_part_id = ?
+                    """,
+                    (assessment_id, asset_part_id),
+                )
+
+            for ordinal, segment in enumerate(resolved):
+                indices = segment["element_indices"]
+
+                self.conn.execute(
+                    """
+                    INSERT INTO usap_path_block (
+                        assessment_id,
+                        asset_part_id,
+                        segment_ordinal,
+                        continues_previous,
+                        element_count,
+                        encoding,
+                        payload
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        assessment_id,
+                        segment["asset_part_id"],
+                        ordinal,
+                        segment["continues_previous"],
+                        int(indices.size),
+                        PATH_ENCODING,
+                        encode_path(indices),
+                    ),
+                )
+
+            self.log_edit(
+                "set_annotation_path",
+                "usap_annotation",
+                annotation_id,
+                f'{{"assessment_id": {assessment_id}, '
+                f'"segments": {len(resolved)}}}',
+            )
+
+        return self._path_result(annotation_id, assessment_id)
+
+    def _resolve_drop_path_assessment(
+        self,
+        annotation_id: int,
+        assessment: int | str | None,
+    ) -> int:
+        """
+        The assessment a path drop means.
+
+        Unlike a write, this must not create one: dropping a path from an
+        assessment that does not exist yet would mint an empty evaluation as a
+        side effect of a delete.
+        """
+        if assessment is not None:
+            assessment_id = self.resolve_assessment(assessment)
+
+            owner = self.conn.execute(
+                "SELECT annotation_id FROM usap_assessment WHERE assessment_id = ?",
+                (assessment_id,),
+            ).fetchone()
+
+            if owner is None or int(owner["annotation_id"]) != annotation_id:
+                raise USAPError(
+                    f"Assessment {assessment!r} does not belong to annotation "
+                    f"{annotation_id}."
+                )
+
+            return assessment_id
+
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT pb.assessment_id
+            FROM usap_path_block AS pb
+            JOIN usap_assessment AS asm
+                ON asm.assessment_id = pb.assessment_id
+            WHERE asm.annotation_id = ?
+            """,
+            (annotation_id,),
+        ).fetchall()
+
+        if len(rows) > 1:
+            raise USAPError(
+                f"Annotation {annotation_id} carries paths on "
+                f"{len(rows)} assessments, so which one to drop is ambiguous. "
+                "Pass assessment=... to say which."
+            )
+
+        if not rows:
+            # Nothing to drop. Resolve the ordinary default so the call is
+            # idempotent rather than an error.
+            return self._default_assessment_for_annotation(annotation_id)
+
+        return int(rows[0]["assessment_id"])
+
+    def _default_assessment_for_annotation(self, annotation_id: int) -> int:
+        rows = self.conn.execute(
+            """
+            SELECT assessment_id
+            FROM usap_assessment
+            WHERE annotation_id = ?
+            ORDER BY assessment_id
+            """,
+            (annotation_id,),
+        ).fetchall()
+
+        if len(rows) == 1:
+            return int(rows[0]["assessment_id"])
+
+        if not rows:
+            raise USAPError(
+                f"Annotation {annotation_id} has no assessment, so it has no "
+                "path to drop."
+            )
+
+        raise USAPAmbiguityError(
+            f"Annotation {annotation_id} has {len(rows)} assessments. Pass "
+            "assessment=... to say which."
+        )
+
+    def _path_result(
+        self,
+        annotation_id: int,
+        assessment_id: int,
+    ) -> dict[str, Any]:
+        runs = self.path_for_annotation(
+            annotation_id, assessment=assessment_id, expand=True
+        )
+
+        return {
+            "annotation_id": annotation_id,
+            "assessment_id": assessment_id,
+            "runs": runs,
+            "path_run_count": len(runs),
+        }
+
+    def path_for_annotation(
+        self,
+        annotation_id: int,
+        *,
+        assessment: int | str | None = None,
+        expand: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Forward query:
+
+            annotation -> ordered path runs
+
+        Returns one entry per **run** — one disjoint stretch of the path — in
+        path order, each carrying its segments in order. A run whose segments
+        name different asset parts is one continuous stretch that crosses a
+        part boundary; a new run means a genuine interruption.
+
+        With `expand=True` each segment carries its `element_indices`, in path
+        order and with repeats intact. With `expand=False` only the row
+        metadata is returned, which is what a caller sizing the result wants.
+
+        Returns `[]` for an annotation with no path — the ordinary case. Every
+        summary-returning read already reports `path_run_count`, so an
+        application knows whether to call this without asking.
+        """
+        where = ["asm.annotation_id = ?"]
+        params: list[Any] = [annotation_id]
+
+        if assessment is not None:
+            where.append("pb.assessment_id = ?")
+            params.append(self.resolve_assessment(assessment))
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                pb.path_block_id,
+                pb.assessment_id,
+                pb.asset_part_id,
+                pb.segment_ordinal,
+                pb.continues_previous,
+                pb.element_count,
+                pb.encoding,
+                pb.payload
+            FROM usap_path_block AS pb
+            JOIN usap_assessment AS asm
+                ON asm.assessment_id = pb.assessment_id
+            WHERE {" AND ".join(where)}
+            ORDER BY pb.assessment_id, pb.segment_ordinal
+            """,
+            params,
+        ).fetchall()
+
+        runs: list[dict[str, Any]] = []
+
+        for row in rows:
+            segment = {
+                "path_block_id": int(row["path_block_id"]),
+                "assessment_id": int(row["assessment_id"]),
+                "asset_part_id": int(row["asset_part_id"]),
+                "segment_ordinal": int(row["segment_ordinal"]),
+                "element_count": int(row["element_count"]),
+                "encoding": row["encoding"],
+            }
+
+            if expand:
+                segment["element_indices"] = decode_path(
+                    row["payload"], int(row["element_count"])
+                ).tolist()
+
+            # A new run at every segment that does not continue the previous
+            # one -- and always at an assessment boundary, since ordinals are
+            # scoped to the assessment.
+            starts_run = not int(row["continues_previous"]) or not runs or (
+                runs[-1]["assessment_id"] != int(row["assessment_id"])
+            )
+
+            if starts_run:
+                runs.append(
+                    {
+                        "assessment_id": int(row["assessment_id"]),
+                        "segments": [segment],
+                    }
+                )
+            else:
+                runs[-1]["segments"].append(segment)
+
+        return runs
+
+    def _annotation_path_summary(
+        self,
+        annotation_id: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Summarize which asset parts an annotation carries path segments on.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT
+                pb.asset_part_id,
+                ap.part_path,
+                ap.element_kind,
+                COUNT(*) AS segment_count,
+                SUM(pb.element_count) AS position_count
+            FROM usap_path_block AS pb
+            JOIN usap_assessment AS asm
+                ON asm.assessment_id = pb.assessment_id
+            JOIN usap_asset_part AS ap
+                ON ap.asset_part_id = pb.asset_part_id
+            WHERE asm.annotation_id = ?
+            GROUP BY pb.asset_part_id, ap.part_path, ap.element_kind
+            ORDER BY pb.asset_part_id
+            """,
+            (annotation_id,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
 
     def _link_annotation_object(
         self,
@@ -5675,6 +6308,7 @@ class USAPPackage:
         element_kind: str,
         element_indices: list[int],
         assessment: int | str | None = None,
+        drop_path: bool = False,
     ) -> dict[str, Any]:
         """
         Attach or replace selected elements for one assessment on one asset part.
@@ -5692,6 +6326,7 @@ class USAPPackage:
             element_kind=element_kind,
             element_indices=element_indices,
             assessment=assessment,
+            drop_path=drop_path,
         )
 
         annotation = self.get_annotation(

@@ -13,6 +13,7 @@ codec of our own: the payload must be readable by any roaring implementation.
 from __future__ import annotations
 
 import struct
+import zlib
 
 import numpy as np
 import pytest
@@ -22,7 +23,10 @@ from conftest import make_mesh_part, make_pkg
 from usap import ELEMENT_KIND_FACE, USAPError
 from usap.encoding import (
     as_index_array,
+    as_sequence_array,
+    decode_path,
     decode_roaring,
+    encode_path,
     encode_roaring,
     split_indices_into_blocks,
 )
@@ -265,3 +269,109 @@ def test_membership_write_accepts_a_numpy_selection(tmp_path) -> None:
         assert kinds == {"int"}
 
         assert pkg.validate_report().is_ok
+
+
+# ---------------------------------------------------------------------------
+# Ordered paths — the codec whose whole job is to NOT be a set.
+#
+# See docs/ORDERED_PATHS_DESIGN.md §4.2. Membership is a roaring bitmap and
+# comes back ascending and deduplicated; a path is the claim that survives
+# that, so every test here is written against an input that sorting would
+# change. A round-trip test on an already-ascending path proves nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_path_round_trip_preserves_order_and_duplicates() -> None:
+    # The single most important test in this file: if encode_path ever routes
+    # through as_index_array, this is what catches it. Nothing else does --
+    # the result would still be a plausible uint32 array of the right values.
+    sequence = [5, 3, 3, 9, 1]
+
+    decoded = decode_path(encode_path(sequence), element_count=len(sequence))
+
+    assert decoded.tolist() == sequence
+
+
+def test_path_normalization_neither_sorts_nor_deduplicates() -> None:
+    assert as_sequence_array([5, 3, 3, 9, 1]).tolist() == [5, 3, 3, 9, 1]
+
+    # The contrast is the point: the same input through the membership
+    # normalizer is a different array, and both are correct for their column.
+    assert as_index_array([5, 3, 3, 9, 1]).tolist() == [1, 3, 5, 9]
+
+
+def test_path_payload_is_little_endian_uint32_with_no_count_prefix() -> None:
+    # The byte-level contract a third-party reader implements against. Asserted
+    # by hand rather than through decode_path, which would pass even if the
+    # layout were something else entirely.
+    sequence = [7, 2, 2, 1]
+
+    raw = zlib.decompress(encode_path(sequence))
+
+    assert len(raw) == 4 * len(sequence)
+    assert raw[:4] == struct.pack("<I", 7)
+    assert np.frombuffer(raw, dtype="<u4").tolist() == sequence
+
+
+def test_a_negative_index_is_refused_wherever_it_sits() -> None:
+    # as_index_array can test values[0] alone because it has already sorted.
+    # This normalizer has not, so a negative in any position must be found --
+    # [5, -1] would otherwise store 4294967295.
+    for sequence in ([-1, 5], [5, -1], [3, 4, -2, 9]):
+        with pytest.raises(USAPError, match="Negative element index"):
+            encode_path(sequence)
+
+
+def test_oversized_and_non_integer_path_indices_are_refused() -> None:
+    with pytest.raises(USAPError, match="too large for uint32"):
+        encode_path([1, 2**32, 3])
+
+    with pytest.raises(USAPError, match="must be integers"):
+        encode_path([1, 3.5, 2])
+
+
+def test_an_empty_path_round_trips() -> None:
+    assert decode_path(encode_path([]), element_count=0).tolist() == []
+
+
+def test_decode_path_refuses_a_payload_that_disagrees_with_its_count() -> None:
+    payload = encode_path([1, 2, 3])
+
+    # Too long: decoding stops one byte past what the row claimed rather than
+    # allocating whatever the payload wanted, so the real count is never known
+    # and the message cannot claim one.
+    with pytest.raises(USAPError, match="holds more than 2 indices"):
+        decode_path(payload, element_count=2)
+
+    # Too short: fully decoded, so the exact disagreement is reportable.
+    with pytest.raises(USAPError, match="holds 3 indices, declared"):
+        decode_path(payload, element_count=4)
+
+
+def test_decode_path_refuses_a_truncated_stream_as_corruption() -> None:
+    # Not as a count mismatch. zlib returns whatever it managed to inflate
+    # without raising, so without the eof check this would decode short and
+    # plausible and be reported as the wrong number of indices.
+    truncated = encode_path(list(range(500)))[:20]
+
+    with pytest.raises(USAPError, match="Corrupt path payload"):
+        decode_path(truncated)
+
+
+def test_decode_path_refuses_a_malformed_payload() -> None:
+    with pytest.raises(USAPError, match="Corrupt path payload"):
+        decode_path(b"\x00\x01\x02")
+
+
+def test_decode_path_refuses_a_length_that_is_not_whole_uint32s() -> None:
+    with pytest.raises(USAPError, match="not a whole number of uint32"):
+        decode_path(zlib.compress(b"\x01\x02\x03"))
+
+
+def test_decode_path_without_a_count_reports_no_mismatch() -> None:
+    # Validation's mode: it must be able to decode a row that lies about its
+    # own element_count, so that it can report PATH_COUNT_MISMATCH rather than
+    # having the decoder raise corruption first.
+    payload = encode_path([4, 4, 1])
+
+    assert decode_path(payload).tolist() == [4, 4, 1]

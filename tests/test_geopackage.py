@@ -72,6 +72,7 @@ def test_created_package_is_a_geopackage(tmp_path: Path) -> None:
         assert "usap_profile" in table_names
         assert "usap_asset" in table_names
         assert "usap_membership_block" in table_names
+        assert "usap_path_block" in table_names
         assert "usap_asset_extent" in table_names
 
         for row in rows:

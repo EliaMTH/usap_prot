@@ -45,6 +45,9 @@ Everything else is droppable in a storage-only view:
   `usap_annotation_object` — the identity layer; needed only for
   "which object" claims (the relationship table is base data, not derivable).
 - `usap_value_block` — a separate feature (value fields).
+- `usap_path_block` — a separate feature (ordered paths). Not derivable from
+  membership and not an accelerator for it: the relationship runs the other
+  way, since the membership is derived from the path.
 - `usap_edit_log` — provenance only; serves no query.
 - `usap_profile` — the uniform-block-size contract is a *query* concern;
   each membership block row carries its own `block_size`/`encoding`.
@@ -80,10 +83,11 @@ composition, not a new concept.
 | Query (`core.py`) | Tables doing the work | Accelerator used |
 |---|---|---|
 | `annotations_for_elements` (pick → claims) | `usap_membership_block`, `usap_profile` | Global block size → candidate `block_start`s; index `usap_mb_by_element_block`; only candidate payloads decoded. |
-| `elements_for_annotation` | `usap_membership_block` | `UNIQUE(annotation_id, …)` auto-index. |
+| `elements_for_annotation` | `usap_membership_block` | `usap_mb_by_annotation`. Until 0.4.0 this came free from `UNIQUE(annotation_id, …)`; that constraint is now scoped to `assessment_id`, so the annotation-first index is declared explicitly. |
 | `elements_for_semantic_class` | `usap_semantic_class_closure`, `usap_annotation`, `usap_membership_block` | Closure PK expands "class + subclasses"; `usap_annotation_by_class`. |
 | `elements_for_city_object` | `usap_city_object`, `usap_city_object_relationship`, `usap_annotation_object` ∪ `primary_city_object_id`, `usap_membership_block` | Recursive CTE expands descendants per graph, following containment edge types only. |
 | `values_for_annotation`, `elements_where`, `value_field_stats` | `usap_value_block` (+ `usap_asset_part` coverage contract) | Per-block `value_min`/`value_max` skipping; stats never decodes a payload. |
+| `path_for_annotation` | `usap_path_block`, `usap_assessment` | `UNIQUE(assessment_id, segment_ordinal)` auto-index. No accelerator of its own and none wanted: a path is a handful of rows per annotation, read forward only. |
 | `list_*` browse queries | `usap_annotation`, `usap_city_object`, `usap_semantic_class` + link tables | Tree expansion uses relationship edges directly (not closure). |
 | GIS browse (QGIS) | `usap_asset_extent`, `gpkg_*`, views | — |
 

@@ -310,9 +310,9 @@ if __name__ == "__main__":
     main()
 
 # python examples/build_integrated_prototype.py \
-# city_JSON.gml \
-# decimated_classified_output.las \
-# city_mesh.obj \
+# <city.gml> \
+# <points.las> \
+# <mesh.obj> \
 # --db integrated_prototype.usap.gpkg \
 # --mesh-representation-name city_triangulation \
 # --mesh-representation-kind triangulated_city_surface

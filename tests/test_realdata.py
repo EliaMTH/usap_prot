@@ -8,9 +8,9 @@ reaches: block splitting past DEFAULT_BLOCK_SIZE, a 22-XSD vocabulary with a
 real substitutionGroup hierarchy, a reverse query over a million selected
 indices, two assets covering the same buildings.
 
-    pytest                                  # these all skip
-    pytest --realdata-dir=data              # these run
-    pytest --realdata-dir=data -s -k timing # N3's numbers
+    pytest                                   # these all skip
+    pytest --realdata-dir=<dir>              # these run
+    pytest --realdata-dir=<dir> -s -k timing # N3's numbers
 
 Several checks below are unreachable with a single asset: the filter, the
 mismatch rule and the visibility rule all return the same answer for a working
@@ -878,8 +878,10 @@ def test_n4_block_skipping_brackets_the_query_cost(
 # N2b -- the configuration folder as it will really be shipped: the OGC XSDs
 # and a third-party ontology, read together in one pass (US-DATA-04).
 #
-# data/vocabulary holds only .xsd and .json, so the folder walk's .owl branch
-# had never run against real files -- only against a hand-written fixture.
+# A real vocabulary/ folder may hold only .xsd and .json, and then the folder
+# walk's .owl branch never runs against real files -- only against a
+# hand-written fixture. So the real ontologies are staged into the folder here,
+# from --realdata-dir or the repo root, whichever has them.
 # ---------------------------------------------------------------------------
 
 REAL_ONTOLOGIES = ("uish_ontology_building.owl", "uish_ontology_sensors.owl")

@@ -10,6 +10,7 @@ from .mesh_adapter import (
     MeshPartRegistration,
     MeshRegistrationResult,
     register_mesh_asset,
+    register_mesh_asset_with_geometries,
 )
 
 
@@ -24,4 +25,5 @@ __all__ = [
     "MeshPartRegistration",
     "MeshRegistrationResult",
     "register_mesh_asset",
+    "register_mesh_asset_with_geometries",
 ]

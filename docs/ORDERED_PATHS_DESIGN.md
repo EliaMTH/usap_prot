@@ -218,7 +218,7 @@ and both `delete_annotation` and `delete_assessment` already rely on nothing but
 
 **No `element_kind`.** `usap_asset_part` declares `UNIQUE(asset_id, part_path,
 element_kind)`, so `asset_part_id → element_kind` is a functional dependency.
-The siblings denormalise it to serve `usap_mb_by_element_block`, a reverse-query
+The siblings denormalise it to serve `usap_mb_by_element_range`, a reverse-query
 index this table has no equivalent of — a path is read forward only. Not storing
 it removes the failure mode `MEMBERSHIP_ELEMENT_KIND_MISMATCH` exists to catch.
 

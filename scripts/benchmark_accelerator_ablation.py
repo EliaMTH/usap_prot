@@ -5,8 +5,10 @@ USAP's minimum storage-only schema is usap_asset / usap_asset_part /
 usap_annotation / usap_membership_block (+ usap_semantic_class). Everything
 else the queries touch is an accelerator holding no independent information:
 
-    A1  membership block_start pruning (usap_mb_by_element_block index and
-        the uniform-block-size contract in usap_profile)
+    A1  membership block pruning (block_start, plus each block's stored
+        min/max_element_index for a sparse selection, via the
+        usap_mb_by_element_range index and the uniform-block-size contract
+        in usap_profile)
     A2  usap_semantic_class_closure    (derivable from parent_class_id)
     A4  per-block value_min/value_max skipping in elements_where
     A5  SQL-only aggregates in value_field_stats
@@ -828,9 +830,9 @@ def write_markdown_report(path: str | Path, report: dict) -> None:
         "## Notes",
         "",
         "- `usap_membership_block.min_element_index` / `max_element_index` "
-        "are populated on write but never used for query-time pruning "
-        "(`annotations_for_elements` prunes by `block_start` only): a stored "
-        "accelerator with no current query benefit.",
+        "are read by `annotations_for_elements` to discard a sparse "
+        "selection's candidate blocks before decoding them (profile 0.6.0 "
+        "and later), so A1's accelerated side includes that prefilter.",
         "",
         f"- Python: `{platform.python_implementation()} "
         f"{sys.version.split()[0]}` on `{platform.platform()}`",
@@ -969,9 +971,9 @@ def main() -> None:
         print_cost_table(costs)
 
         print(
-            "Note: usap_membership_block.min/max_element_index are stored "
-            "on every block but never used for query-time pruning — a "
-            "write-side accelerator no query currently reads."
+            "Note: A1's accelerated side includes the min/max_element_index "
+            "prefilter annotations_for_elements applies to sparse selections "
+            "(profile 0.6.0 and later)."
         )
 
         report = {

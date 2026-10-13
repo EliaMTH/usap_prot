@@ -45,6 +45,7 @@ from .adapters import (
     import_citygml_semantics,
     register_las_asset,
     register_mesh_asset,
+    register_mesh_asset_with_geometries,
 )
 from .domain_vocab import (
     OntologyResult,
@@ -113,6 +114,7 @@ __all__ = [
     "MeshPartRegistration",
     "MeshRegistrationResult",
     "register_mesh_asset",
+    "register_mesh_asset_with_geometries",
     "seed_default_ade_vocabulary",
     "city_object_classes",
     "is_city_object_class",

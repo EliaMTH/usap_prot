@@ -57,6 +57,16 @@ So:
   application.** They are convenience readers for scripts and for building
   fixtures. They count elements with *their* reader (trimesh / laspy), which is
   not your loader, and that is exactly the mismatch this section is about.
+- **`register_mesh_asset_with_geometries` is the exception, on one condition.**
+  It takes the counts and bounds from *your* loader — one `(name, face_count,
+  bounds)` per geometry — reads the file only to hash it, and writes the rows
+  `register_mesh_asset` would, stamped with the SDK's convention
+  (`usap:obj-face-record-order-v1` and its `.ply` / `.stl` siblings): face *i*
+  is the *i*-th face record of the file. Use it only when your loader numbers
+  faces exactly that way, counting quads and polygons as records rather than
+  as the triangles you draw them with. If it triangulates, reorders or drops
+  faces, use the generic path above with a profile of your own: no validation
+  level can detect a count taken under the wrong convention.
 
 `register_asset` is idempotent on `(uri, content_hash)` and
 `register_asset_part` on `(asset_id, part_path, element_kind)`; a re-run with
@@ -375,7 +385,9 @@ Two consequences for the installer:
   nothing would say why.
 
 Re-seeding on every open is the intended usage: it is idempotent and additive,
-and raises only on a genuine contradiction.
+and raises only on a genuine contradiction. The folder loads as one
+transaction, so a failure leaves nothing of it written, and the error names
+the file to fix. It needs no `pkg.transaction()` around it.
 
 ---
 
@@ -535,6 +547,7 @@ re-hashes files. Two results worth deciding about in advance:
 - [ ] `element_count` comes from the application's own loader
 - [ ] `indexing_profile` is set on every part, and versioned with the loader
 - [ ] `register_mesh_asset` / `register_las_asset` are not called from the app
+      (`register_mesh_asset_with_geometries` only if the loader keeps the file's face-record order)
 - [ ] `content_hash` is recorded, and `verify_assets` runs on project open
 - [ ] `object_uid == gml:id`, derived in exactly one place
 - [ ] carriers are created with `semantic_class_id=None`

@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from conftest import make_mesh_part, make_pkg, seed_citygml_concepts
+from conftest import (
+    assert_package_valid,
+    make_mesh_part,
+    make_pkg,
+    seed_citygml_concepts,
+)
 from usap.constants import (
     CITYGML_3_0_BUILDING_NS,
     CITYGML_3_0_CONSTRUCTION_NS,
     concept_uri,
 )
 from usap import (
+    DEFAULT_SCHEMA_PATH,
     ELEMENT_KIND_FACE,
     ELEMENT_KIND_POINT,
     USAPAmbiguityError,
@@ -439,15 +446,154 @@ def test_log_edit_writes_row(pkg: USAPPackage) -> None:
 def test_create_failure_leaves_no_artifacts(tmp_path: Path) -> None:
     # A failed create must not leave a half-initialized package file (or an
     # open connection) behind, or a retry hits "Database already exists".
-    bad_schema = tmp_path / "bad_schema.sql"
-    bad_schema.write_text("CREATE TABLE broken (;", encoding="utf-8")
+    # Also when the broken script manages its own transaction, which create()
+    # first fails to open and then runs as given.
+    for name, script in (
+        ("bad_schema.sql", "CREATE TABLE broken (;"),
+        ("bad_wrapped.sql", "BEGIN;\nCREATE TABLE broken (;\nCOMMIT;"),
+    ):
+        bad_schema = tmp_path / name
+        bad_schema.write_text(script, encoding="utf-8")
 
-    db_path = tmp_path / "broken.usap.gpkg"
+        db_path = tmp_path / "broken.usap.gpkg"
 
-    with pytest.raises(sqlite3.OperationalError):
-        USAPPackage.create(db_path, schema_path=bad_schema, overwrite=True)
+        with pytest.raises(sqlite3.OperationalError, match="syntax error"):
+            USAPPackage.create(db_path, schema_path=bad_schema, overwrite=True)
 
-    assert not db_path.exists()
+        assert not db_path.exists()
+
+
+class _TracedPackage(USAPPackage):
+    """
+    A package whose connection reports each statement as it starts, together
+    with whether a transaction is open at that moment. create() builds its
+    connection through cls(...), so a subclass is the only place to attach the
+    trace before the schema runs.
+    """
+
+    statements: list[tuple[str, bool]] = []
+
+    def __init__(self, db_path) -> None:
+        super().__init__(db_path)
+        conn = self.conn
+        conn.set_trace_callback(
+            lambda sql: _TracedPackage.statements.append(
+                (_without_leading_comments(sql), conn.in_transaction)
+            )
+        )
+
+
+def _without_leading_comments(sql: str) -> str:
+    # A statement executescript runs carries the comments above it in the
+    # file; without this, half the schema's CREATEs would not start with
+    # CREATE.
+    return re.sub(r"\A(?:\s*--[^\n]*\n)+", "", sql).strip()
+
+
+def _created_objects(pkg: USAPPackage) -> int:
+    return pkg.conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+    ).fetchone()[0]
+
+
+def test_create_runs_the_schema_in_one_transaction(tmp_path: Path) -> None:
+    # executescript runs each statement in autocommit: one commit, and one
+    # sync to disk, per CREATE -- 9 s for an empty package on a slow disk.
+    # Counting COMMIT statements alone proves nothing, because an autocommit
+    # never shows up as one: the old code also issued a single explicit
+    # COMMIT. What must hold is that no statement runs outside a transaction.
+    _TracedPackage.statements = []
+    pkg = _TracedPackage.create(tmp_path / "traced.usap.gpkg")
+    statements = list(_TracedPackage.statements)
+
+    with pkg:
+        expected_creates = _created_objects(pkg)
+
+    creates = [sql for sql, _ in statements if sql.upper().startswith("CREATE")]
+    commits = [sql for sql, _ in statements if sql.upper().startswith("COMMIT")]
+    outside = [sql for sql, in_transaction in statements if not in_transaction]
+
+    assert len(creates) == expected_creates
+    assert len(commits) == 1
+    assert all(sql.upper().startswith("BEGIN") for sql in outside), outside[:3]
+
+
+def test_create_builds_the_same_package_with_or_without_its_own_transaction(
+    tmp_path: Path,
+) -> None:
+    # A schema_path wrapped in BEGIN/COMMIT -- City3D's is -- cannot be opened
+    # with a second BEGIN, so create() runs it as given; both routes must
+    # build the same package. A CREATE TRIGGER, whose body has a BEGIN of its
+    # own, must not be mistaken for such a script: it still runs in one
+    # transaction.
+    schema = DEFAULT_SCHEMA_PATH.read_text(encoding="utf-8")
+    wrapped = tmp_path / "wrapped.sql"
+    wrapped.write_text(f"BEGIN;\n{schema}\nCOMMIT;\n", encoding="utf-8")
+    with_trigger = tmp_path / "with_trigger.sql"
+    with_trigger.write_text(
+        schema
+        + "\nCREATE TRIGGER usap_demo AFTER INSERT ON usap_edit_log"
+        " BEGIN SELECT 1; END;\n",
+        encoding="utf-8",
+    )
+
+    def shape(pkg: USAPPackage) -> dict[str, object]:
+        conn = pkg.conn
+
+        def rows(sql: str) -> list[tuple]:
+            return sorted(tuple(row) for row in conn.execute(sql))
+
+        return {
+            "master": rows(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE type != 'trigger'"
+            ),
+            "pragmas": (
+                conn.execute("PRAGMA application_id").fetchone()[0],
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                conn.execute("PRAGMA foreign_keys").fetchone()[0],
+            ),
+            "srs": rows("SELECT * FROM gpkg_spatial_ref_sys"),
+            "extensions": rows("SELECT * FROM gpkg_extensions"),
+            "geometry_columns": rows("SELECT * FROM gpkg_geometry_columns"),
+            "contents": rows(
+                "SELECT table_name, data_type, identifier, description, "
+                "min_x, min_y, max_x, max_y, srs_id FROM gpkg_contents"
+            ),
+            "profile": rows(
+                "SELECT profile_id, profile_name, profile_version, "
+                "default_block_size, default_encoding, metadata_json "
+                "FROM usap_profile"
+            ),
+        }
+
+    shapes = {}
+
+    for name, schema_path in (
+        ("default", DEFAULT_SCHEMA_PATH),
+        ("wrapped", wrapped),
+        ("with_trigger", with_trigger),
+    ):
+        _TracedPackage.statements = []
+        pkg = _TracedPackage.create(
+            tmp_path / f"{name}.usap.gpkg", schema_path=schema_path
+        )
+        statements = list(_TracedPackage.statements)
+
+        with pkg:
+            assert_package_valid(pkg)
+            shapes[name] = shape(pkg)
+
+        if name == "with_trigger":
+            assert all(
+                in_transaction
+                for sql, in_transaction in statements
+                if sql.upper().startswith("CREATE")
+            )
+
+    assert shapes["default"]["pragmas"][2] == 1
+    assert shapes["wrapped"] == shapes["default"]
+    assert shapes["with_trigger"] == shapes["default"]
 
 
 def test_default_paths_work_from_any_cwd(tmp_path: Path, monkeypatch) -> None:

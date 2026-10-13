@@ -19,6 +19,9 @@ python -m pytest
 - `pkg` / `mesh_part` — pytest fixtures wrapping the two helpers.
 - `assert_package_valid(pkg)` — assert `validate_report()` is clean, printing
   the issues on failure.
+- `executed_plans(pkg, call)` — the `EXPLAIN QUERY PLAN` of every query
+  `call` runs, recorded from the connection itself. Plan tests use it so they
+  check the SQL the SDK actually executes, not a copy pasted into the test.
 - `write_tiny_las(path, point_count)` / `write_tiny_mesh(path)` — minimal real
   LAS / 2-triangle mesh files for adapter and end-to-end tests.
 
@@ -59,7 +62,21 @@ rather than depending on the full OGC distribution.
   a custom operation recorded via the public API must land in `usap_edit_log`.
 - `test_create_failure_leaves_no_artifacts` — a failed `create()` must not
   leave a half-initialized file or open connection behind (a retry would
-  otherwise hit "Database already exists").
+  otherwise hit "Database already exists"), including when the broken script
+  manages its own transaction and so takes the run-as-given route.
+- `test_create_runs_the_schema_in_one_transaction` — `executescript` runs
+  each statement in autocommit, one commit and one disk sync per `CREATE` (9 s
+  for an empty package on a slow disk). Counting `COMMIT` statements cannot
+  catch that, since an autocommit never appears as one and the old code also
+  issued a single explicit `COMMIT`; so a traced connection checks that every
+  statement but the `BEGIN` ran inside the transaction. The trace sees a
+  statement with the comments above it in the file, which are stripped first.
+- `test_create_builds_the_same_package_with_or_without_its_own_transaction` —
+  a `schema_path` wrapped in `BEGIN`/`COMMIT` (as City3D's is) is run as given
+  and builds the same package as the default route: same `sqlite_master`,
+  pragmas, `gpkg_*` rows and profile, valid, foreign keys on. A `CREATE
+  TRIGGER`, whose body has a `BEGIN` of its own, is not mistaken for such a
+  script and still runs in one transaction.
 - `test_default_paths_work_from_any_cwd` — default schema/vocabulary paths
   are package-anchored, not CWD-dependent (and ship in the wheel).
 - `test_annotations_for_elements_survives_huge_selection` — id lists larger
@@ -122,6 +139,13 @@ rather than depending on the full OGC distribution.
   claim fields (status, confidence, attributes).
 - `test_list_annotations_with_filters` — listing filters (status, concept,
   city object) return exactly the matching annotations.
+- `test_list_annotations_by_object_matches_the_primary_and_every_link` — the
+  object filter, case by case: the primary object, a `usap_annotation_object`
+  link alone, a link whose `relation_type` is not `represents`, an unknown
+  uid or id, and the combination with `status`, `limit` and the other object
+  spelling — with the order pinned too. 0.6.0 rewrote the SQL behind it (an
+  indexed `IN (… UNION …)` instead of `OR EXISTS`), and the answer must not
+  have moved.
 - `test_list_annotations_asset_filter_separates_two_assets` — the `asset_id` /
   `asset_part_id` filters, which are how an application loads the annotations
   of the asset it has just opened. **Two** assets and two parts are what make
@@ -186,6 +210,17 @@ rather than depending on the full OGC distribution.
 
 - `test_vocabulary_seeding_is_idempotent` — re-seeding the same vocabulary
   must not duplicate concepts.
+- `test_seeding_a_vocabulary_file_commits_once` /
+  `test_loading_a_citygml_schema_commits_once` — one file, one `COMMIT`.
+  `create_semantic_class` opens its own transaction, so outside an outer one
+  every concept used to commit and sync on its own: City3D's first annotation
+  timed out seeding 889 concepts. What is written must be identical to seeding
+  inside a caller's transaction.
+- `test_a_vocabulary_file_that_fails_halfway_leaves_nothing` /
+  `test_a_citygml_schema_that_fails_halfway_leaves_nothing` — a failure after
+  some concepts were created leaves none of them, so the file can be fixed and
+  re-run from clean. The schema case fails on a contradiction with an existing
+  `Building`, after the abstract classes were created parents-first.
 - `test_list_accepted_concepts` — the registry listing (scheme, uri, ADE flag)
   is queryable.
 - `test_get_semantic_class_and_concept_exists` — point lookups of registered
@@ -299,6 +334,29 @@ rewrite.
   part under two conventions would repoint every membership without changing
   a single stored index, so it is refused like any other conflicting
   re-registration.
+- `test_known_geometries_write_the_rows_register_mesh_asset_writes[ply|obj]` —
+  `register_mesh_asset_with_geometries`, given the facts `register_mesh_asset`
+  reads, writes the same asset, parts and extent, metadata included, except
+  for `facts_source` (`"caller"`) and `streamed` (null). Re-registering with
+  the same facts is idempotent; registering the file through the other
+  function too is a conflicting re-registration.
+- `test_known_geometries_are_not_read_from_the_file` — the point of the
+  function: a file no mesh reader could parse registers fine, the hash is the
+  only read, and `compute_hash=False` reads nothing.
+- `test_known_geometries_keep_the_part_index_of_skipped_ones` — several
+  geometries, one without faces: it is skipped and the others keep their
+  position in `part_path`; numpy scalars and arrays, which is what a loader
+  hands over, are accepted.
+- `test_inconsistent_known_geometries_are_refused` — a negative, fractional or
+  boolean face count, a repeated or non-string name, an entry that is not a
+  triple, bounds that are not six finite numbers (trimesh's `(2, 3)` shape
+  included, with the way to flatten it in the message) or that have a min
+  above its max: `USAPError`, nothing written.
+- `test_known_geometries_without_faces_raise_like_register_mesh_asset` — no
+  geometry, or none with faces: the same `ValueError`s as
+  `register_mesh_asset`.
+- `test_known_geometries_keep_the_file_checks` — the file is not read but must
+  exist, and glTF stays refused.
 
 `test_citygml_adapter.py`:
 
@@ -389,11 +447,83 @@ pile of unrelated roots with no warning.
   and the COALESCE'd unique index (NULLs are distinct in a SQLite unique
   index, so a plain constraint would admit `('boundary', NULL)` twice).
 - `test_descendant_walk_uses_its_index` — the 400x regression detector:
-  `EXPLAIN QUERY PLAN` over the recursive CTE must use the index and never
-  scan the relationship table.
+  `EXPLAIN QUERY PLAN` over the recursive CTE, in all three directions, must
+  look edges up by their anchor and never scan or range over the relationship
+  table. It binds **two** relationship types on purpose: with one, SQLite picks
+  the right index even when the external-target filter is not kept out of index
+  selection, which is how that regression went unnoticed.
+- `test_one_hop_outward_branch_uses_the_from_index` — the one-hop queries
+  (`related_to`, `related_city_objects(include_external=False)`) have the same
+  trap: read as a range on `to_city_object_id`, the target's `NOT NULL` moved
+  the `out` branch onto `usap_rel_by_to_graph` and every call read nearly every
+  edge — with one edge in the package and no type filter.
+- `test_target_not_null_filter_keeps_its_meaning` — what the unary `+` must
+  not change: an edge leaving the document stays out of every traversal, in
+  every direction, with and without a type filter.
 - `test_both_directions_terminate_and_do_not_duplicate` — `UNION` in the
   recursive term both deduplicates and stops a two-way walk oscillating
   across one edge.
+
+## Query plans — `test_query_plans.py`
+
+What the profile-0.6.0 indexes and query shapes are for. Each test records
+the SQL a public call actually executes (`executed_plans`) and checks SQLite
+answers it by index. With no `ANALYZE` statistics the plan does not depend on the row count,
+so a handful of rows gets the plan the Catania package gets; each test notes
+what the regression cost there. Asserts on `EXPLAIN QUERY PLAN` text, so it
+may need updating on SQLite upgrades.
+
+- `test_new_packages_carry_the_0_6_0_indexes` — the indexes exist, on the
+  columns the queries need, and the `gml_id` one is **not** unique: a
+  duplicate `gml_id` is a validation finding (`DUPLICATE_GML_ID`), not an
+  insert the schema refuses.
+- `test_city_object_annotations_are_found_by_index` — `elements_for_city_object`
+  (with and without descendants) and `elements_for_city_objects` reach
+  annotations through `usap_annotation_by_primary_object` and
+  `usap_annotation_object_by_object`, never by reading either table whole.
+- `test_list_annotations_by_object_is_answered_by_index` — the object filter
+  of `list_annotations`, by id and by uid. An `OR EXISTS` here scans every
+  annotation whatever the indexes, which is why the indexes alone did not fix
+  it.
+- `test_resolving_a_name_is_a_multi_index_or` — `resolve_city_object` by
+  `object_uid` or `gml_id` is two index lookups, not a scan of every city
+  object; it runs once per batch entry.
+- `test_candidate_blocks_are_found_inside_the_range_index` — the reverse
+  query's prefilter, for a sparse selection over ten blocks, keeps the
+  selection as the outer loop and finds the overlapping blocks inside
+  `usap_mb_by_element_range` without reading a payload.
+- `test_candidate_block_lookup_keeps_the_selection_outside` — the same query
+  on a package whose range index is swapped for the old three-column one.
+  There a plain `JOIN` puts the block table outside from eight `VALUES` rows
+  up and rescans every block of the part per row; on the range index it gets
+  the right plan anyway, which is why the check needs this package. The
+  `CROSS JOIN` must hold either way.
+
+## The reverse query — `test_reverse_query.py`
+
+Which blocks `annotations_for_elements` decodes, and that both ways of
+choosing them give the same answer. A sparse selection goes in two steps (the
+stored `[min, max]` prefilter, then the payloads left); a dense one reads its
+blocks by `block_start` in one pass. Every test pins the answer, order
+included, against an oracle that decodes every block of the part.
+
+- `test_one_element_decodes_only_the_blocks_whose_range_holds_it` — forty
+  claims side by side in one block: choosing candidates by `block_start` alone
+  decoded all forty to find the one holding the picked face; the prefilter
+  decodes one.
+- `test_both_routes_give_the_same_answer_in_the_same_order` — one element,
+  several blocks, interleaved claims, nothing there, an empty selection, a
+  full block and the whole part: the default route, the two-step route and the
+  `block_start` route (forced through `_DENSE_SELECTION_FRACTION`) must all
+  agree with the oracle.
+- `test_two_assessments_in_one_block_keep_their_order` — two assessments of one
+  annotation in one block tie on `block_start` and `annotation_id`; the block
+  written first is reported first, as before the prefilter existed.
+- `test_an_assessment_filter_applies_on_both_routes` — `assessment=` restricts
+  the answer to that evaluation on either route.
+- `test_the_threshold_picks_the_route_and_not_the_answer` — a selection just
+  below the density threshold takes the two-step route and one at it takes
+  the `block_start` route, with the same answer.
 
 ## Ontology loading — `test_ontology_loading.py`
 
@@ -992,3 +1122,20 @@ Appended to `test_ontology_loading.py`:
   re-seeding on every package open is safe.
 - `test_vocabulary_folder_needs_a_directory_with_something_in_it` — an empty
   configuration folder is an error, not a silently empty vocabulary.
+- `test_a_vocabulary_folder_loads_all_or_nothing` — schemas, an ontology and
+  three JSON files, the second of which fails: nothing of the folder stays
+  written, link types included. Fixed, it loads in one `COMMIT`, and the
+  re-run on an already seeded package costs one empty one.
+- `test_a_folder_error_names_its_file_and_keeps_its_type` — every way a file
+  in the folder can fail: missing parent, malformed schema, a contradiction
+  with an earlier file, an ambiguous parent, malformed JSON, a file not in
+  UTF-8. All or
+  nothing means the caller must be told which file to fix; the type stays what
+  it was (`USAPAmbiguityError`, `json.JSONDecodeError` and
+  `UnicodeDecodeError` included — the last two cannot be rebuilt from a
+  message alone) and the original is chained as `__cause__`.
+- `test_a_schema_error_names_the_schema_folder` — the `.xsd` files load as one
+  set, so an error found while registering them names their folder.
+- `test_a_folder_given_as_a_relative_path_is_still_named` — the "already
+  named?" check matches the path as a whole: with the folder given as `"."`,
+  a substring test would find `.` in any sentence and never add the file.

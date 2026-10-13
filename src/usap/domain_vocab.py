@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,6 +77,9 @@ def seed_vocabulary_file(
     filled in, so provenance added to a registry later reaches packages that
     already exist by re-seeding rather than rebuilding. A field that already
     holds a *different* value raises instead of being silently rewritten.
+
+    The file is seeded in one transaction: a concept that fails leaves nothing
+    of the file written, so re-running after the fix starts from clean.
     """
     vocab_path = Path(path)
 
@@ -101,53 +107,59 @@ def seed_vocabulary_file(
     by_name: dict[str, int] = {}
     by_uri: dict[str, int] = {}
 
-    # First pass: create in the order given by the file.
-    # Parent concepts should appear before children.
-    for item in concepts:
-        if not isinstance(item, dict):
-            raise ValueError(f"Invalid concept entry in {vocab_path}: {item!r}")
+    # One transaction for the whole file. create_semantic_class opens its own,
+    # and outside an outer one each concept would commit (and sync) on its own:
+    # minutes for a few hundred concepts on a slow disk. It also makes the file
+    # all or nothing. transaction() is re-entrant: callers already inside one
+    # see no change.
+    with pkg.transaction():
+        # Created in the order given by the file: parents before children.
+        for item in concepts:
+            if not isinstance(item, dict):
+                raise ValueError(f"Invalid concept entry in {vocab_path}: {item!r}")
 
-        local_name = require_str(item, "local_name", source=str(vocab_path))
+            local_name = require_str(item, "local_name", source=str(vocab_path))
 
-        if item.get("class_uri") is not None:
-            class_uri = require_str(item, "class_uri", source=str(vocab_path))
-        else:
-            # Minimal-vocabulary convenience: a concept without an explicit
-            # URI gets a scheme-derived one, so local/temporary schemes only
-            # need names.
-            class_uri = f"{scheme}:{local_name}"
+            if item.get("class_uri") is not None:
+                class_uri = require_str(item, "class_uri", source=str(vocab_path))
+            else:
+                # Minimal-vocabulary convenience: a concept without an explicit
+                # URI gets a scheme-derived one, so local/temporary schemes only
+                # need names.
+                class_uri = f"{scheme}:{local_name}"
 
-        parent_class_id = None
-        parent_uri = item.get("parent_uri")
+            parent_class_id = None
+            parent_uri = item.get("parent_uri")
 
-        if parent_uri is not None:
-            parent_class_id = _resolve_optional_parent(
-                pkg,
-                parent_uri,
+            if parent_uri is not None:
+                parent_class_id = _resolve_optional_parent(
+                    pkg,
+                    parent_uri,
+                    scheme=scheme,
+                    vocab_path=vocab_path,
+                    child_uri=class_uri,
+                )
+
+            # create_semantic_class is itself idempotent on class_uri (the
+            # globally unique key), which is what makes vocabulary seeding
+            # idempotent, and backfills NULL fields, which is what makes a
+            # re-seed enriching.
+            class_id = pkg.create_semantic_class(
                 scheme=scheme,
-                vocab_path=vocab_path,
-                child_uri=class_uri,
+                scheme_version=scheme_version,
+                class_uri=class_uri,
+                local_name=local_name,
+                parent_class_id=parent_class_id,
+                is_ade=is_ade,
+                source_namespace=item.get(
+                    "source_namespace",
+                    default_source_namespace,
+                ),
+                concept_iri=item.get("concept_iri"),
             )
 
-        # create_semantic_class is itself idempotent on class_uri (the globally
-        # unique key), which is what makes vocabulary seeding idempotent, and
-        # backfills NULL fields, which is what makes a re-seed enriching.
-        class_id = pkg.create_semantic_class(
-            scheme=scheme,
-            scheme_version=scheme_version,
-            class_uri=class_uri,
-            local_name=local_name,
-            parent_class_id=parent_class_id,
-            is_ade=is_ade,
-            source_namespace=item.get(
-                "source_namespace",
-                default_source_namespace,
-            ),
-            concept_iri=item.get("concept_iri"),
-        )
-
-        by_name[local_name] = class_id
-        by_uri[class_uri] = class_id
+            by_name[local_name] = class_id
+            by_uri[class_uri] = class_id
 
     return VocabularyResult(by_name=by_name, by_uri=by_uri)
 
@@ -200,7 +212,8 @@ def load_citygml_schema(
                           is exactly the QName a .gml uses — the only exact
                           join key back to the document.
 
-    Concepts are created parents-first so the closure is correct in one pass.
+    Concepts are created parents-first so the closure is correct in one pass,
+    in one transaction: a failure leaves none of them written.
     A substitutionGroup pointing outside CityGML (gml:AbstractFeature) ends the
     chain and leaves parent_class_id NULL. Re-running is idempotent and
     enriching, like seed_vocabulary_file: create_semantic_class keys on
@@ -243,33 +256,37 @@ def load_citygml_schema(
     by_uri: dict[str, int] = {}
     class_ids: dict[tuple[str, str], int] = {}
 
-    for element in _parents_first(elements):
-        parent_class_id = None
+    # One transaction for every concept, as in seed_vocabulary_file: one
+    # commit instead of one per concept, and all or nothing.
+    with pkg.transaction():
+        for element in _parents_first(elements):
+            parent_class_id = None
 
-        if element.parent is not None:
-            # None when the chain leaves CityGML (gml:AbstractFeature): the
-            # concept is a root here, which is correct — USAP does not mirror
-            # the GML object model.
-            parent_class_id = class_ids.get(element.parent)
+            if element.parent is not None:
+                # None when the chain leaves CityGML (gml:AbstractFeature): the
+                # concept is a root here, which is correct — USAP does not
+                # mirror the GML object model.
+                parent_class_id = class_ids.get(element.parent)
 
-        class_id = pkg.create_semantic_class(
-            scheme=scheme,
-            scheme_version=scheme_version,
-            class_uri=element.class_uri,
-            local_name=element.local_name,
-            parent_class_id=parent_class_id,
-            is_ade=False,
-            source_namespace=element.namespace,
-            metadata_json=json.dumps({"abstract": element.abstract}),
-        )
+            class_id = pkg.create_semantic_class(
+                scheme=scheme,
+                scheme_version=scheme_version,
+                class_uri=element.class_uri,
+                local_name=element.local_name,
+                parent_class_id=parent_class_id,
+                is_ade=False,
+                source_namespace=element.namespace,
+                metadata_json=json.dumps({"abstract": element.abstract}),
+            )
 
-        class_ids[element.key] = class_id
-        by_uri[element.class_uri] = class_id
+            class_ids[element.key] = class_id
+            by_uri[element.class_uri] = class_id
 
-        # Local names are unique across CityGML 3.0 modules, but do not rely on
-        # it: first writer wins here, and callers that need certainty use the
-        # class_uri. resolve_semantic_class raises on a genuine ambiguity.
-        by_name.setdefault(element.local_name, class_id)
+            # Local names are unique across CityGML 3.0 modules, but do not
+            # rely on it: first writer wins here, and callers that need
+            # certainty use the class_uri. resolve_semantic_class raises on a
+            # genuine ambiguity.
+            by_name.setdefault(element.local_name, class_id)
 
     return VocabularyResult(by_name=by_name, by_uri=by_uri)
 
@@ -800,6 +817,65 @@ _VOCABULARY_SUFFIXES = (
 )
 
 
+def _names_path(message: str, source: Path) -> bool:
+    """
+    Whether a message already names source, as a whole path.
+
+    Not a plain substring test: a short relative path such as "." or "voc"
+    occurs inside words, numbers and other paths, and must not count as
+    naming anything. Every loader message that does name its file starts the
+    path at the beginning of the message or after a space, and nothing but
+    punctuation, a space or a separator follows it -- a separator meaning a
+    file inside the folder is named, which names the folder too.
+    """
+    path = re.escape(str(source))
+
+    return re.search(rf"(?<!\S){path}(?![\w\-]|\.\w)", message) is not None
+
+
+def _with_source(exc: Exception, source: Path) -> Exception:
+    """The same exception type, its message prefixed with the file that failed."""
+    # Two ValueError subclasses cannot be rebuilt from a message alone.
+    if isinstance(exc, json.JSONDecodeError):
+        return json.JSONDecodeError(f"{source}: {exc.msg}", exc.doc, exc.pos)
+
+    if isinstance(exc, UnicodeDecodeError):
+        return UnicodeDecodeError(
+            exc.encoding, exc.object, exc.start, exc.end, f"{source}: {exc.reason}"
+        )
+
+    try:
+        return type(exc)(f"{source}: {exc}")
+    except TypeError:
+        # Any other type that wants more than a message: better its own
+        # message without the file than a TypeError in its place.
+        return exc
+
+
+@contextmanager
+def _errors_name(source: Path) -> Iterator[None]:
+    """
+    Re-raise a loader's error with the file (or schema folder) that caused it.
+
+    The exception type does not change, so a caller catching
+    USAPAmbiguityError or ValueError sees no difference, and the original
+    stays chained as __cause__. A message that names the path already is
+    left alone.
+    """
+    try:
+        yield
+    except (USAPError, ValueError) as exc:
+        if _names_path(str(exc), source):
+            raise
+
+        renamed = _with_source(exc, source)
+
+        if renamed is exc:
+            raise
+
+        raise renamed from exc
+
+
 def load_vocabulary_folder(
     pkg: USAPPackage,
     path: str | Path,
@@ -838,6 +914,14 @@ def load_vocabulary_folder(
     Seeding is idempotent and enriching, so calling this again on every package
     open is the intended usage: it fills in what a package is missing and
     raises only on a genuine contradiction.
+
+    The whole folder loads in one transaction. A file that fails leaves
+    nothing of the folder written -- not even what the files before it loaded
+    -- so a corrected folder re-runs from clean; on a package already seeded
+    the transaction writes nothing and costs one empty BEGIN/COMMIT. Because a
+    failure undoes everything, the error names the file it came from (the
+    schema folder, for the .xsd files, which load as one set), with its type
+    unchanged and the original exception as __cause__.
     """
     folder = Path(path)
 
@@ -866,27 +950,33 @@ def load_vocabulary_folder(
 
     schemas = [item for item in files if item.suffix.lower() == ".xsd"]
 
-    if schemas:
-        # One call for the whole tree: see the docstring on cross-module
-        # substitutionGroup resolution.
-        results[str(folder)] = load_citygml_schema(
-            pkg,
-            folder,
-            scheme_version=scheme_version,
-        )
+    # One transaction for the whole folder: see the docstring. Each loader runs
+    # inside _errors_name, so whichever file fails is named in the error.
+    with pkg.transaction():
+        if schemas:
+            # One call for the whole tree: see the docstring on cross-module
+            # substitutionGroup resolution. Its errors name the folder.
+            with _errors_name(folder):
+                results[str(folder)] = load_citygml_schema(
+                    pkg,
+                    folder,
+                    scheme_version=scheme_version,
+                )
 
-    for item in files:
-        suffix = item.suffix.lower()
+        for item in files:
+            suffix = item.suffix.lower()
 
-        if suffix in _RDFXML_SUFFIXES or suffix in _UNSUPPORTED_RDF_SUFFIXES:
-            results[item.name] = load_ontology(
-                pkg,
-                item,
-                scheme_version=scheme_version,
-            )
+            if suffix in _RDFXML_SUFFIXES or suffix in _UNSUPPORTED_RDF_SUFFIXES:
+                with _errors_name(item):
+                    results[item.name] = load_ontology(
+                        pkg,
+                        item,
+                        scheme_version=scheme_version,
+                    )
 
-    for item in files:
-        if item.suffix.lower() == ".json":
-            results[item.name] = seed_vocabulary_file(pkg, item)
+        for item in files:
+            if item.suffix.lower() == ".json":
+                with _errors_name(item):
+                    results[item.name] = seed_vocabulary_file(pkg, item)
 
     return results

@@ -57,10 +57,12 @@ File adapters, for when you want the counts read off the file instead:
 |---|---|
 | `register_las_asset(pkg, las_path, uri=None, compute_hash=True)` | register a LAS/LAZ cloud; one part, point-record order |
 | `register_mesh_asset(pkg, mesh_path, representation_name=..., lod=None, stream=None)` | register an `.obj`/`.ply`/`.stl` mesh; one part per geometry |
+| `register_mesh_asset_with_geometries(pkg, mesh_path, geometries, representation_name=..., lod=None, uri=None, compute_hash=True)` | the same rows from `(name, face_count, bounds)` per geometry that the caller already has; the file is read only for its hash. The caller guarantees face *i* is the *i*-th face record of the file |
 
 > Registering through `register_asset` + `register_asset_part` from the code that
 > already loads the mesh for display is the safer path — see "Integrating USAP
-> into an application" in REFERENCE.md.
+> into an application" in REFERENCE.md. `register_mesh_asset_with_geometries`
+> is the shortcut when that loader keeps the file's face-record order.
 
 ## Concepts — the vocabulary side
 
@@ -69,7 +71,7 @@ supply; USAP asserts no taxonomy of its own.
 
 | Call | Does |
 |---|---|
-| `load_vocabulary_folder(pkg, path)` | seed a whole config directory: `.xsd`, `.owl`, `.json` — the one-call startup path |
+| `load_vocabulary_folder(pkg, path)` | seed a whole config directory: `.xsd`, `.owl`, `.json` — the one-call startup path. All or nothing: a failing file leaves nothing written, and the error names it |
 | `load_citygml_schema(pkg, path)` | CityGML concepts **and their hierarchy** from the OGC XSDs |
 | `load_ontology(pkg, path)` | link types, their `usap:category`, and ADE classes from an ontology (**RDF/XML only**; `.ttl` and the other non-XML syntaxes raise) |
 | `seed_vocabulary_file(pkg, path)` | concepts from a JSON registry |

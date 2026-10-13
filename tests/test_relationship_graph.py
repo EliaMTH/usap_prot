@@ -18,11 +18,12 @@ from pathlib import Path
 
 import pytest
 
-from conftest import assert_package_valid, make_pkg
+from conftest import assert_package_valid, executed_plans, make_pkg
 from usap import USAPError, USAPPackage
 from usap.core import _descendants_cte
 
 CORE_NS = "http://www.opengis.net/citygml/3.0"
+BLDG_NS = "http://www.opengis.net/citygml/building/3.0"
 CON_NS = "http://www.opengis.net/citygml/construction/3.0"
 TRAN_NS = "http://www.opengis.net/citygml/transportation/3.0"
 
@@ -383,26 +384,143 @@ def test_duplicate_type_identity_is_rejected_by_the_database(
 
 def test_descendant_walk_uses_its_index(pkg: USAPPackage) -> None:
     # The 400x regression detector. _descendants_cte's CROSS JOIN pins the
-    # join order; a plain JOIN makes SQLite rescan every edge per recursive
-    # step. Nothing in the body may become a scan.
+    # join order, and the unary + on the external-target filter keeps it out
+    # of index selection; lose either and SQLite rescans every edge per
+    # recursive step. Nothing in the body may become a scan or a range.
+    #
+    # Two relationship types, not one: with a single type the planner picks
+    # the right index even without the +, which is how the typed-graph rewrite
+    # brought the rescan back unnoticed. Any real containment category binds
+    # several. The plan does not depend on the data, so a tiny graph is enough.
     _graph(pkg)
 
-    for direction, expected_index in [
-        ("out", "usap_rel_by_from_graph"),
-        ("in", "usap_rel_by_to_graph"),
+    for direction, expected_indexes in [
+        ("out", ["usap_rel_by_from_graph"]),
+        ("in", ["usap_rel_by_to_graph"]),
+        ("both", ["usap_rel_by_from_graph", "usap_rel_by_to_graph"]),
     ]:
+        params = [1, "usap_default", 1, 2]
+
+        if direction == "both":
+            params += ["usap_default", 1, 2]
+
         plan = " ".join(
             str(row[3])
             for row in pkg.conn.execute(
                 "EXPLAIN QUERY PLAN "
-                + _descendants_cte(1, direction)
+                + _descendants_cte(2, direction)
                 + " SELECT * FROM objects",
-                (1, "usap_default", 1),
+                params,
             )
         )
 
-        assert f"USING INDEX {expected_index}" in plan, plan
+        for expected_index in expected_indexes:
+            assert f"USING INDEX {expected_index}" in plan, plan
+
+        assert "to_city_object_id>?" not in plan, plan
         assert "SCAN usap_city_object_relationship" not in plan, plan
+
+
+def test_one_hop_outward_branch_uses_the_from_index(pkg: USAPPackage) -> None:
+    # The one-hop sibling of the descendant-walk regression: the target's
+    # NOT NULL, read as a range on to_city_object_id, put the 'out' branch on
+    # usap_rel_by_to_graph and every expansion of a node read nearly every
+    # edge. Unlike the recursive walk it shows with one edge and no type filter.
+    building = pkg.create_city_object(object_uid="building")
+    roof = pkg.create_city_object(object_uid="roof")
+    pkg.link_city_objects(
+        building, roof, "boundary", code_space=CORE_NS, category="containment",
+    )
+
+    for categories in (None, ("containment",)):
+        sql, params = pkg._one_hop_neighbour_sql(
+            anchor_id=building,
+            direction="out",
+            graph_name="usap_default",
+            relationship_types=None,
+            relationship_categories=categories,
+            code_space=None,
+        )
+        plan = " ".join(
+            str(row[3])
+            for row in pkg.conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+        )
+
+        assert "USING INDEX usap_rel_by_from_graph" in plan, plan
+        assert "to_city_object_id>?" not in plan, plan
+
+    # related_city_objects builds the same condition for include_external=False.
+    plan = "\n".join(
+        executed_plans(
+            pkg, lambda: pkg.related_city_objects(building, include_external=False)
+        )
+    )
+
+    assert "SEARCH r USING INDEX usap_rel_by_from_graph" in plan, plan
+    assert "to_city_object_id>?" not in plan, plan
+
+
+def test_target_not_null_filter_keeps_its_meaning(pkg: USAPPackage) -> None:
+    # The unary + changes how the external-target filter is planned, never
+    # what it selects: an edge leaving the document stays out of every
+    # traversal, in every direction, with and without a type filter.
+    ids = {
+        uid: pkg.create_city_object(object_uid=uid)
+        for uid in ("building", "roof", "part", "neighbour")
+    }
+    pkg.link_city_objects(
+        ids["building"], ids["roof"], "boundary",
+        code_space=CORE_NS, category="containment",
+    )
+    pkg.link_city_objects(
+        ids["building"], ids["part"], "buildingPart",
+        code_space=BLDG_NS, category="containment",
+    )
+    pkg.link_city_objects(
+        ids["building"], ids["neighbour"], "adjacentTo",
+        code_space=CORE_NS, category="peer",
+    )
+    pkg.link_city_objects(
+        ids["building"], None, "boundary",
+        to_external_uri="https://example.org/other.gml#roof_9",
+        code_space=CORE_NS, category="containment",
+    )
+
+    containment = {"relationship_categories": ["containment"]}
+
+    assert _uids(pkg.list_city_objects(related_to="building")) == {
+        "roof", "part", "neighbour",
+    }
+    assert _uids(pkg.list_city_objects(related_to="building", **containment)) == {
+        "roof", "part",
+    }
+    assert _uids(
+        pkg.list_city_objects(related_to="building", direction="both")
+    ) == {"roof", "part", "neighbour"}
+    assert _uids(pkg.list_city_objects(related_to="roof", direction="in")) == {
+        "building"
+    }
+    assert _uids(pkg.list_city_objects(related_to="roof", direction="both")) == {
+        "building"
+    }
+
+    assert _uids(pkg.list_city_objects(descendants_of="building")) == {
+        "building", "roof", "part",
+    }
+    assert _uids(
+        pkg.list_city_objects(descendants_of="roof", direction="both")
+    ) == {"roof", "building", "part"}
+
+    assert len(pkg.related_city_objects("building")) == 4
+    assert {
+        e["to_object_uid"]
+        for e in pkg.related_city_objects("building", include_external=False)
+    } == {"roof", "part", "neighbour"}
+    assert len(
+        pkg.related_city_objects(
+            "building", direction="both", include_external=False
+        )
+    ) == 3
 
 
 def test_both_directions_terminate_and_do_not_duplicate(

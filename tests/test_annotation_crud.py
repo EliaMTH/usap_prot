@@ -166,6 +166,57 @@ def test_list_annotations_with_filters(tmp_path: Path) -> None:
         }
 
 
+def test_list_annotations_by_object_matches_the_primary_and_every_link(
+    tmp_path: Path,
+) -> None:
+    """
+    The object filter matches an annotation through its primary object or
+    through any usap_annotation_object link, whatever the relation_type, and
+    the id and uid spellings agree. Pinned case by case because 0.6.0 rewrote
+    the SQL behind it -- OR EXISTS became an indexed IN (... UNION ...) -- and
+    the answer, order included, must not have moved.
+    """
+    with make_pkg(tmp_path) as pkg:
+        roof_class = pkg.create_semantic_class("test", "test:Roof", "Roof")
+        roof = pkg.create_city_object(object_uid="roof")
+        other = pkg.create_city_object(object_uid="other")
+
+        def annotation(uid: str, primary: int | None, status: str = "accepted") -> int:
+            return pkg.create_annotation(
+                annotation_uid=uid,
+                semantic_class_id=roof_class,
+                primary_city_object_id=primary,
+                status=status,
+            )
+
+        annotation("by_primary", roof)
+        annotation("unrelated", other)
+        by_link = annotation("by_link", other, status="draft")
+        pkg.link_annotation_to_object(by_link, roof)
+        by_concerns = annotation("by_concerns", None)
+        pkg.link_annotation_to_object(by_concerns, roof, "concerns")
+
+        def uids(**filters) -> list[str]:
+            return [item["annotation_uid"] for item in pkg.list_annotations(**filters)]
+
+        expected = ["by_primary", "by_link", "by_concerns"]
+
+        assert uids(city_object_uid="roof") == expected
+        assert uids(city_object_id=roof) == expected
+        assert uids(city_object_uid="other") == ["unrelated", "by_link"]
+        assert uids(city_object_uid="no-such-object") == []
+        assert uids(city_object_id=roof + other + 1000) == []
+
+        # AND-combined with the other filters, and LIMIT applied after ordering.
+        assert uids(city_object_uid="roof", status="accepted") == [
+            "by_primary",
+            "by_concerns",
+        ]
+        assert uids(city_object_uid="roof", limit=2) == ["by_primary", "by_link"]
+        assert uids(city_object_id=roof, status="draft", limit=1) == ["by_link"]
+        assert uids(city_object_uid="roof", city_object_id=other) == ["by_link"]
+
+
 def test_list_annotations_asset_filter_separates_two_assets(tmp_path: Path) -> None:
     """
     US-DATA-01's load step: "the annotations belonging to the 3D asset just

@@ -1,5 +1,4 @@
 .venv
-.chats
 __pycache__/
 .pytest_cache/
 *.egg-info/
@@ -8,35 +7,6 @@ data/
 dist/
 *.usap.gpkg
 *.prof
-city_JSON.gml
-city_mesh.obj
-decimated_classified_output.las
 outputs/
-data/
-CLAUDE.md
+ticket_def/
 CHANGELOG.md
-W3C-alternatives.md
-benchmark_results/
-usap_devdiary.md
-PHASE1_BASELINE.md
-USAP_report.md
-HANDOFF_PLAN.md
-*_0.5.0.md
-# One-off data-preparation scripts. Not part of the SDK: they fix up source
-# data before it is registered, and say nothing about how USAP behaves.
-utility/
-
-FW_*
-*.css
-*.owl
-*.pdf
-
-# ...but the test fixtures are part of the suite, not local working copies.
-!tests/fixtures/**/*.owl
-
-# Local working copy of an external authority. Not vendored: the SDK takes a
-# path to it, it does not ship it.
-#   citygml-3.0-schemas/  OGC CityGML 3.0 XSDs (schemas.opengis.net/citygml/citygml-3_0_0.zip)
-citygml-3.0-schemas/
-
-US.md

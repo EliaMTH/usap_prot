@@ -82,7 +82,7 @@ composition, not a new concept.
 
 | Query (`core.py`) | Tables doing the work | Accelerator used |
 |---|---|---|
-| `annotations_for_elements` (pick → claims) | `usap_membership_block`, `usap_profile` | Global block size → candidate `block_start`s; index `usap_mb_by_element_block`; only candidate payloads decoded. |
+| `annotations_for_elements` (pick → claims) | `usap_membership_block`, `usap_profile` | Global block size → candidate `block_start`s; for a sparse selection, only the blocks whose stored `min/max_element_index` range holds a selected index, found inside `usap_mb_by_element_range` (a dense one reads its `block_start`s directly); only those payloads decoded. |
 | `elements_for_annotation` | `usap_membership_block` | `usap_mb_by_annotation`. Until 0.4.0 this came free from `UNIQUE(annotation_id, …)`; that constraint is now scoped to `assessment_id`, so the annotation-first index is declared explicitly. |
 | `elements_for_semantic_class` | `usap_semantic_class_closure`, `usap_annotation`, `usap_membership_block` | Closure PK expands "class + subclasses"; `usap_annotation_by_class`. |
 | `elements_for_city_object` | `usap_city_object`, `usap_city_object_relationship`, `usap_annotation_object` ∪ `primary_city_object_id`, `usap_membership_block` | Recursive CTE expands descendants per graph, following containment edge types only. |
@@ -91,9 +91,11 @@ composition, not a new concept.
 | `list_*` browse queries | `usap_annotation`, `usap_city_object`, `usap_semantic_class` + link tables | Tree expansion uses relationship edges directly (not closure). |
 | GIS browse (QGIS) | `usap_asset_extent`, `gpkg_*`, views | — |
 
-Serving no query: `usap_edit_log`. Also: `usap_membership_block.min_element_index`
-/ `max_element_index` are **written on every block but read by no query**
-(`annotations_for_elements` prunes by `block_start` only) — a dead accelerator.
+Serving no query: `usap_edit_log`. Until profile 0.6.0 this list also held
+`usap_membership_block.min_element_index` / `max_element_index`, **written on
+every block but read by no query** (`annotations_for_elements` pruned by
+`block_start` only) — a dead accelerator. 0.6.0 put them to work rather than
+dropping them; see the note at the end.
 
 ## 3. Ablation experiment
 
@@ -170,12 +172,12 @@ Same logical query, ~400× apart on the spelling.
 
 | Structure | Verdict |
 |---|---|
-| Membership block partitioning + `usap_mb_by_element_block` | **Necessary for the tested workload.** 13–251× on the interactive reverse query; the win comes from the storage layout itself and cannot be recovered by smarter SQL (the cost is payload decoding, not query planning). |
+| Membership block partitioning + `usap_mb_by_element_block` (since 0.6.0 `usap_mb_by_element_range`) | **Necessary for the tested workload.** 13–251× on the interactive reverse query; the win comes from the storage layout itself (the cost is payload decoding, not query planning). The stored per-block ranges cut the decoding further since 0.6.0 — see the note at the end. |
 | `usap_semantic_class_closure` | **Not performance-necessary.** The recursive CTE over `parent_class_id` is marginally faster at every scale tested. |
 | `usap_city_object_closure` | **Removed.** Not performance-necessary — a well-written CTE matches it — and it was the source of two silent-wrong-answer bugs (§4.1). |
 | `value_min`/`value_max` skipping | Cheap, worth keeping; pays 4× on structured data, ~nothing on uniform data. |
 | SQL-only `value_field_stats` | Huge ratio (245×) but naive is only ~10ms at 1M values — convenience, not necessity. |
-| `min/max_element_index` on membership blocks | **Dead weight** — written always, read never. Drop or start using. |
+| `min/max_element_index` on membership blocks | **Used since 0.6.0** (until then dead weight: written always, read never). The reverse query reads them inside `usap_mb_by_element_range` and decodes only the blocks whose range holds a selected index. |
 
 ### 4.1 Why `usap_city_object_closure` was removed (decision, 0.1.0)
 
@@ -204,7 +206,9 @@ The costs in §5 below were accepted knowingly, with these mitigations:
 
 - **planner fragility** — the `CROSS JOIN` spelling now lives in exactly one
   place (`_descendants_cte` in `core.py`) with the reason in its docstring,
-  and this benchmark still aborts on any accelerated/naive mismatch;
+  together with the unary `+` that keeps the external-target filter out of
+  index selection (see the 0.6.0 correction below), and this benchmark still
+  aborts on any accelerated/naive mismatch;
 - **third-party queryability** — `list_city_objects(descendants_of=...)`
   answers "this object and its parts" from the SDK; raw-SQL consumers do
   have to write the recursive CTE themselves, which is a genuine regression
@@ -219,6 +223,20 @@ The costs in §5 below were accepted knowingly, with these mitigations:
 > foreign key. The measurements and the decisions still hold — the recursive
 > CTE is unchanged apart from those names, and its `CROSS JOIN` is still what
 > keeps the planner off the 400x path.
+>
+> *Correction (profile 0.6.0):* that last sentence stopped being true in
+> 0.3.0 itself. The same change added `to_city_object_id IS NOT NULL` to the
+> recursive step (an external target is not a node), and SQLite reads that
+> term as a range on `to_city_object_id`: with two or more relationship types
+> bound — which any real containment category does — it chose
+> `usap_rel_by_to_graph` again and rescanned every edge per step, `CROSS JOIN`
+> notwithstanding (289 ms against 0.06 ms for one 50-surface building of the
+> Catania package). The term is now written `+r.to_city_object_id IS NOT NULL`:
+> the unary `+` keeps it out of index selection without changing what it
+> selects. The one-hop queries (`related_to`, `related_city_objects`) had the
+> same trap and the same fix. `test_descendant_walk_uses_its_index` used to
+> bind a single type, with which the planner happens to choose correctly; it
+> now binds two.
 >
 > The one thing 0.3.0 adds is `usap_relationship_type.category`, which decides
 > what counts as containment. That is *not* the materialized state rejected in
@@ -256,8 +274,8 @@ closure decision rests on (1) and (2) — which favored keeping the closures.
 The correctness argument in §4.1 outweighed them for the *object* closure,
 which was removed; `usap_semantic_class_closure` is not affected (class
 parentage is seeded, not edited edge by edge, and carries no type policy) and
-stays. The other simplification candidate found here is the dead
-`min/max_element_index` columns.
+stays. The other simplification candidate found here was the then-dead
+`min/max_element_index` columns, which 0.6.0 put to use instead.
 
 ## Reproducing
 
@@ -280,3 +298,19 @@ not a proof of functional completeness in general.
 > query has to join `usap_assessment` to reach it. The reverse-query index
 > (`usap_mb_by_element_block`) and the recursive-CTE `CROSS JOIN` — the two
 > things this document actually measures — are untouched.
+
+> **Profile 0.6.0 note.** Both of those changed. The reverse-query index is
+> now `usap_mb_by_element_range` on `(asset_part_id, element_kind,
+> block_start, min_element_index, max_element_index)`; the old index's columns
+> are its prefix, so it serves every use the old one had, the `ON DELETE
+> CASCADE` scan from `usap_asset_part` included. `annotations_for_elements`
+> reads the two extra columns as a prefilter: for a sparse selection it first
+> keeps, inside the index, only the blocks whose stored range holds a selected
+> index, then decodes those alone; a selection filling at least 46% of the
+> blocks it touches skips the prefilter, which would discard almost nothing.
+> On the Catania package one picked face went from 6,993 decoded blocks to 2
+> (32 ms to 0.13 ms) and a 60 × 60 m lasso from 159 ms to 4.4 ms, while dense
+> selections, where there is nothing to discard, cost 2–8% more. The A1
+> numbers above predate this and compare against the `block_start`-only
+> query. The recursive CTE's change is the unary `+` described in the
+> correction under the 0.3.0 note.

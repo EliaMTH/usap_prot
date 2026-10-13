@@ -28,14 +28,15 @@ The motivation and mental model are in [README.md](../README.md); this file is t
 
 This repository contains a working MVP. The file format, schema, and API may still change, and packages created with this version should be treated as experimental.
 
-The current schema is profile version **0.5.0**. There is no migration path from
+The current schema is profile version **0.6.0**. There is no migration path from
 any older profile: 0.3.0 renamed the relationship endpoints and made the link
 type a foreign key into a new table, 0.4.0 moved membership and value blocks
-under `usap_assessment` and dropped `usap_annotation.label`, and 0.5.0 brought
+under `usap_assessment` and dropped `usap_annotation.label`, 0.5.0 brought
 that label back as a column and added `usap_path_block`, the ordered-sequence
-sidecar. `USAPPackage.open` refuses an older package with an
-explicit "unsupported profile version" error rather than misreading it. Rebuild
-rather than migrate.
+sidecar, and 0.6.0 changed indexes only — no table, column or row — which still
+makes a 0.5.0 package an older profile. `USAPPackage.open` refuses an older
+package with an explicit "unsupported profile version" error rather than
+misreading it. Rebuild rather than migrate.
 
 What the prototype can do, end to end:
 
@@ -432,7 +433,7 @@ stored index mean different geometry. Record a new assessment instead.
 
 ### Membership block
 
-A compressed set of selected element indices for one **assessment**, one asset part, and one element kind (the owning annotation is carried alongside, so forward queries stay one indexed lookup). Stored as a **roaring bitmap** in CRoaring's portable serialization (`encoding = 'roaring'`), so the payload is readable by any roaring implementation, not only this SDK. Indices are partitioned into blocks of `usap_profile.default_block_size` (16384) and held as within-block offsets; `block_start` is what the reverse element query prunes on.
+A compressed set of selected element indices for one **assessment**, one asset part, and one element kind (the owning annotation is carried alongside, so forward queries stay one indexed lookup). Stored as a **roaring bitmap** in CRoaring's portable serialization (`encoding = 'roaring'`), so the payload is readable by any roaring implementation, not only this SDK. Indices are partitioned into blocks of `usap_profile.default_block_size` (16384) and held as within-block offsets; `block_start` is what the reverse element query prunes on, and for a sparse selection also each block's stored `min_element_index`/`max_element_index`, so a block whose range holds no selected index is never decoded.
 
 Example:
 
@@ -585,7 +586,13 @@ mesh adapter's `.glb`/`.gltf` refusal, since the adapter is then not involved.
 Record the convention in `indexing_profile`; `validate_report()` warns
 `ASSET_PART_NO_INDEXING_PROFILE` when an annotated part declares none, and
 `list_asset_parts()` returns it so an application can compare it against what
-its own loader would produce.
+its own loader would produce. When that loader keeps the file's face-record
+order — face *i* is the *i*-th face record, a quad counted once —
+`register_mesh_asset_with_geometries` is the shorter way: it takes the loader's
+per-geometry face counts and bounds, reads the file only to hash it, and writes
+the rows `register_mesh_asset` would, marked `"facts_source": "caller"` in
+their metadata. The counts are the caller's word: nothing re-reads the file to
+check them.
 
 **Register under a uri relative to the package.** It is resolved against the
 directory holding the `.usap.gpkg`, so a project folder can be moved, copied to
@@ -668,7 +675,11 @@ package is portable and why a concept cannot vanish from under existing
 annotations when a config file is edited. Seed on create and **re-seed on open**:
 seeding is idempotent and enriching, filling in what is missing and raising only
 on a genuine contradiction — which the application should surface rather than
-swallow. Note the asymmetry: concepts are gated (an unregistered one raises),
+swallow. A load that fails leaves nothing written: each file is one
+transaction, and `load_vocabulary_folder` makes the whole folder one, so a
+corrected configuration re-runs from clean. Its error keeps its type and names
+the file to fix (the schema folder, for the `.xsd` files, which load as one
+set). Note the asymmetry: concepts are gated (an unregistered one raises),
 link types are not (an unregistered name auto-registers).
 
 **One thread per connection.** `sqlite3` connections are thread-bound; using a
@@ -1614,6 +1625,23 @@ and treat one file as one part. Two cases raise instead of guessing:
 is minutes on a 10 GB asset. It is what makes a later change to that file
 detectable (`validate_report(level="external")`), so skip it deliberately, not
 by accident.
+
+An application that already holds the mesh has both facts in its own arrays,
+and need not have the file read again at all:
+
+```python
+register_mesh_asset_with_geometries(
+    pkg, "city.obj",
+    [("default", face_count, (minx, miny, minz, maxx, maxy, maxz))],
+    representation_name="city",
+)
+```
+
+The file is then read only for its hash, and not at all with
+`compute_hash=False`. On a 172 MB OBJ, `register_mesh_asset` took 2.40 s
+(2.39 s of it reading geometry) and this 0.14 s, the cost of the hash alone. The
+face counts are the caller's word — see "Integrating USAP into an application"
+for when that word is safe to give.
 
 ---
 

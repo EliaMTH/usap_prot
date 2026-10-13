@@ -15,6 +15,7 @@ import pytest
 
 from conftest import CITYGML_SCHEMA_FIXTURE, make_pkg, seed_citygml_concepts
 from usap import (
+    USAPAmbiguityError,
     USAPError,
     USAPPackage,
     city_object_classes,
@@ -347,3 +348,234 @@ def test_vocabulary_folder_needs_a_directory_with_something_in_it(tmp_path):
     with make_pkg(tmp_path, "empty.usap.gpkg") as pkg:
         with pytest.raises(USAPError, match="No vocabulary files"):
             load_vocabulary_folder(pkg, empty)
+
+
+# ---------------------------------------------------------------------------
+# A configuration folder loads all or nothing, and its errors name the file
+# ---------------------------------------------------------------------------
+
+
+def _vocabulary(scheme: str, concepts: list[dict], **extra: object) -> str:
+    return json.dumps({"scheme": scheme, "concepts": concepts, **extra})
+
+
+def _folder(
+    tmp_path: Path,
+    files: dict[str, str | bytes],
+    *,
+    name: str = "vocabulary",
+    with_schemas: bool = False,
+) -> Path:
+    folder = tmp_path / name
+    folder.mkdir()
+
+    for file_name, content in files.items():
+        if isinstance(content, bytes):
+            (folder / file_name).write_bytes(content)
+        else:
+            (folder / file_name).write_text(content, encoding="utf-8")
+
+    if with_schemas:
+        for xsd in CITYGML_SCHEMA_FIXTURE.rglob("*.xsd"):
+            (folder / xsd.name).write_bytes(xsd.read_bytes())
+
+    return folder
+
+
+def _written(pkg: USAPPackage) -> tuple[int, int]:
+    """(concepts, link types) in the package."""
+    return (
+        pkg.conn.execute("SELECT COUNT(*) FROM usap_semantic_class").fetchone()[0],
+        pkg.conn.execute("SELECT COUNT(*) FROM usap_relationship_type").fetchone()[0],
+    )
+
+
+def _commits(pkg: USAPPackage, call) -> int:
+    statements: list[str] = []
+    pkg.conn.set_trace_callback(statements.append)
+
+    try:
+        call()
+    finally:
+        pkg.conn.set_trace_callback(None)
+
+    return sum(1 for sql in statements if sql.lstrip().upper().startswith("COMMIT"))
+
+
+def test_a_vocabulary_folder_loads_all_or_nothing(tmp_path):
+    """
+    Schemas, an ontology and three JSON files, the second of which fails.
+    The folder is one transaction, so nothing of it stays written: not the
+    schemas, not the ontology's link types, not the JSON file before it.
+    Re-running after the fix starts from clean.
+    """
+    folder = _folder(
+        tmp_path,
+        {
+            "a.json": _vocabulary("a", [{"local_name": "First"}]),
+            "b.json": _vocabulary(
+                "b", [{"local_name": "Second", "parent_uri": "Missing"}]
+            ),
+            "c.json": _vocabulary("c", [{"local_name": "Third"}]),
+            "domain.owl": CATEGORY_ONTOLOGY.read_bytes(),
+        },
+        with_schemas=True,
+    )
+
+    with make_pkg(tmp_path, "folder.usap.gpkg") as pkg:
+        with pytest.raises(ValueError, match="Missing"):
+            load_vocabulary_folder(pkg, folder)
+
+        assert _written(pkg) == (0, 0)
+
+        (folder / "b.json").write_text(
+            _vocabulary("b", [{"local_name": "Second"}]), encoding="utf-8"
+        )
+
+        # One commit for the whole folder, and on an already seeded package
+        # (the every-open path) one empty one.
+        assert _commits(pkg, lambda: load_vocabulary_folder(pkg, folder)) == 1
+        seeded = _written(pkg)
+
+        assert _commits(pkg, lambda: load_vocabulary_folder(pkg, folder)) == 1
+        assert _written(pkg) == seeded
+        assert {"First", "Second", "Third", "Building"} <= {
+            c["local_name"] for c in pkg.list_accepted_concepts()
+        }
+
+
+_LOADS = _vocabulary("s", [{"local_name": "A"}])
+
+
+@pytest.mark.parametrize(
+    ("files", "error", "culprit", "already_named"),
+    [
+        pytest.param(
+            {
+                "a.json": _LOADS,
+                "b.json": _vocabulary(
+                    "s", [{"local_name": "B", "parent_uri": "Missing"}]
+                ),
+            },
+            ValueError, "b.json", True,
+            id="missing-parent",
+        ),
+        pytest.param(
+            {"bad.xsd": "<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'"},
+            USAPError, "bad.xsd", True,
+            id="malformed-schema",
+        ),
+        pytest.param(
+            {
+                "a.json": _vocabulary(
+                    "x", [{"local_name": "Roof"}], scheme_version="1"
+                ),
+                "b.json": _vocabulary(
+                    "x", [{"local_name": "Roof"}], scheme_version="2"
+                ),
+            },
+            USAPError, "b.json", False,
+            id="contradicts-an-earlier-file",
+        ),
+        pytest.param(
+            {
+                "a.json": _vocabulary("A", [{"local_name": "Dup"}]),
+                "b.json": _vocabulary("B", [{"local_name": "Dup"}]),
+                "c.json": _vocabulary(
+                    "C", [{"local_name": "Kid", "parent_uri": "Dup"}]
+                ),
+            },
+            USAPAmbiguityError, "c.json", False,
+            id="ambiguous-parent",
+        ),
+        pytest.param(
+            {"a.json": _LOADS, "b.json": '{"scheme": "s", "concepts": [ oops ]}'},
+            json.JSONDecodeError, "b.json", False,
+            id="malformed-json",
+        ),
+        pytest.param(
+            {"a.json": _LOADS, "b.json": b'\xff\xfe{"scheme": "s"}'},
+            UnicodeDecodeError, "b.json", False,
+            id="not-utf8",
+        ),
+    ],
+)
+def test_a_folder_error_names_its_file_and_keeps_its_type(
+    tmp_path, files, error, culprit, already_named
+):
+    """
+    All or nothing means the caller must be told which file to fix. The
+    exception type is what it always was -- callers catch USAPAmbiguityError
+    or ValueError by type, and json.JSONDecodeError / UnicodeDecodeError
+    cannot be rebuilt from a message alone -- and the original stays chained
+    as __cause__. A message that named the file already is left as it was.
+    """
+    folder = _folder(tmp_path, files)
+
+    with make_pkg(tmp_path, "errors.usap.gpkg") as pkg:
+        with pytest.raises(error) as excinfo:
+            load_vocabulary_folder(pkg, folder)
+
+        assert _written(pkg) == (0, 0)
+
+    raised = excinfo.value
+
+    assert type(raised) is error
+    assert str(folder / culprit) in str(raised)
+
+    if not already_named:
+        assert type(raised.__cause__) is error
+        assert str(folder / culprit) not in str(raised.__cause__)
+
+
+def test_a_schema_error_names_the_schema_folder(tmp_path):
+    # The .xsd files load as one set (a parent may live in another module),
+    # so an error found while registering them names the folder they came
+    # from.
+    folder = _folder(tmp_path, {}, with_schemas=True)
+
+    with make_pkg(tmp_path, "schema_error.usap.gpkg") as pkg:
+        pkg.create_semantic_class(
+            scheme="citygml",
+            class_uri="http://www.opengis.net/citygml/building/3.0#Building",
+            local_name="Building",
+            scheme_version="2.0",
+        )
+
+        with pytest.raises(USAPError, match="scheme_version") as excinfo:
+            load_vocabulary_folder(pkg, folder, scheme_version="3.0")
+
+    assert str(excinfo.value).startswith(f"{folder}: ")
+
+
+def test_a_folder_given_as_a_relative_path_is_still_named(tmp_path, monkeypatch):
+    # The "already named?" check matches the path as a whole. A substring
+    # test would find "." in any sentence, and with the folder given as "."
+    # would never add the file -- or the schema folder -- to the message.
+    contradiction = {
+        "a.json": _vocabulary("x", [{"local_name": "Roof"}], scheme_version="1"),
+        "b.json": _vocabulary("x", [{"local_name": "Roof"}], scheme_version="2"),
+    }
+    json_folder = _folder(tmp_path, contradiction, name="json_only")
+    schema_folder = _folder(tmp_path, {}, name="schemas", with_schemas=True)
+
+    with make_pkg(tmp_path, "relative.usap.gpkg") as pkg:
+        monkeypatch.chdir(json_folder)
+
+        with pytest.raises(USAPError) as excinfo:
+            load_vocabulary_folder(pkg, ".")
+
+        assert str(excinfo.value).startswith("b.json: ")
+
+        pkg.create_semantic_class(
+            scheme="citygml",
+            class_uri="http://www.opengis.net/citygml/building/3.0#Building",
+            local_name="Building",
+            scheme_version="2.0",
+        )
+        monkeypatch.chdir(schema_folder)
+
+        with pytest.raises(USAPError) as excinfo:
+            load_vocabulary_folder(pkg, ".", scheme_version="3.0")
+
+        assert str(excinfo.value).startswith(".: ")

@@ -78,6 +78,16 @@ CONFIDENCE_RANGE = (0.0, 1.0)
 
 # The version stamped on packages this build creates.
 #
+# 0.6.0 changed indexes only: usap_annotation_by_primary_object and
+# usap_annotation_object_by_object, so a city object's annotations are found
+# without scanning every annotation; usap_city_object_by_gml_id, so
+# resolve_city_object does not scan every object; and usap_mb_by_element_range
+# in place of usap_mb_by_element_block, so the reverse query discards blocks on
+# their stored min/max before decoding any. No table, column, constraint or
+# row changed -- but schema.sql did, and that is what the version tracks: a
+# 0.5.0 package lacks the indexes these queries are planned against, and is
+# rebuilt like any other.
+#
 # 0.5.0 also added usap_path_block, the ordered-sequence sidecar. Membership is
 # a roaring bitmap and therefore a set, so a claim with a direction -- a road
 # centreline, a traversal -- had nowhere to keep its order. The interim home,
@@ -116,8 +126,9 @@ CONFIDENCE_RANGE = (0.0, 1.0)
 # this one moves only when schema.sql changes, because SUPPORTED_PROFILE_
 # VERSIONS below carries no migration path — bumping it in step with a bugfix
 # release would make this build refuse every package already written. The two
-# happen to read 0.5.0 together right now; that is a coincidence, not a rule.
-CURRENT_PROFILE_VERSION = "0.5.0"
+# have often read the same number (0.5.0, 0.6.0); that is a coincidence, not a
+# rule.
+CURRENT_PROFILE_VERSION = "0.6.0"
 
 # Only packages written by a profile version this build understands can be
 # opened; there is no migration path yet, so opening a newer one would

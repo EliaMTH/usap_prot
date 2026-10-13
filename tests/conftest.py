@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Callable, Iterator
 
 import laspy
 import numpy as np
@@ -133,6 +133,47 @@ def assert_package_valid(pkg) -> None:
     """
     report = pkg.validate_report()
     assert report.is_ok, [issue.format() for issue in report.issues]
+
+
+class _RecordingConnection:
+    """Forwards to a sqlite3 connection, recording every execute() call."""
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+        self.statements: list[tuple[str, Any]] = []
+
+    def execute(self, sql: str, parameters: Any = ()) -> Any:
+        self.statements.append((sql, parameters))
+        return self._conn.execute(sql, parameters)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+def executed_plans(pkg: USAPPackage, call: Callable[[], object]) -> list[str]:
+    """
+    EXPLAIN QUERY PLAN of every query `call` runs on pkg, one string each.
+
+    A plan test has to look at the SQL the SDK actually executes: a copy of
+    the query pasted into the test keeps passing after the real one regresses.
+    The connection is swapped for a recorder for the duration of the call.
+    """
+    real = pkg.conn
+    recorder = _RecordingConnection(real)
+    pkg.conn = recorder
+
+    try:
+        call()
+    finally:
+        pkg.conn = real
+
+    return [
+        "\n".join(
+            row[3] for row in real.execute("EXPLAIN QUERY PLAN " + sql, parameters)
+        )
+        for sql, parameters in recorder.statements
+        if sql.split(None, 1)[0].upper() in ("SELECT", "WITH")
+    ]
 
 
 def write_tiny_las(path: Path, point_count: int = 10) -> None:

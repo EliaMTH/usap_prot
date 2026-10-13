@@ -2,7 +2,7 @@
 
 How the objects in [`src/usap/data/schema.sql`](../src/usap/data/schema.sql) connect: which foreign keys wire the tables together, and which tables each view reads from.
 
-**Object counts:** 15 USAP tables + 4 GeoPackage plumbing tables = 19 base tables, plus 5 views and 13 indexes.
+**Object counts:** 16 USAP tables + 4 GeoPackage plumbing tables = 20 base tables, plus 5 views and 17 indexes.
 
 In every diagram, an arrow `A ──▶ B` means **"A has a foreign key pointing to B"** (A references B; the arrow points at the thing being referenced).
 
@@ -194,16 +194,19 @@ Fast-lookup structures on non-primary-key columns:
 | Index | On table | Column(s) |
 |-------|----------|-----------|
 | `usap_scc_by_descendant` | `usap_semantic_class_closure` | `descendant_class_id` |
+| `usap_city_object_by_gml_id` | `usap_city_object` | `gml_id` **(not unique:** a duplicate is the `DUPLICATE_GML_ID` finding**)** |
 | `usap_rel_by_from_graph` | `usap_city_object_relationship` | `graph_name, from_city_object_id, relationship_type_id` |
 | `usap_rel_by_to_graph` | `usap_city_object_relationship` | `graph_name, to_city_object_id, relationship_type_id` |
 | `usap_rel_unresolved` | `usap_city_object_relationship` | `to_external_uri` **(partial:** `WHERE to_external_uri IS NOT NULL`**)** |
 | `usap_relationship_type_identity` | `usap_relationship_type` | `local_name, COALESCE(code_space, '')` **(unique, expression)** |
 | `usap_relationship_type_by_category` | `usap_relationship_type` | `category` |
 | `usap_annotation_by_class` | `usap_annotation` | `semantic_class_id` |
+| `usap_annotation_by_primary_object` | `usap_annotation` | `primary_city_object_id` |
+| `usap_annotation_object_by_object` | `usap_annotation_object` | `city_object_id, relation_type` |
 | `usap_assessment_by_annotation` | `usap_assessment` | `annotation_id, assessed_at` |
 | `usap_assessment_one_undated` | `usap_assessment` | `annotation_id, asset_id` **(unique, partial:** `WHERE assessed_at IS NULL`**)** |
 | `usap_mb_by_annotation` | `usap_membership_block` | `annotation_id, asset_part_id, element_kind, block_start` |
-| `usap_mb_by_element_block` | `usap_membership_block` | `asset_part_id, element_kind, block_start` |
+| `usap_mb_by_element_range` | `usap_membership_block` | `asset_part_id, element_kind, block_start, min_element_index, max_element_index` |
 | `usap_vb_by_annotation` | `usap_value_block` | `annotation_id, asset_part_id, element_kind, block_start` |
 | `usap_vb_by_part` | `usap_value_block` | `asset_part_id, element_kind` |
 | `usap_path_by_part` | `usap_path_block` | `asset_part_id` |

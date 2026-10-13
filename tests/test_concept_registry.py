@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
-from conftest import seed_citygml_concepts
+from conftest import CITYGML_SCHEMA_FIXTURE, make_pkg, seed_citygml_concepts
 from usap import (
     USAPAmbiguityError,
     USAPError,
     USAPPackage,
+    load_citygml_schema,
     seed_default_ade_vocabulary,
+    seed_vocabulary_file,
 )
+from usap.constants import CITYGML_3_0_BUILDING_NS
 
 
 def test_vocabulary_seeding_is_idempotent(tmp_path: Path) -> None:
@@ -179,3 +184,135 @@ def test_ambiguous_local_name_requires_scheme_or_uri(tmp_path: Path) -> None:
             pkg.resolve_semantic_class("my-ade:energy:Roof")
             == ade_roof
         )
+
+# ---------------------------------------------------------------------------
+# One transaction per vocabulary file
+# ---------------------------------------------------------------------------
+
+
+def _commits(pkg: USAPPackage, call: Callable[[], object]) -> int:
+    """How many COMMIT statements call() issues on the package's connection."""
+    statements: list[str] = []
+    pkg.conn.set_trace_callback(statements.append)
+
+    try:
+        call()
+    finally:
+        pkg.conn.set_trace_callback(None)
+
+    return sum(1 for sql in statements if sql.lstrip().upper().startswith("COMMIT"))
+
+
+def _registry(pkg: USAPPackage) -> tuple[list[tuple], list[tuple]]:
+    """Every concept and closure row, for comparing two seeded packages."""
+    concepts = pkg.conn.execute(
+        """
+        SELECT semantic_class_id, scheme, scheme_version, class_uri, local_name,
+               parent_class_id, source_namespace, concept_iri, is_ade,
+               metadata_json
+        FROM usap_semantic_class
+        ORDER BY semantic_class_id
+        """
+    ).fetchall()
+    closure = pkg.conn.execute(
+        """
+        SELECT ancestor_class_id, descendant_class_id, depth
+        FROM usap_semantic_class_closure
+        ORDER BY ancestor_class_id, descendant_class_id
+        """
+    ).fetchall()
+
+    return [tuple(row) for row in concepts], [tuple(row) for row in closure]
+
+
+def test_seeding_a_vocabulary_file_commits_once(tmp_path: Path) -> None:
+    # create_semantic_class opens its own transaction, so outside an outer one
+    # every concept used to commit -- and sync -- on its own: City3D's first
+    # annotation timed out seeding 889 concepts on a slow disk. One file is now
+    # one commit, and it writes exactly what it writes inside a caller's
+    # transaction.
+    vocabulary = tmp_path / "chains.json"
+    vocabulary.write_text(
+        json.dumps(
+            {
+                "scheme": "chains",
+                "concepts": [
+                    {
+                        "local_name": f"C{i}",
+                        **({"parent_uri": f"C{i - 1}"} if i % 4 else {}),
+                    }
+                    for i in range(40)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with make_pkg(tmp_path, "alone.usap.gpkg") as alone, make_pkg(
+        tmp_path, "wrapped.usap.gpkg"
+    ) as wrapped:
+
+        def inside_a_transaction() -> None:
+            with wrapped.transaction():
+                seed_vocabulary_file(wrapped, vocabulary)
+
+        assert _commits(alone, lambda: seed_vocabulary_file(alone, vocabulary)) == 1
+        assert _commits(wrapped, inside_a_transaction) == 1
+
+        assert _registry(alone) == _registry(wrapped)
+        assert len(_registry(alone)[0]) == 40
+        assert len(_registry(alone)[1]) == 100  # 10 chains of depth 4
+
+
+def test_loading_a_citygml_schema_commits_once(tmp_path: Path) -> None:
+    with make_pkg(tmp_path) as pkg:
+        assert _commits(pkg, lambda: seed_citygml_concepts(pkg)) == 1
+        assert pkg.resolve_semantic_class("RoofSurface")
+
+
+def test_a_vocabulary_file_that_fails_halfway_leaves_nothing(tmp_path: Path) -> None:
+    # Two concepts load, the third names a parent that does not exist. With
+    # one transaction per file none of the three stays written, so the file
+    # can be fixed and re-run from clean.
+    vocabulary = tmp_path / "broken.json"
+    vocabulary.write_text(
+        json.dumps(
+            {
+                "scheme": "s",
+                "concepts": [
+                    {"local_name": "A"},
+                    {"local_name": "B", "parent_uri": "A"},
+                    {"local_name": "C", "parent_uri": "Missing"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with make_pkg(tmp_path) as pkg:
+        with pytest.raises(ValueError, match="Missing"):
+            seed_vocabulary_file(pkg, vocabulary)
+
+        assert _registry(pkg) == ([], [])
+
+
+def test_a_citygml_schema_that_fails_halfway_leaves_nothing(tmp_path: Path) -> None:
+    # The schema's own Building contradicts one already registered under the
+    # same class_uri, so loading stops there -- after the abstract classes
+    # created parents-first before it. None of those may stay written.
+    building_uri = f"{CITYGML_3_0_BUILDING_NS}#Building"
+
+    with make_pkg(tmp_path) as pkg:
+        existing = pkg.create_semantic_class(
+            scheme="citygml",
+            class_uri=building_uri,
+            local_name="Building",
+            scheme_version="2.0",
+        )
+
+        with pytest.raises(USAPError, match="scheme_version"):
+            load_citygml_schema(pkg, CITYGML_SCHEMA_FIXTURE, scheme_version="3.0")
+
+        concepts, _ = _registry(pkg)
+
+        assert [row[0] for row in concepts] == [existing]

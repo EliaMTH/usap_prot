@@ -156,6 +156,12 @@ DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parent / "data" / "schema.sql"
 # as low as 999, so large id lists are queried in chunks of this size.
 _MAX_SQL_IN_VARS = 900
 
+# annotations_for_elements: a selection that fills at least this fraction of
+# the blocks it touches leaves the min/max prefilter almost nothing to
+# discard, so the single block_start query is run instead. Two-step wins at
+# 27% density and loses at 46% on the measured cases; tune here.
+_DENSE_SELECTION_FRACTION = 0.46
+
 _COMPARISON_OPS = {
     ">": np.greater,
     ">=": np.greater_equal,
@@ -318,7 +324,14 @@ def _descendants_cte(edge_type_count: int, direction: str = "out") -> str:
     this body.
 
     to_city_object_id IS NOT NULL excludes edges whose target is outside the
-    document: an external URI is not a node and must not enter the queue.
+    document: an external URI is not a node and must not enter the queue. It
+    is written with a unary + (+r.to_city_object_id), which matters as much as
+    the CROSS JOIN: without it SQLite reads the term as a range on
+    to_city_object_id, picks usap_rel_by_to_graph for the outward step and
+    rescans every edge per step, the same ~400x. That plan appears only once
+    two or more relationship types are bound -- which any real containment
+    category does -- so a check with a single type passes either way (see
+    test_descendant_walk_uses_its_index).
     """
     if direction not in RELATIONSHIP_DIRECTIONS:
         raise USAPError(
@@ -343,7 +356,11 @@ def _descendants_cte(edge_type_count: int, direction: str = "out") -> str:
                 ON {alias}.{from_column} = o.object_id
             WHERE {alias}.graph_name = ?
               AND {alias}.relationship_type_id IN ({placeholders})
-              AND {alias}.to_city_object_id IS NOT NULL
+              -- Unary +: keeps the external-target filter out of index
+              -- selection; as an index constraint it is a range on
+              -- to_city_object_id that steers the planner to
+              -- usap_rel_by_to_graph and rescans every edge per step.
+              AND +{alias}.to_city_object_id IS NOT NULL
         """
 
     outward = step("from_city_object_id", "to_city_object_id", "r")
@@ -363,6 +380,80 @@ def _descendants_cte(edge_type_count: int, direction: str = "out") -> str:
             {recursive}
         )
     """
+
+
+def _candidate_blocks_sql(row_count: int, *, by_assessment: bool = False) -> str:
+    """
+    The reverse query's prefilter: membership blocks whose stored
+    [min_element_index, max_element_index] overlaps the selection, in each
+    block the selection touches.
+
+    Bind (block_start, lo, hi) per row -- the first and last selected index in
+    that block -- then asset_part_id, element_kind and, with by_assessment,
+    the assessment_id. Yields (membership_block_id, min_element_index,
+    max_element_index) and reads no payload: the whole filter is answered
+    inside usap_mb_by_element_range.
+
+    CROSS JOIN pins sel as the outer loop, so blocks are looked up by
+    block_start. With a plain JOIN and an index on (asset_part_id,
+    element_kind, block_start) alone, SQLite puts the block table outside from
+    eight VALUES rows up and rescans every block of the part for each row.
+    The range index gets the right plan from a plain JOIN too; only the CROSS
+    JOIN guarantees it (test_candidate_block_lookup_keeps_the_selection_outside).
+    """
+    values = ",".join("(?, ?, ?)" for _ in range(row_count))
+    assessment_clause = "AND mb.assessment_id = ?" if by_assessment else ""
+
+    return f"""
+        WITH sel(bs, lo, hi) AS (VALUES {values})
+        SELECT
+            mb.membership_block_id,
+            mb.min_element_index,
+            mb.max_element_index
+        FROM sel
+        CROSS JOIN usap_membership_block AS mb
+            ON mb.asset_part_id = ?
+           AND mb.element_kind = ?
+           AND mb.block_start = sel.bs
+           AND mb.min_element_index <= sel.hi
+           AND mb.max_element_index >= sel.lo
+           {assessment_clause}
+    """
+
+
+# What annotations_for_elements reports for each candidate block, and the
+# joins that supply it. Shared by both ways of choosing the blocks, so they
+# cannot drift apart.
+_REVERSE_QUERY_ROWS = """
+    SELECT
+        mb.membership_block_id,
+        mb.annotation_id,
+        mb.assessment_id,
+        mb.block_start,
+        mb.payload,
+
+        a.annotation_uid,
+        a.label,
+        a.status,
+
+        asm.assessment_uid,
+        asm.assessed_at,
+
+        sc.local_name AS semantic_class,
+        sc.class_uri AS semantic_class_uri,
+
+        co.object_uid AS primary_city_object_uid,
+        co.gml_id AS primary_city_object_gml_id
+    FROM usap_membership_block AS mb
+    JOIN usap_annotation AS a
+        ON a.annotation_id = mb.annotation_id
+    JOIN usap_assessment AS asm
+        ON asm.assessment_id = mb.assessment_id
+    JOIN usap_semantic_class AS sc
+        ON sc.semantic_class_id = a.semantic_class_id
+    LEFT JOIN usap_city_object AS co
+        ON co.city_object_id = a.primary_city_object_id
+"""
 
 
 def _block_cannot_match(
@@ -555,7 +646,21 @@ class USAPPackage:
             with open(schema_path, "r", encoding="utf-8") as f:
                 schema_sql = f.read()
 
-            pkg.conn.executescript(schema_sql)
+            # One transaction for schema, metadata and profile: executescript
+            # runs each statement in autocommit, which is one commit -- and
+            # one sync to disk -- per CREATE. The script is opened with BEGIN
+            # and left open; transaction() below adopts it and commits once.
+            # A script that manages its own transaction fails on its BEGIN,
+            # and is rolled back and run as given. (Not detected by looking
+            # for BEGIN in the text: a CREATE TRIGGER body has one too.)
+            try:
+                pkg.conn.executescript("BEGIN;\n" + schema_sql)
+            except sqlite3.OperationalError as exc:
+                if "within a transaction" not in str(exc):
+                    raise
+
+                pkg.conn.rollback()
+                pkg.conn.executescript(schema_sql)
 
             with pkg.transaction():
                 initialize_geopackage_metadata(
@@ -2324,8 +2429,12 @@ class USAPPackage:
 
         A UNION ALL of one indexed branch per direction, rather than a JOIN:
         a JOIN cannot express direction='both' without either duplicating rows
-        or losing one side. Each branch hits its own covering index
-        (usap_rel_by_from_graph / usap_rel_by_to_graph).
+        or losing one side. Each branch looks its anchor up in its own index
+        (usap_rel_by_from_graph / usap_rel_by_to_graph) -- as long as the
+        target's NOT NULL stays out of index selection, which is what its
+        unary + is for: read as a range on to_city_object_id, it moved the
+        'out' branch onto usap_rel_by_to_graph and every call read nearly
+        every edge, with one edge in the package and no type filter at all.
 
         No default category here: a one-hop question is "what is related to
         this", and defaulting it to containment would silently hide exactly
@@ -2367,7 +2476,10 @@ class USAPPackage:
                 FROM usap_city_object_relationship AS r
                 WHERE r.graph_name = ?
                   AND r.{anchor_column} = ?
-                  AND r.{target_column} IS NOT NULL
+                  -- Unary +: as an index constraint the NOT NULL is a range
+                  -- on to_city_object_id that steers the planner to
+                  -- usap_rel_by_to_graph and reads every edge.
+                  AND +r.{target_column} IS NOT NULL
                   {type_clause}
                 """
             )
@@ -2434,8 +2546,11 @@ class USAPPackage:
             type_clause = f"AND r.relationship_type_id IN ({placeholders})"
             type_params = list(edge_type_ids)
 
+        # Unary +, as in _one_hop_neighbour_sql: without it the 'out' branch is
+        # planned as a range over usap_rel_by_to_graph instead of a lookup of
+        # its anchor.
         external_clause = (
-            "" if include_external else "AND r.to_city_object_id IS NOT NULL"
+            "" if include_external else "AND +r.to_city_object_id IS NOT NULL"
         )
 
         branches: list[str] = []
@@ -2633,34 +2748,48 @@ class USAPPackage:
             where.append("sc.local_name = ?")
             params.append(semantic_class_local_name)
 
+        # The object filters are an IN over a UNION, not "primary = ? OR
+        # EXISTS (...)": an OR with a correlated EXISTS is evaluated row by
+        # row and scans every annotation, whereas each half of the UNION is
+        # one lookup in usap_annotation_by_primary_object or
+        # usap_annotation_object_by_object. Same match: the primary object,
+        # or any link in usap_annotation_object whatever its relation_type.
         if city_object_id is not None:
             where.append(
                 """
-                (
-                    a.primary_city_object_id = ?
-                    OR EXISTS (
-                        SELECT 1
-                        FROM usap_annotation_object AS ao
-                        WHERE ao.annotation_id = a.annotation_id
-                        AND ao.city_object_id = ?
-                    )
+                a.annotation_id IN (
+                    SELECT x.annotation_id
+                    FROM usap_annotation AS x
+                    WHERE x.primary_city_object_id = ?
+                    UNION
+                    SELECT ao.annotation_id
+                    FROM usap_annotation_object AS ao
+                    WHERE ao.city_object_id = ?
                 )
                 """
             )
             params.extend([city_object_id, city_object_id])
 
+        # object_uid is UNIQUE, so each scalar subquery yields at most one id;
+        # an unknown uid yields NULL, which matches nothing.
         if city_object_uid is not None:
             where.append(
                 """
-                (
-                    primary_co.object_uid = ?
-                    OR EXISTS (
-                        SELECT 1
-                        FROM usap_annotation_object AS ao
-                        JOIN usap_city_object AS linked_co
-                            ON linked_co.city_object_id = ao.city_object_id
-                        WHERE ao.annotation_id = a.annotation_id
-                        AND linked_co.object_uid = ?
+                a.annotation_id IN (
+                    SELECT x.annotation_id
+                    FROM usap_annotation AS x
+                    WHERE x.primary_city_object_id = (
+                        SELECT city_object_id
+                        FROM usap_city_object
+                        WHERE object_uid = ?
+                    )
+                    UNION
+                    SELECT ao.annotation_id
+                    FROM usap_annotation_object AS ao
+                    WHERE ao.city_object_id = (
+                        SELECT city_object_id
+                        FROM usap_city_object
+                        WHERE object_uid = ?
                     )
                 )
                 """
@@ -4659,6 +4788,150 @@ class USAPPackage:
 
         return item
 
+    def _reverse_rows_by_block_start(
+        self,
+        asset_part_id: int,
+        element_kind: int,
+        block_starts: list[int],
+        assessment_id: int | None,
+    ) -> list[sqlite3.Row]:
+        """
+        annotations_for_elements' rows for a dense selection: every block that
+        starts where the selection has indices, in reverse-query order.
+        """
+        assessment_clause = ""
+        assessment_params: tuple[Any, ...] = ()
+
+        if assessment_id is not None:
+            assessment_clause = "AND mb.assessment_id = ?"
+            assessment_params = (assessment_id,)
+
+        # Chunked so a huge selection cannot exceed the SQLite variable limit.
+        # Chunks partition the sorted block_starts, so each block appears once
+        # and the concatenation stays in order.
+        rows: list[sqlite3.Row] = []
+
+        for chunk_index in range(0, len(block_starts), _MAX_SQL_IN_VARS):
+            chunk = block_starts[chunk_index : chunk_index + _MAX_SQL_IN_VARS]
+            placeholders = ",".join("?" for _ in chunk)
+
+            rows.extend(
+                self.conn.execute(
+                    f"""
+                    {_REVERSE_QUERY_ROWS}
+                    WHERE mb.asset_part_id = ?
+                    AND mb.element_kind = ?
+                    AND mb.block_start IN ({placeholders})
+                    {assessment_clause}
+                    ORDER BY
+                        mb.block_start,
+                        mb.annotation_id,
+                        mb.membership_block_id
+                    """,
+                    (
+                        asset_part_id,
+                        element_kind,
+                        *chunk,
+                        *assessment_params,
+                    ),
+                ).fetchall()
+            )
+
+        return rows
+
+    def _reverse_rows_by_range(
+        self,
+        asset_part_id: int,
+        element_kind: int,
+        selected: np.ndarray,
+        offsets_by_block: dict[int, np.ndarray],
+        assessment_id: int | None,
+    ) -> list[sqlite3.Row]:
+        """
+        annotations_for_elements' rows for a sparse selection: only the blocks
+        whose stored [min, max] range contains a selected index.
+
+        A block whose range holds no selected index cannot hold one, so this
+        drops only blocks that would be decoded for nothing -- provided the
+        stored range is the payload's, which validate_report (deep) checks.
+        """
+        # The selection's first and last index in each block it touches;
+        # offsets_by_block holds them sorted.
+        ranges = [
+            (
+                block_start,
+                block_start + int(offsets[0]),
+                block_start + int(offsets[-1]),
+            )
+            for block_start, offsets in sorted(offsets_by_block.items())
+        ]
+
+        # Three variables per row, plus the part, the kind and the assessment.
+        rows_per_query = (_MAX_SQL_IN_VARS - 3) // 3
+        assessment_params = () if assessment_id is None else (assessment_id,)
+        block_ids: list[int] = []
+
+        for chunk_index in range(0, len(ranges), rows_per_query):
+            chunk = ranges[chunk_index : chunk_index + rows_per_query]
+            candidates = self.conn.execute(
+                _candidate_blocks_sql(
+                    len(chunk), by_assessment=assessment_id is not None
+                ),
+                (
+                    *(value for block_range in chunk for value in block_range),
+                    asset_part_id,
+                    element_kind,
+                    *assessment_params,
+                ),
+            ).fetchall()
+
+            if not candidates:
+                continue
+
+            table = np.array([tuple(row) for row in candidates], dtype=np.int64)
+
+            # Exact check, one vectorized search per query: the first selected
+            # index at or after a block's min is inside the block's range iff
+            # it is not past its max. In the selection's own dtype -- searching
+            # with values of another type converts the whole selection, every
+            # call.
+            lows = table[:, 1].astype(selected.dtype)
+            highs = table[:, 2].astype(selected.dtype)
+            first = np.searchsorted(selected, lows)
+            found = first < selected.size
+            keep = np.zeros(len(table), dtype=bool)
+            keep[found] = selected[first[found]] <= highs[found]
+
+            block_ids.extend(table[keep, 0].tolist())
+
+        rows: list[sqlite3.Row] = []
+
+        for chunk_index in range(0, len(block_ids), _MAX_SQL_IN_VARS):
+            chunk = block_ids[chunk_index : chunk_index + _MAX_SQL_IN_VARS]
+            placeholders = ",".join("?" for _ in chunk)
+
+            rows.extend(
+                self.conn.execute(
+                    f"""
+                    {_REVERSE_QUERY_ROWS}
+                    WHERE mb.membership_block_id IN ({placeholders})
+                    """,
+                    chunk,
+                ).fetchall()
+            )
+
+        # The block_start route's order. membership_block_id is the tie-break
+        # between two assessments of one annotation in one block, and decides
+        # which of them is reported first.
+        rows.sort(
+            key=lambda row: (
+                row["block_start"],
+                row["annotation_id"],
+                row["membership_block_id"],
+            )
+        )
+
+        return rows
 
     def annotations_for_elements(
         self,
@@ -4682,10 +4955,18 @@ class USAPPackage:
 
         Pass `assessment` to restrict the search to a single evaluation.
 
-        Optimized version:
-        - groups selected indices by block_start
-        - queries all relevant block_start values in one SQL query
-        - decodes only candidate membership blocks
+        How candidate blocks are chosen. The selection is split by block_start,
+        as on the write path. A sparse selection -- a pick, a lasso -- then goes
+        in two steps: first only the blocks whose stored [min, max] element
+        range contains a selected index, found inside usap_mb_by_element_range
+        without reading a payload; then those blocks' payloads, decoded and
+        intersected. Picking one face no longer decodes every block that
+        merely starts where it does (6,993 for one face of the Catania mesh,
+        two of which hold it). A dense selection, filling at least
+        _DENSE_SELECTION_FRACTION of the blocks it touches, leaves that filter
+        almost nothing to discard, so its blocks are read by block_start in
+        one pass instead. Both routes return the same entries in the same
+        order.
         """
         element_kind = normalize_element_kind(element_kind)
         assessment_id = (
@@ -4701,80 +4982,34 @@ class USAPPackage:
 
         # Same block split as the write path, so a selection the size of the
         # asset costs one pass over an array rather than a Python loop.
-        #
+        offsets_by_block = split_indices_into_blocks(selected, block_size)
+
         # Built as BitMaps once here rather than per row: several annotations
         # share a block_start, and each would otherwise rebuild the same
         # selection bitmap before intersecting it.
         selected_by_block = {
             block_start: BitMap(offsets)
-            for block_start, offsets in split_indices_into_blocks(
-                selected, block_size
-            ).items()
+            for block_start, offsets in offsets_by_block.items()
         }
 
-        block_starts = sorted(selected_by_block)
+        # Decided before any query: deciding on the blocks the prefilter
+        # leaves would mean having paid for the prefilter already.
+        density = selected.size / (len(offsets_by_block) * block_size)
 
-        # Chunked so a huge selection cannot exceed the SQLite variable limit.
-        # Chunks partition block_starts, so each candidate block row appears
-        # exactly once and the merge below is unaffected.
-        rows: list[sqlite3.Row] = []
-
-        assessment_clause = ""
-        assessment_params: tuple[Any, ...] = ()
-
-        if assessment_id is not None:
-            assessment_clause = "AND mb.assessment_id = ?"
-            assessment_params = (assessment_id,)
-
-        for chunk_index in range(0, len(block_starts), _MAX_SQL_IN_VARS):
-            chunk = block_starts[chunk_index : chunk_index + _MAX_SQL_IN_VARS]
-            placeholders = ",".join("?" for _ in chunk)
-
-            rows.extend(
-                self.conn.execute(
-                    f"""
-                    SELECT
-                        mb.annotation_id,
-                        mb.assessment_id,
-                        mb.block_start,
-                        mb.payload,
-
-                        a.annotation_uid,
-                        a.label,
-                        a.status,
-
-                        asm.assessment_uid,
-                        asm.assessed_at,
-
-                        sc.local_name AS semantic_class,
-                        sc.class_uri AS semantic_class_uri,
-
-                        co.object_uid AS primary_city_object_uid,
-                        co.gml_id AS primary_city_object_gml_id
-                    FROM usap_membership_block AS mb
-                    JOIN usap_annotation AS a
-                        ON a.annotation_id = mb.annotation_id
-                    JOIN usap_assessment AS asm
-                        ON asm.assessment_id = mb.assessment_id
-                    JOIN usap_semantic_class AS sc
-                        ON sc.semantic_class_id = a.semantic_class_id
-                    LEFT JOIN usap_city_object AS co
-                        ON co.city_object_id = a.primary_city_object_id
-                    WHERE mb.asset_part_id = ?
-                    AND mb.element_kind = ?
-                    AND mb.block_start IN ({placeholders})
-                    {assessment_clause}
-                    ORDER BY
-                        mb.block_start,
-                        mb.annotation_id
-                    """,
-                    (
-                        asset_part_id,
-                        element_kind,
-                        *chunk,
-                        *assessment_params,
-                    ),
-                ).fetchall()
+        if density >= _DENSE_SELECTION_FRACTION:
+            rows = self._reverse_rows_by_block_start(
+                asset_part_id,
+                element_kind,
+                sorted(offsets_by_block),
+                assessment_id,
+            )
+        else:
+            rows = self._reverse_rows_by_range(
+                asset_part_id,
+                element_kind,
+                selected,
+                offsets_by_block,
+                assessment_id,
             )
 
         # Keyed on (annotation, assessment): one annotation evaluated twice on

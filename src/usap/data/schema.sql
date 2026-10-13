@@ -25,6 +25,10 @@
 --
 -- Indexes are declared immediately after the table they serve.
 
+-- A no-op when USAPPackage.create runs this file: it runs inside a single
+-- transaction, where SQLite ignores this pragma, and USAPPackage enables
+-- foreign keys on every connection it opens anyway. It still applies when the
+-- script is run by hand, e.g. from the sqlite3 shell.
 PRAGMA foreign_keys = ON; -- ensure key consistency between tables (i.e.: prevent operations that would break relationship between tables); need to be declare as it is off by default for backwards compatibility
 
 -- -------------------------------------------------------------------------
@@ -248,6 +252,16 @@ CREATE TABLE usap_city_object (
     attributes_json    TEXT
 );
 
+-- resolve_city_object matches a reference against object_uid OR gml_id. With
+-- only object_uid indexed the OR cannot use any index and every resolution
+-- scans all city objects; with both, SQLite answers with a MULTI-INDEX OR.
+-- Deliberately not UNIQUE: duplicate gml_ids are a validation finding
+-- (DUPLICATE_GML_ID), not something the schema rejects.
+CREATE INDEX usap_city_object_by_gml_id
+ON usap_city_object(
+    gml_id
+);
+
 -- The relationship vocabulary: one row per link *type*, not per spelling.
 --
 -- (local_name, code_space) is the identity, where code_space is the namespace
@@ -398,6 +412,14 @@ ON usap_annotation(
     semantic_class_id
 );
 
+-- Lets "the annotations of this city object" (elements_for_city_object,
+-- list_annotations) reach annotations through their primary object by index
+-- instead of scanning every annotation.
+CREATE INDEX usap_annotation_by_primary_object
+ON usap_annotation(
+    primary_city_object_id
+);
+
 CREATE TABLE usap_annotation_object (
     annotation_id   INTEGER NOT NULL
         REFERENCES usap_annotation(annotation_id)
@@ -411,6 +433,16 @@ CREATE TABLE usap_annotation_object (
 
     PRIMARY KEY(annotation_id, city_object_id, relation_type)
 ) WITHOUT ROWID;
+
+-- The primary key is ordered by annotation_id and answers annotation ->
+-- objects only. This answers object -> annotations, optionally for one
+-- relation_type: the direction elements_for_city_object and list_annotations
+-- need.
+CREATE INDEX usap_annotation_object_by_object
+ON usap_annotation_object(
+    city_object_id,
+    relation_type
+);
 
 -- One dated evaluation of an annotation against one 3D asset.
 --
@@ -522,13 +554,16 @@ ON usap_membership_block(
     block_start
 );
 
--- Serves the reverse element query (annotations_for_elements) and the
--- ON DELETE CASCADE scan from usap_asset_part.
-CREATE INDEX usap_mb_by_element_block
+-- Serves the reverse element query (annotations_for_elements), including the
+-- min/max prefilter entirely inside the index, and the ON DELETE CASCADE scan
+-- from usap_asset_part.
+CREATE INDEX usap_mb_by_element_range
 ON usap_membership_block(
     asset_part_id,
     element_kind,
-    block_start
+    block_start,
+    min_element_index,
+    max_element_index
 );
 
 -- Per-element value fields: dense scalar arrays over an asset part's

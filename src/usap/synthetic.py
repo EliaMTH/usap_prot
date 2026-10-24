@@ -182,10 +182,10 @@ def create_synthetic_package(
                 )
 
                 # core:boundary is the CityGML 3.0 property that makes a
-                # surface part of a space. The code space and category are
-                # given explicitly because a synthetic package has no ontology
-                # behind it: without a category these edges would register
-                # unclassified and the building would report no parts.
+                # surface part of a space. create() registers it as
+                # containment already; stating the category anyway makes it
+                # the generator's own declaration, so the parts it builds do
+                # not depend on the defaults table.
                 for surface_id in (roof_id, wall_id, ground_id):
                     pkg.link_city_objects(
                         building_id,

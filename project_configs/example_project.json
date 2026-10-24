@@ -6,6 +6,7 @@
   "vocabularies": [
     "../src/usap/data/vocabularies/usap_ade_prototype.json"
   ],
+  "_comment_relationship_types": "Optional. Every package is created with a default category for the 35 CityGML 3.0 relation properties (REFERENCE.md, 'The CityGML 3.0 defaults'); an entry here replaces that default, and classifies any other link type (CityGML 2.0, ADE properties). The two entries below restate defaults and are kept as an example of the format. A category contradicting another declaration -- an ontology's usap:category, say -- still raises.",
   "relationship_types": [
     {
       "local_name": "boundary",

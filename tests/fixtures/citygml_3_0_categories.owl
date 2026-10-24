@@ -4,9 +4,10 @@
 
   This is the shape a real deployment writes. The properties are CityGML's own,
   identified by the namespace the .gml uses, and the single thing asserted over
-  them is usap:category — which no CityGML artifact carries, so somebody has to
-  say it. In a real stack these assertions live next to the properties they
-  describe, in an ADE that imports CityGML.
+  them is usap:category. A package already carries USAP's CityGML 3.0 defaults;
+  an overlay like this one is how a deployment classifies anything else, or
+  reads one of those properties differently. In a real stack these assertions
+  live next to the properties they describe, in an ADE that imports CityGML.
 -->
 <rdf:RDF
     xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"

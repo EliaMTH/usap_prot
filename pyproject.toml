@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "usap"
-version = "0.6.0"
+version = "0.6.1"
 description = "Urban Semantic Annotation Package phase-1 prototype"
 requires-python = ">=3.11"
 dependencies = [
@@ -42,7 +42,10 @@ where = ["src"]
 #
 # CityGML concepts are deliberately NOT here. They are read from the OGC XSDs
 # or an ontology the caller supplies (load_citygml_schema / load_ontology), so
-# USAP ships no assertion of its own about what CityGML contains.
+# USAP ships no assertion of its own about which classes CityGML contains. The
+# one CityGML statement it does ship -- the default category of the 35 CityGML
+# 3.0 relation properties -- is code (constants.py), not data, and every
+# package can override it.
 [tool.setuptools.package-data]
 usap = ["data/schema.sql", "data/vocabularies/*.json"]
 

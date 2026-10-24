@@ -98,9 +98,10 @@ def main() -> None:
         # ------------------------------------------------------------
         # The link type is the CityGML property the edge stands for, with the
         # namespace that gives it identity. `category` says what the link
-        # *means* for traversal — no CityGML artifact states that, so the
-        # builder does. Without it the edge is still recorded and queryable by
-        # name, but the roof is not reported as part of the building.
+        # *means* for traversal. boundary already arrives as containment, one
+        # of the CityGML 3.0 defaults create() registers; stating it here turns
+        # that default into the builder's own declaration, which a later,
+        # different one cannot silently replace.
         pkg.link_city_objects(
             building_id,
             roof_id,

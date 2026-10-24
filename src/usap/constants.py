@@ -156,6 +156,11 @@ CITY_OBJECT_ROOT_LOCAL_NAME = "AbstractCityObject"
 CITYGML_3_0_CORE_NS = "http://www.opengis.net/citygml/3.0"
 CITYGML_3_0_BUILDING_NS = "http://www.opengis.net/citygml/building/3.0"
 CITYGML_3_0_CONSTRUCTION_NS = "http://www.opengis.net/citygml/construction/3.0"
+CITYGML_3_0_BRIDGE_NS = "http://www.opengis.net/citygml/bridge/3.0"
+CITYGML_3_0_TUNNEL_NS = "http://www.opengis.net/citygml/tunnel/3.0"
+CITYGML_3_0_TRANSPORTATION_NS = "http://www.opengis.net/citygml/transportation/3.0"
+CITYGML_3_0_RELIEF_NS = "http://www.opengis.net/citygml/relief/3.0"
+CITYGML_3_0_CITYOBJECTGROUP_NS = "http://www.opengis.net/citygml/cityobjectgroup/3.0"
 
 # The handful of classes the synthetic generator and the examples create
 # directly. Same identity load_citygml_schema derives, so the two agree and
@@ -205,6 +210,96 @@ RELATIONSHIP_CATEGORIES = (
 
 # What "this object and its parts" means when a query does not say otherwise.
 DEFAULT_TRAVERSAL_CATEGORIES = ("containment",)
+
+# The category of every CityGML 3.0 property that links a city object to a
+# city object: 35 of them, read from the OGC 21-006r2 schemas. USAPPackage.
+# create registers them, so a CityGML 3.0 import is classified without anyone
+# asserting it, and register_default_relationship_types adds them to a package
+# created before 0.6.1.
+#
+# Defaults, not policy. Each row they create is marked in its metadata_json
+# (RELATIONSHIP_CATEGORY_SOURCE_KEY below), and the first explicit declaration
+# -- a config's relationship_types, an ontology's usap:category, a call to
+# register_relationship_type -- replaces it. Two explicit declarations that
+# disagree still raise.
+#
+# Where the conceptual model marks the association as an aggregation, shared or
+# composite (in the XSD: a property type extending gml:AbstractFeatureMemberType),
+# the category is containment. Where it does not, the category is USAP's
+# reading:
+#
+#   boundary, filling,     plain associations, read as containment: the
+#   fillingSurface         surfaces bounding a space, and a wall's openings,
+#                          are its parts
+#   storey, buildingUnit   plain, linking Storey and BuildingUnit both ways;
+#                          as containment they would form a cycle
+#   predecessor, successor references along a traffic network: peer
+#   relatedTo              peer. An objectified CityObjectRelation carrying a
+#                          relationType is typed by that value instead, which
+#                          this table does not cover
+#   generalizesTo          generalization
+#   groupMember, parent    grouping
+#
+# A type's identity is its QName, not the class declaring it. buildingRoom and
+# buildingConstructiveElement are aggregations from AbstractBuilding and plain
+# from AbstractBuildingSubdivision, so containment covers both: a room is part
+# of its building and of its storey (reached twice, returned once).
+#
+# Keyed on the namespace each property is declared in, which is the code space
+# an import records. An edge from a CityGML 2.0 document keeps its 2.0
+# namespace and is not covered.
+CITYGML_3_0_RELATIONSHIP_CATEGORIES: tuple[tuple[str, str, str], ...] = (
+    # core
+    ("boundary", CITYGML_3_0_CORE_NS, "containment"),
+    ("relatedTo", CITYGML_3_0_CORE_NS, "peer"),
+    ("generalizesTo", CITYGML_3_0_CORE_NS, "generalization"),
+    # construction
+    ("filling", CITYGML_3_0_CONSTRUCTION_NS, "containment"),
+    ("fillingSurface", CITYGML_3_0_CONSTRUCTION_NS, "containment"),
+    # building
+    ("buildingPart", CITYGML_3_0_BUILDING_NS, "containment"),
+    ("buildingRoom", CITYGML_3_0_BUILDING_NS, "containment"),
+    ("buildingInstallation", CITYGML_3_0_BUILDING_NS, "containment"),
+    ("buildingConstructiveElement", CITYGML_3_0_BUILDING_NS, "containment"),
+    ("buildingFurniture", CITYGML_3_0_BUILDING_NS, "containment"),
+    ("buildingSubdivision", CITYGML_3_0_BUILDING_NS, "containment"),
+    ("buildingUnit", CITYGML_3_0_BUILDING_NS, "peer"),
+    ("storey", CITYGML_3_0_BUILDING_NS, "peer"),
+    # bridge
+    ("bridgePart", CITYGML_3_0_BRIDGE_NS, "containment"),
+    ("bridgeRoom", CITYGML_3_0_BRIDGE_NS, "containment"),
+    ("bridgeInstallation", CITYGML_3_0_BRIDGE_NS, "containment"),
+    ("bridgeConstructiveElement", CITYGML_3_0_BRIDGE_NS, "containment"),
+    ("bridgeFurniture", CITYGML_3_0_BRIDGE_NS, "containment"),
+    # tunnel
+    ("tunnelPart", CITYGML_3_0_TUNNEL_NS, "containment"),
+    ("hollowSpace", CITYGML_3_0_TUNNEL_NS, "containment"),
+    ("tunnelInstallation", CITYGML_3_0_TUNNEL_NS, "containment"),
+    ("tunnelConstructiveElement", CITYGML_3_0_TUNNEL_NS, "containment"),
+    ("tunnelFurniture", CITYGML_3_0_TUNNEL_NS, "containment"),
+    # transportation
+    ("section", CITYGML_3_0_TRANSPORTATION_NS, "containment"),
+    ("intersection", CITYGML_3_0_TRANSPORTATION_NS, "containment"),
+    ("trafficSpace", CITYGML_3_0_TRANSPORTATION_NS, "containment"),
+    ("auxiliaryTrafficSpace", CITYGML_3_0_TRANSPORTATION_NS, "containment"),
+    ("clearanceSpace", CITYGML_3_0_TRANSPORTATION_NS, "containment"),
+    ("hole", CITYGML_3_0_TRANSPORTATION_NS, "containment"),
+    ("marking", CITYGML_3_0_TRANSPORTATION_NS, "containment"),
+    ("predecessor", CITYGML_3_0_TRANSPORTATION_NS, "peer"),
+    ("successor", CITYGML_3_0_TRANSPORTATION_NS, "peer"),
+    # relief
+    ("reliefComponent", CITYGML_3_0_RELIEF_NS, "containment"),
+    # cityobjectgroup
+    ("groupMember", CITYGML_3_0_CITYOBJECTGROUP_NS, "grouping"),
+    ("parent", CITYGML_3_0_CITYOBJECTGROUP_NS, "grouping"),
+)
+
+# The metadata_json key, and its value, marking a category as one of the
+# defaults above rather than a declaration. Only register_default_relationship_
+# types writes it, so a category anyone declared -- and every row of a package
+# created before 0.6.1 -- is unmarked and is never replaced.
+RELATIONSHIP_CATEGORY_SOURCE_KEY = "usap:category_source"
+RELATIONSHIP_CATEGORY_SOURCE_DEFAULT = "default"
 
 # Which way an edge is followed. Edges are directed but not hierarchical, so
 # the direction is a query argument rather than a property of the data:

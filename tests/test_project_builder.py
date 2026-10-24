@@ -318,6 +318,71 @@ def test_vocabulary_folder_matches_the_key_by_key_form(tmp_path: Path) -> None:
     assert {"Building", "SolarPanel"} <= from_folder
 
 
+STOREY_CITYGML = """<?xml version="1.0" encoding="UTF-8"?>
+<core:CityModel
+    xmlns:core="http://www.opengis.net/citygml/3.0"
+    xmlns:gml="http://www.opengis.net/gml/3.2"
+    xmlns:bldg="http://www.opengis.net/citygml/building/3.0"
+    xmlns:xlink="http://www.w3.org/1999/xlink">
+  <core:cityObjectMember>
+    <bldg:Building gml:id="building_1">
+      <bldg:buildingSubdivision>
+        <bldg:Storey gml:id="storey_1">
+          <bldg:buildingUnit xlink:href="#unit_1"/>
+        </bldg:Storey>
+      </bldg:buildingSubdivision>
+      <bldg:buildingSubdivision>
+        <bldg:BuildingUnit gml:id="unit_1">
+          <bldg:storey xlink:href="#storey_1"/>
+        </bldg:BuildingUnit>
+      </bldg:buildingSubdivision>
+    </bldg:Building>
+  </core:cityObjectMember>
+</core:CityModel>
+"""
+
+
+def test_a_config_category_wins_over_the_citygml_defaults(tmp_path: Path) -> None:
+    # Every package is born with storey = peer, a CityGML 3.0 default. A
+    # config reading it as containment must build, and keep its reading: the
+    # defaults are a starting point, never a reason to refuse a declaration.
+    bldg = "http://www.opengis.net/citygml/building/3.0"
+    citygml_path = tmp_path / "storeys.gml"
+    citygml_path.write_text(STOREY_CITYGML, encoding="utf-8")
+    db_path = tmp_path / "storeys.usap.gpkg"
+
+    config = {
+        "db_path": str(db_path),
+        "citygml_schema": str(CITYGML_SCHEMA_FIXTURE),
+        "relationship_types": [
+            {"local_name": "storey", "code_space": bldg, "category": "containment"},
+        ],
+        "citygml": {"path": str(citygml_path)},
+    }
+
+    build_project_package(config, base_dir=tmp_path)
+
+    # Re-applying the same config is a repetition, not a contradiction.
+    build_project_package(config, base_dir=tmp_path, update=True)
+
+    with USAPPackage.open(db_path) as pkg:
+        types = {
+            (t["local_name"], t["code_space"]): t
+            for t in pkg.list_relationship_types()
+        }
+
+        assert types[("storey", bldg)]["category"] == "containment"
+        assert types[("storey", bldg)]["metadata_json"] is None
+        assert types[("buildingUnit", bldg)]["category"] == "peer"
+
+        # The unit's storey is one of its parts now, and nothing is a cycle.
+        assert {
+            row["object_uid"]
+            for row in pkg.list_city_objects(descendants_of="unit_1")
+        } == {"unit_1", "storey_1"}
+        assert pkg.validate_report().is_ok
+
+
 def test_unrecognised_config_keys_are_refused(tmp_path: Path) -> None:
     # The failure this exists for: 'annotation_batch' for 'annotation_batches'
     # built a package with zero annotations, exit code 0, and a clean

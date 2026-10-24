@@ -274,12 +274,14 @@ def _validate_relationship_types(
     target is not in this package.
 
     Both are warnings, and both exist so that an accepted consequence of the
-    design stays *visible*. USAP ships no link vocabulary: an import registers
-    whatever types the document uses, and until something supplies a category
-    those edges are stored and queryable by name but sit outside the default
-    "and its parts" traversal. That must be reported, never silent — a
-    descendants query quietly returning the root alone is the failure mode this
-    check exists to prevent.
+    design stays *visible*. USAP classifies only the 35 CityGML 3.0 relation
+    properties, as defaults registered at create(). Anything else an import
+    meets -- a CityGML 2.0 or ADE property, a relationType value -- registers
+    unclassified, and until something supplies a category its edges are stored
+    and queryable by name but sit outside the default "and its parts"
+    traversal. So does every type of a package created before the defaults.
+    That must be reported, never silent — a descendants query quietly
+    returning the root alone is the failure mode this check exists to prevent.
     """
     unclassified = conn.execute(
         """

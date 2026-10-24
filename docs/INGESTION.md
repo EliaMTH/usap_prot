@@ -27,14 +27,16 @@ A CityGML source may contain its own geometry, but this workflow does not copy o
 ---
 ## Procedure 1 — init from 3D assets + CityGML + linking JSON
 
-City-object names in the linking JSON are the **`gml:id` values** from the CityGML file. Objects, their classes, and their relationships come from the CityGML import — which needs `citygml_schema` in the config, since USAP ships no CityGML vocabulary, and a `relationship_types` block to say which links mean *part of*; the linking JSON only states which elements in the registered operational assets correspond to which authoritative city object.
+City-object names in the linking JSON are the **`gml:id` values** from the CityGML file. Objects, their classes, and their relationships come from the CityGML import — which needs `citygml_schema` in the config, since USAP ships no CityGML vocabulary. Which links mean *part of* needs nothing: the package is created with a category for each of the 35 CityGML 3.0 relation properties. The linking JSON only states which elements in the registered operational assets correspond to which authoritative city object.
 
-The block below declares one type because a LOD1 building model produces one.
-For the full CityGML 3.0 mapping — which of the thirteen relation properties
-mean *part of*, and which are peers, generalizations or groupings — see
-REFERENCE.md → *City object relationships* → **What to assert, for CityGML
-3.0**. Declaring a type your documents never use is harmless; omitting one they
-do use leaves those edges unclassified, so "and its parts" silently skips them.
+The `relationship_types` block is optional. It declares what your data reads
+differently from the defaults, and classifies link types outside them (a
+CityGML 2.0 or ADE property); the entry below restates a default and changes
+nothing. For the 35 — which mean *part of*, and which are peers,
+generalizations or groupings — see REFERENCE.md → *City object* → **The
+CityGML 3.0 defaults**. A link type neither covered nor declared stays
+unclassified: its edges are stored, "and its parts" skips them, and validation
+warns `UNCLASSIFIED_RELATIONSHIP_TYPE`.
 
 `project.json`:
 ```json
@@ -212,7 +214,7 @@ unnoticed.
 | Operational 3D assets (LAS, mesh) | element counts + part structure (the index space), optional SHA-256 + bounds | URI, hash, parts, counts — never geometry |
 | CityGML | object identity, class, typed relationships (inline, xlink, or objectified), and source provenance | mirrored ids/classes/edges — any CityGML geometry and authoritative object attributes remain only in the source |
 | CityGML XSDs | concept identity + `substitutionGroup` hierarchy | `usap_semantic_class` + hierarchy closure |
-| `relationship_types` config / ontology | which link types mean part-of | `usap_relationship_type.category` |
+| `relationship_types` config / ontology | which link types mean part-of, over the CityGML 3.0 defaults `create` registers | `usap_relationship_type.category` |
 | Vocabulary JSON | accepted ADE/local concepts (+ parent links) | `usap_semantic_class` + hierarchy closure |
 | Linking JSON | claims connecting objects/concepts to asset elements (+ optional value fields) | compressed membership/value blocks and annotation records |
 

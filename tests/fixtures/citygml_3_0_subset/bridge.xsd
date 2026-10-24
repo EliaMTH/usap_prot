@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Test fixture: subset of the OGC CityGML 3.0 bridge schema.
+
+  The bridge module mirrors building: AbstractBridge is a construction, a
+  BridgeRoom is an unoccupied space, and the installations, constructive
+  elements and furniture substitute the construction module's abstract
+  classes. Enough for an import to reach a bridge's parts and rooms.
+-->
+<schema xmlns="http://www.w3.org/2001/XMLSchema"
+        xmlns:brid="http://www.opengis.net/citygml/bridge/3.0"
+        xmlns:con="http://www.opengis.net/citygml/construction/3.0"
+        xmlns:core="http://www.opengis.net/citygml/3.0"
+        elementFormDefault="qualified"
+        targetNamespace="http://www.opengis.net/citygml/bridge/3.0"
+        version="3.0.0">
+
+  <import namespace="http://www.opengis.net/citygml/3.0" schemaLocation="core.xsd"/>
+  <import namespace="http://www.opengis.net/citygml/construction/3.0" schemaLocation="construction.xsd"/>
+
+  <element abstract="true" name="AbstractBridge" substitutionGroup="con:AbstractConstruction" type="anyType"/>
+
+  <element name="Bridge" substitutionGroup="brid:AbstractBridge" type="anyType"/>
+  <element name="BridgePart" substitutionGroup="brid:AbstractBridge" type="anyType"/>
+  <element name="BridgeRoom" substitutionGroup="core:AbstractUnoccupiedSpace" type="anyType"/>
+  <element name="BridgeConstructiveElement" substitutionGroup="con:AbstractConstructiveElement" type="anyType"/>
+  <element name="BridgeInstallation" substitutionGroup="con:AbstractInstallation" type="anyType"/>
+  <element name="BridgeFurniture" substitutionGroup="con:AbstractFurniture" type="anyType"/>
+</schema>

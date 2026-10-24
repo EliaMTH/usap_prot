@@ -26,6 +26,7 @@ CORE_NS = "http://www.opengis.net/citygml/3.0"
 BLDG_NS = "http://www.opengis.net/citygml/building/3.0"
 CON_NS = "http://www.opengis.net/citygml/construction/3.0"
 TRAN_NS = "http://www.opengis.net/citygml/transportation/3.0"
+BLDG_2_0_NS = "http://www.opengis.net/citygml/building/2.0"
 
 
 def _graph(pkg: USAPPackage) -> dict[str, int]:
@@ -255,14 +256,19 @@ def test_external_target_is_stored_and_only_visible_as_an_edge(
 
 
 def test_registering_is_idempotent_and_enriching(pkg: USAPPackage) -> None:
-    first = pkg.register_relationship_type("boundary", code_space=CORE_NS)
+    # A CityGML 2.0 property: outside the 3.0 defaults, so it starts
+    # unclassified, as anything an import meets for the first time does.
+    first = pkg.register_relationship_type("boundedBy", code_space=BLDG_2_0_NS)
 
-    assert pkg.register_relationship_type("boundary", code_space=CORE_NS) == first
+    assert (
+        pkg.register_relationship_type("boundedBy", code_space=BLDG_2_0_NS)
+        == first
+    )
 
     # A category arriving later is filled in, so a package can be classified
     # after its edges already exist.
     pkg.register_relationship_type(
-        "boundary", code_space=CORE_NS, category="containment"
+        "boundedBy", code_space=BLDG_2_0_NS, category="containment"
     )
 
     types = {
@@ -270,12 +276,12 @@ def test_registering_is_idempotent_and_enriching(pkg: USAPPackage) -> None:
         for t in pkg.list_relationship_types()
     }
 
-    assert types[("boundary", CORE_NS)]["category"] == "containment"
+    assert types[("boundedBy", BLDG_2_0_NS)]["category"] == "containment"
 
     # Contradicting it does not silently win.
     with pytest.raises(USAPError, match="cannot re-register"):
         pkg.register_relationship_type(
-            "boundary", code_space=CORE_NS, category="peer"
+            "boundedBy", code_space=BLDG_2_0_NS, category="peer"
         )
 
 
@@ -297,7 +303,10 @@ def test_same_name_in_two_code_spaces_stays_distinct(pkg: USAPPackage) -> None:
         )
 
 
-def test_list_relationship_types_counts_edges(pkg: USAPPackage) -> None:
+def test_list_relationship_types_counts_edges(bare_pkg: USAPPackage) -> None:
+    # Without the CityGML 3.0 defaults, so the listing holds exactly what
+    # this test registered.
+    pkg = bare_pkg
     _graph(pkg)
     pkg.register_relationship_type("neverUsed", code_space=CORE_NS)
 
@@ -334,7 +343,9 @@ def test_type_cache_is_dropped_when_a_transaction_rolls_back(
             )
             raise RuntimeError("caller fails after linking")
 
-    assert pkg.list_relationship_types() == []
+    assert "provisional" not in {
+        t["local_name"] for t in pkg.list_relationship_types()
+    }
 
     # The same name must register cleanly afterwards.
     pkg.link_city_objects(

@@ -65,6 +65,10 @@ Method map (matches the ``# ---`` section banners below):
     Semantic classes ........... create_semantic_class (+ closure maintenance)
     City objects and graph ..... create_city_object, link_city_objects,
                                   list_city_objects
+    Relationship types ......... register_relationship_type,
+                                  register_default_relationship_types (the
+                                  CityGML 3.0 categories create() registers),
+                                  resolve/list_relationship_types
     Annotations ................ get/list/update/delete_annotation,
                                   create_annotation, link_annotation_to_object
     Membership editing ......... replace_annotation_membership (+ validation)
@@ -91,6 +95,7 @@ import sqlite3
 from collections import defaultdict
 from contextlib import contextmanager
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import json
@@ -105,6 +110,7 @@ from .errors import USAPAmbiguityError, USAPError
 from .constants import (
     ANNOTATION_STATUSES,
     CITY_OBJECT_STATUSES,
+    CITYGML_3_0_RELATIONSHIP_CATEGORIES,
     CONFIDENCE_RANGE,
     CURRENT_PROFILE_VERSION,
     DEFAULT_BLOCK_SIZE,
@@ -114,6 +120,8 @@ from .constants import (
     DEFAULT_VALUE_DTYPE,
     PATH_ENCODING,
     RELATIONSHIP_CATEGORIES,
+    RELATIONSHIP_CATEGORY_SOURCE_DEFAULT,
+    RELATIONSHIP_CATEGORY_SOURCE_KEY,
     RELATIONSHIP_DIRECTIONS,
     SUPPORTED_PROFILE_VERSIONS,
     VALUE_BLOCK_ENCODING,
@@ -538,6 +546,88 @@ def _check_value_cast(
                 )
 
 
+# A link type's category may be one of the shipped CityGML 3.0 defaults or a
+# declaration, and only a default gives way to a later declaration. Which one
+# it is lives in usap_relationship_type.metadata_json, an existing column, so
+# the defaults cost no schema change. The helpers below are the only readers
+# and writers of that marker.
+
+
+def _metadata_object(metadata_json: str | None) -> dict[str, Any] | None:
+    """metadata_json as a JSON object: {} for NULL, None if it is not one."""
+    if metadata_json is None:
+        return {}
+
+    try:
+        value = json.loads(metadata_json)
+    except (TypeError, ValueError):
+        return None
+
+    return value if isinstance(value, dict) else None
+
+
+def _is_default_category(metadata_json: str | None) -> bool:
+    data = _metadata_object(metadata_json)
+
+    return bool(data) and (
+        data.get(RELATIONSHIP_CATEGORY_SOURCE_KEY)
+        == RELATIONSHIP_CATEGORY_SOURCE_DEFAULT
+    )
+
+
+def _with_default_marker(metadata_json: str | None) -> str | None:
+    """
+    metadata_json with the default marker added, or None when it holds
+    something other than a JSON object: that is the caller's data, not ours to
+    replace, so such a row takes its category unmarked.
+    """
+    data = _metadata_object(metadata_json)
+
+    if data is None:
+        return None
+
+    data[RELATIONSHIP_CATEGORY_SOURCE_KEY] = RELATIONSHIP_CATEGORY_SOURCE_DEFAULT
+
+    return json.dumps(data)
+
+
+def _without_default_marker(metadata_json: str | None) -> str | None:
+    """metadata_json without the default marker; NULL if nothing else is left."""
+    data = _metadata_object(metadata_json) or {}
+    data.pop(RELATIONSHIP_CATEGORY_SOURCE_KEY, None)
+
+    return json.dumps(data) if data else None
+
+
+@dataclass(frozen=True)
+class KeptRelationshipCategory:
+    """
+    A default register_default_relationship_types did not apply: the package
+    already gives the link type another category, and keeps it.
+    """
+
+    local_name: str
+    code_space: str
+    category: str
+    default_category: str
+
+
+@dataclass(frozen=True)
+class DefaultRelationshipTypesResult:
+    """
+    What register_default_relationship_types changed.
+
+        registered  (local_name, code_space) of the link types the package
+                    did not have, added with their default category
+        classified  those it had without a category, given the default
+        kept        those it gives another category, left as they are
+    """
+
+    registered: tuple[tuple[str, str], ...]
+    classified: tuple[tuple[str, str], ...]
+    kept: tuple[KeptRelationshipCategory, ...]
+
+
 class USAPPackage:
     """
     Tiny phase-1 USAP SDK. It controls common database edits and queries.
@@ -615,6 +705,8 @@ class USAPPackage:
         overwrite: bool = False,
         profile_version: str = CURRENT_PROFILE_VERSION,
         package_iri: str | None = None,
+        *,
+        default_relationship_types: bool = True,
     ) -> "USAPPackage":
         """
         Create a new package.
@@ -624,6 +716,13 @@ class USAPPackage:
         domain, registry, or namespace to be valid — so the caller never has to
         supply one. Pass an explicit IRI only to adopt an identity that already
         exists elsewhere.
+
+        default_relationship_types registers the category of the 35 CityGML
+        3.0 relation properties (see register_default_relationship_types), in
+        the same transaction as the schema, so an imported CityGML 3.0 edge is
+        classified without anyone asserting it. They are defaults: any explicit
+        declaration replaces one. False creates the package as 0.6.0 did, with
+        an empty link vocabulary.
         """
         db_path = Path(db_path)
         schema_path = Path(schema_path)
@@ -689,6 +788,12 @@ class USAPPackage:
                         None,
                     ),
                 )
+
+                # Rows, not schema: schema.sql and so the profile version are
+                # untouched, and a package created without them is still a
+                # valid one (register_default_relationship_types adds them).
+                if default_relationship_types:
+                    pkg.register_default_relationship_types()
         except BaseException:
             pkg.conn.close()
             if db_path.exists():
@@ -1922,8 +2027,15 @@ class USAPPackage:
 
         Idempotent and enriching, like create_semantic_class: a category that
         is still NULL is filled in by a later call, so a package can be
-        classified after the edges already exist. A *different* non-NULL
-        category is a contradiction and raises rather than being overwritten.
+        classified after the edges already exist.
+
+        A category that came from the CityGML 3.0 defaults (see
+        register_default_relationship_types) gives way to the first explicit
+        one: a different category replaces it, the same one confirms it, and
+        either way the type is declared from then on. A *different* non-NULL
+        category against a declared one is a contradiction and raises rather
+        than being overwritten, so two declarations that disagree raise in
+        whichever order they arrive.
 
         code_space is the namespace the property came from. Leaving it NULL is
         allowed but weakens the package: 'boundedBy' with no namespace cannot
@@ -1939,7 +2051,7 @@ class USAPPackage:
 
         existing = self.conn.execute(
             """
-            SELECT relationship_type_id, category
+            SELECT relationship_type_id, category, metadata_json
             FROM usap_relationship_type
             WHERE local_name = ?
               AND COALESCE(code_space, '') = ?
@@ -1949,25 +2061,52 @@ class USAPPackage:
 
         if existing is not None:
             type_id = int(existing["relationship_type_id"])
+            stored = existing["category"]
 
-            if category is not None and existing["category"] != category:
-                if existing["category"] is not None:
+            if category is not None:
+                is_default = _is_default_category(existing["metadata_json"])
+
+                if stored is not None and stored != category and not is_default:
                     raise USAPError(
                         f"Relationship type {local_name!r} is already "
-                        f"{existing['category']!r}, cannot re-register it as "
-                        f"{category!r}. Registering fills in a missing "
-                        "category; it does not overwrite one."
+                        f"{stored!r}, cannot re-register it as {category!r}. "
+                        "Registering fills in a missing category, or replaces "
+                        "a CityGML 3.0 default once; it does not overwrite a "
+                        "declared one."
                     )
 
-                with self.transaction():
-                    self.conn.execute(
-                        """
-                        UPDATE usap_relationship_type
-                        SET category = ?
-                        WHERE relationship_type_id = ?
-                        """,
-                        (category, type_id),
-                    )
+                if stored is None or is_default:
+                    with self.transaction():
+                        self.conn.execute(
+                            """
+                            UPDATE usap_relationship_type
+                            SET category = ?,
+                                metadata_json = ?
+                            WHERE relationship_type_id = ?
+                            """,
+                            (
+                                category,
+                                _without_default_marker(existing["metadata_json"])
+                                if is_default
+                                else existing["metadata_json"],
+                                type_id,
+                            ),
+                        )
+
+                        # Replacing a default changes what every edge of the
+                        # type means to the default traversal; confirming one
+                        # changes whether a later declaration may still do so.
+                        if is_default and stored is not None:
+                            self.log_edit(
+                                "override_default_relationship_category"
+                                if stored != category
+                                else "confirm_default_relationship_category",
+                                "usap_relationship_type",
+                                type_id,
+                                details_json=json.dumps(
+                                    {"default": stored, "category": category}
+                                ),
+                            )
 
             self._relationship_type_cache[cache_key] = type_id
 
@@ -1997,6 +2136,112 @@ class USAPPackage:
         self._relationship_type_cache[cache_key] = type_id
 
         return type_id
+
+    def register_default_relationship_types(
+        self,
+    ) -> DefaultRelationshipTypesResult:
+        """
+        Give this package the category of the 35 CityGML 3.0 relation
+        properties (constants.CITYGML_3_0_RELATIONSHIP_CATEGORIES).
+
+        create() already does this, so a new package needs nothing more. This
+        is for a package created before 0.6.1, or with
+        default_relationship_types=False.
+
+        It only fills. A type the package lacks is added, a type it has with
+        no category gets the default, and a type it already classifies keeps
+        its category. One that differs from the default is reported in the
+        result's `kept` rather than raised, so a single disagreement does not
+        block the rest.
+
+        What it writes is marked as a default in metadata_json, which is what
+        lets a later explicit declaration replace it once (see
+        register_relationship_type). Idempotent, and one transaction.
+        """
+        registered: list[tuple[str, str]] = []
+        classified: list[tuple[str, str]] = []
+        kept: list[KeptRelationshipCategory] = []
+
+        with self.transaction():
+            for local_name, code_space, category in (
+                CITYGML_3_0_RELATIONSHIP_CATEGORIES
+            ):
+                existing = self.conn.execute(
+                    """
+                    SELECT relationship_type_id, category, metadata_json
+                    FROM usap_relationship_type
+                    WHERE local_name = ?
+                      AND COALESCE(code_space, '') = ?
+                    """,
+                    (local_name, code_space),
+                ).fetchone()
+
+                if existing is None:
+                    cur = self.conn.execute(
+                        """
+                        INSERT INTO usap_relationship_type (
+                            local_name,
+                            code_space,
+                            category,
+                            metadata_json
+                        )
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            local_name,
+                            code_space,
+                            category,
+                            _with_default_marker(None),
+                        ),
+                    )
+                    self._relationship_type_cache[(local_name, code_space)] = (
+                        require_lastrowid(cur)
+                    )
+                    registered.append((local_name, code_space))
+                elif existing["category"] is None:
+                    # COALESCE: metadata that is not a JSON object stays as it
+                    # is, and the category goes in unmarked.
+                    self.conn.execute(
+                        """
+                        UPDATE usap_relationship_type
+                        SET category = ?,
+                            metadata_json = COALESCE(?, metadata_json)
+                        WHERE relationship_type_id = ?
+                        """,
+                        (
+                            category,
+                            _with_default_marker(existing["metadata_json"]),
+                            int(existing["relationship_type_id"]),
+                        ),
+                    )
+                    classified.append((local_name, code_space))
+                elif existing["category"] != category:
+                    kept.append(
+                        KeptRelationshipCategory(
+                            local_name=local_name,
+                            code_space=code_space,
+                            category=existing["category"],
+                            default_category=category,
+                        )
+                    )
+
+            if registered or classified:
+                self.log_edit(
+                    "register_default_relationship_types",
+                    "usap_relationship_type",
+                    details_json=json.dumps(
+                        {
+                            "registered": len(registered),
+                            "classified": len(classified),
+                        }
+                    ),
+                )
+
+        return DefaultRelationshipTypesResult(
+            registered=tuple(registered),
+            classified=tuple(classified),
+            kept=tuple(kept),
+        )
 
     def resolve_relationship_type(
         self,

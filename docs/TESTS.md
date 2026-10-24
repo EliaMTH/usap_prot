@@ -13,10 +13,14 @@ python -m pytest
 
 - `SCHEMA_PATH` — the packaged `src/usap/data/schema.sql` (re-exported from
   `usap.DEFAULT_SCHEMA_PATH`, so the suite passes against an installed wheel).
-- `make_pkg(tmp_path, name=...)` — create a fresh empty package.
+- `make_pkg(tmp_path, name=..., default_relationship_types=True)` — create a
+  fresh package: no concepts, no objects, and the CityGML 3.0 link categories
+  `create()` registers. `default_relationship_types=False` gives the empty link
+  vocabulary of a package created before 0.6.1.
 - `make_mesh_part(pkg, element_count=...)` — register a bare mesh asset with
   one face part; returns the `asset_part_id`.
-- `pkg` / `mesh_part` — pytest fixtures wrapping the two helpers.
+- `pkg` / `mesh_part` — pytest fixtures wrapping the two helpers; `bare_pkg`,
+  a package created without the link defaults, as 0.6.0 created it.
 - `assert_package_valid(pkg)` — assert `validate_report()` is clean, printing
   the issues on failure.
 - `executed_plans(pkg, call)` — the `EXPLAIN QUERY PLAN` of every query
@@ -25,12 +29,14 @@ python -m pytest
 - `write_tiny_las(path, point_count)` / `write_tiny_mesh(path)` — minimal real
   LAS / 2-triangle mesh files for adapter and end-to-end tests.
 
-Two CityGML helpers stand in for what a package normally supplies itself:
-`seed_citygml_concepts()` loads `tests/fixtures/citygml_3_0_subset/` — a
-faithful subset of the OGC schemas, every name and `substitutionGroup` copied
-verbatim — and `seed_citygml_relationship_categories()` states which of its
-properties mean part-of. USAP ships neither, so the suite brings its own
-rather than depending on the full OGC distribution.
+`seed_citygml_concepts()` stands in for the concept source a package normally
+supplies itself: it loads `tests/fixtures/citygml_3_0_subset/` — a faithful
+subset of the OGC schemas, every name and `substitutionGroup` copied verbatim.
+USAP ships no CityGML vocabulary, so the suite brings its own rather than
+depending on the full OGC distribution. Which properties mean part-of needs no
+helper: `create()` registers the shipped CityGML 3.0 categories
+(`usap.constants.CITYGML_3_0_RELATIONSHIP_CATEGORIES`), and
+`CITYGML_CONTAINMENT_CONFIG` is the same table as a config fragment.
 
 ## Core data model — `test_core.py`
 
@@ -369,14 +375,14 @@ rewrite.
   "this file has no buildings".
 - `test_parts_are_reachable_at_every_depth` — both CityGML 3.0 containment
   properties are followed, `core:boundary` and `con:fillingSurface`, so a
-  window nested under a wall is part of the building. The predecessor
-  hardcoded four CityGML *2.0* tokens, so `fillingSurface` was recorded and
-  then never traversed.
-- `test_uncategorised_links_are_recorded_but_not_traversed` — the accepted
-  consequence of shipping no link vocabulary: with no categories supplied
-  every edge is still stored and queryable by name, `descendants_of` returns
-  the root alone, and validation warns `UNCLASSIFIED_RELATIONSHIP_TYPE`. It
-  must be visible, never silent.
+  window nested under a wall is part of the building — with nothing declared,
+  from the defaults alone. The predecessor hardcoded four CityGML *2.0*
+  tokens, so `fillingSurface` was recorded and then never traversed.
+- `test_uncategorised_links_are_recorded_but_not_traversed` — what happens to
+  a link type nothing classifies (here, on a package created without the
+  defaults): every edge is still stored and queryable by name,
+  `descendants_of` returns the root alone, and validation warns
+  `UNCLASSIFIED_RELATIONSHIP_TYPE`. It must be visible, never silent.
 - `test_malformed_citygml_fails_loud` — a truncated/invalid file must refuse
   to import (it used to be silently half-parsed with `recover=True`).
 - `test_non_citygml_namespace_is_refused` — matching on element local names
@@ -437,8 +443,9 @@ pile of unrelated roots with no warning.
 - `test_registering_is_idempotent_and_enriching` /
   `test_same_name_in_two_code_spaces_stays_distinct` /
   `test_list_relationship_types_counts_edges` — the registry: a category
-  arriving late is filled in, a contradicting one raises, and the same name
-  from two namespaces stays two types.
+  arriving late is filled in (on a CityGML 2.0 type, which no default covers),
+  a contradicting one raises, and the same name from two namespaces stays two
+  types.
 - `test_type_cache_is_dropped_when_a_transaction_rolls_back` — an
   auto-registration inside a failed transaction no longer exists, and a cache
   still handing out its id would make the next insert die on the foreign key.
@@ -463,6 +470,57 @@ pile of unrelated roots with no warning.
 - `test_both_directions_terminate_and_do_not_duplicate` — `UNION` in the
   recursive term both deduplicates and stops a two-way walk oscillating
   across one edge.
+
+## The CityGML 3.0 link defaults — `test_relationship_defaults.py`
+
+`USAPPackage.create` registers a category for the 35 CityGML 3.0 relation
+properties. These tests pin that they are defaults and not a policy, and that
+none of it is a schema change.
+
+- `test_the_table_names_35_distinct_citygml_3_0_properties` — the shipped
+  table: 35 distinct `(local_name, code_space)` keys, all in CityGML 3.0
+  namespaces, with valid categories, and the two pairs that point both ways
+  (`storey`/`buildingUnit`, `predecessor`/`successor`) never containment, or a
+  file using both directions would make each object its own part.
+- `test_a_new_package_carries_the_citygml_3_0_defaults` /
+  `test_the_defaults_survive_close_and_reopen` — a new package lists exactly
+  the table, every row marked as a default, the profile version unchanged,
+  and one edit-log entry for the lot.
+- `test_create_can_leave_the_defaults_out` — `default_relationship_types=False`
+  gives the empty link vocabulary 0.6.0 created.
+- `test_a_declaration_replaces_a_default_once` /
+  `test_a_declaration_that_agrees_turns_the_default_into_a_declaration` /
+  `test_a_declaration_without_a_category_leaves_the_default` — the rule. A
+  declaration replaces a default and is logged; one that agrees turns it into a
+  declaration, so "confirm, then contradict" raises in either loading order;
+  a declaration with no category changes nothing.
+- `test_the_defaults_fill_a_package_created_before_them` — the upgrade path:
+  on a package built without the defaults, with edges, one category declared
+  differently and the import's own types unclassified,
+  `register_default_relationship_types` fills the empty ones, keeps and reports
+  the different one without raising, leaves the package valid, and is
+  idempotent. What it filled is still a default a declaration may replace.
+- `test_the_defaults_keep_the_metadata_a_type_already_has` — the marker joins
+  the keys already in `metadata_json` and leaves with the default; metadata
+  that is not a JSON object is never overwritten, and the category goes in
+  unmarked.
+- `test_a_citygml_3_0_import_is_classified_from_creation` — the acceptance
+  case: a Building reaches its surfaces, opening, room and subdivisions, a
+  Bridge its part and room, a Road its section and traffic spaces, with no
+  `UNCLASSIFIED_RELATIONSHIP_TYPE` and no cycle from the two peer pairs.
+- `test_an_external_xlink_of_a_default_property_is_kept` — the import trusts
+  an xlink leaving the document only for a link type it already knows, so a
+  `buildingRoom` pointing at another file is now stored as an external edge;
+  without the defaults it is skipped, as before.
+- `test_the_reference_table_lists_exactly_the_shipped_defaults` — the table in
+  REFERENCE.md and the constant cannot drift apart.
+
+`tests/test_realdata.py` adds
+`test_n2_the_link_defaults_are_every_relation_property_of_the_schemas`: with
+`--realdata-dir`, it derives every property linking two city objects from the
+real OGC XSDs and requires the table to equal it, nothing missing and nothing
+extra. The list this one replaced held CityGML 2.0 tokens, and nothing compared
+it with a schema. It skips when the vocabulary lacks one of the modules.
 
 ## Query plans — `test_query_plans.py`
 
@@ -529,7 +587,8 @@ included, against an oracle that decodes every block of the part.
 
 - `test_ontology_supplies_the_categories` — `usap:category` from an RDF/XML
   ontology classifies the link types; a property declared without one stays
-  NULL, never assumed to be containment.
+  NULL, never assumed to be containment. On a package without the defaults,
+  so the ontology is the only source.
 - `test_iso_19150_class_property_names_are_split` — CityGML's published OWL
   renderings name a property `Class.property`; keeping the class prefix would
   give a type name no document writes, so the category would land on a type
@@ -541,11 +600,13 @@ included, against an oracle that decodes every block of the part.
   ontology. The same stored edges answer differently before and after.
 - `test_swapping_the_ontology_swaps_the_vocabulary` — the governing
   requirement as a test: two ontologies over one document, one of which does
-  not consider an opening part of the building.
+  not consider an opening part of the building — and so replaces the
+  `fillingSurface` default.
 - `test_loading_is_idempotent_and_order_independent` /
   `test_a_contradicting_category_raises` — classify before or after the edges
-  exist, re-load freely, but a category that contradicts one already recorded
-  raises rather than overwriting it.
+  exist, re-load freely, but a category that contradicts a declared one raises
+  rather than overwriting it, even when the declaration itself replaced a
+  default.
 - `test_xml_that_is_not_rdf_is_refused` — XML that is not RDF is refused by the
   built-in reader with a message naming what it expected.
 - `test_reads_a_real_world_ade` — runs against an actual ADE when one is in
@@ -732,6 +793,9 @@ here to check.
   the application startup path (US-DATA-04): one directory, dispatched by
   suffix in a single pass. It has to seed the same package as naming those
   sources one key at a time, or the config path and the app path would drift.
+- `test_a_config_category_wins_over_the_citygml_defaults` — a config reading
+  `storey` as containment builds, keeps its reading over the default, and
+  re-applying it with `update=True` is a repetition, not a contradiction.
 - `test_unrecognised_config_keys_are_refused` — the failure this exists for:
   `annotation_batch` for `annotation_batches` built a package with zero
   annotations, exit code 0 and a clean validation report, because nothing reads

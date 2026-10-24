@@ -246,45 +246,114 @@ is accepted anywhere a name is — one query routinely spans modules. An
 unregistered name **raises**: a typo must not answer "this object has no
 parts".
 
-**`category` is the one thing no CityGML artifact states.** Not the XSD, not
-the conceptual model's data dictionary, not an OWL rendering of it — all three
-carry the properties but nothing marking which are aggregations. So USAP does
-not ship it either: it is asserted by whoever builds the package
-(`register_relationship_type`, or a project-config `relationship_types`
-block). Until something does, an imported edge is stored, queryable by name,
-and reported as `UNCLASSIFIED_RELATIONSHIP_TYPE` — never silently treated as
-containment.
+**Where `category` comes from.** For most CityGML 3.0 relation properties the
+standard says it: the conceptual model marks the association as an
+aggregation, and the GML encoding gives such a property a type extending
+`gml:AbstractFeatureMemberType`. For the rest it says nothing — `boundary`,
+`filling` and `fillingSurface` are plain associations, and no CityGML artifact
+states that a window is part of its wall. USAP therefore ships a default for
+each of the 35 CityGML 3.0 relation properties, and `USAPPackage.create`
+registers them in the same transaction as the schema, so an imported CityGML
+3.0 edge is classified without anyone asserting it. Anything else an import
+meets — a CityGML 2.0 property, an ADE's, a `relationType` value — registers
+unclassified: it is stored, queryable by name, and reported as
+`UNCLASSIFIED_RELATIONSHIP_TYPE` — never silently treated as containment.
 
-**What to assert, for CityGML 3.0.** USAP not shipping this is a statement
-about *authority*, not a reason to make every project re-derive it from the
-spec. The reading below is the one USAP's own suite uses; take it as a starting
-point and change whatever your data means differently.
+**The CityGML 3.0 defaults.** The table is
+`CITYGML_3_0_RELATIONSHIP_CATEGORIES` in `usap.constants`; this is it, row for
+row. A default is a starting point, not a policy: declare whatever your data
+means differently (see *Declaring a category* below).
 
-| Property | Module namespace | Category |
-|---|---|---|
-| `boundary` | `…/citygml/3.0` | `containment` |
-| `relatedTo` | `…/citygml/3.0` | `peer` |
-| `generalizesTo` | `…/citygml/3.0` | `generalization` |
-| `filling` | `…/citygml/construction/3.0` | `containment` |
-| `fillingSurface` | `…/citygml/construction/3.0` | `containment` |
-| `buildingPart` | `…/citygml/building/3.0` | `containment` |
-| `buildingRoom` | `…/citygml/building/3.0` | `containment` |
-| `buildingInstallation` | `…/citygml/building/3.0` | `containment` |
-| `buildingConstructiveElement` | `…/citygml/building/3.0` | `containment` |
-| `buildingFurniture` | `…/citygml/building/3.0` | `containment` |
-| `buildingSubdivision` | `…/citygml/building/3.0` | `containment` |
-| `groupMember` | `…/citygml/cityobjectgroup/3.0` | `grouping` |
-| `parent` | `…/citygml/cityobjectgroup/3.0` | `grouping` |
+| Property | Module namespace | Category | In the model |
+|---|---|---|---|
+| `boundary` | `…/citygml/3.0` | `containment` | association |
+| `relatedTo` | `…/citygml/3.0` | `peer` | association, via `CityObjectRelation` |
+| `generalizesTo` | `…/citygml/3.0` | `generalization` | reference |
+| `filling` | `…/citygml/construction/3.0` | `containment` | association |
+| `fillingSurface` | `…/citygml/construction/3.0` | `containment` | association |
+| `buildingPart` | `…/citygml/building/3.0` | `containment` | aggregation |
+| `buildingRoom` | `…/citygml/building/3.0` | `containment` | aggregation¹ |
+| `buildingInstallation` | `…/citygml/building/3.0` | `containment` | aggregation |
+| `buildingConstructiveElement` | `…/citygml/building/3.0` | `containment` | aggregation¹ |
+| `buildingFurniture` | `…/citygml/building/3.0` | `containment` | aggregation |
+| `buildingSubdivision` | `…/citygml/building/3.0` | `containment` | aggregation |
+| `buildingUnit` | `…/citygml/building/3.0` | `peer` | association² |
+| `storey` | `…/citygml/building/3.0` | `peer` | association² |
+| `bridgePart` | `…/citygml/bridge/3.0` | `containment` | aggregation |
+| `bridgeRoom` | `…/citygml/bridge/3.0` | `containment` | aggregation |
+| `bridgeInstallation` | `…/citygml/bridge/3.0` | `containment` | aggregation |
+| `bridgeConstructiveElement` | `…/citygml/bridge/3.0` | `containment` | aggregation |
+| `bridgeFurniture` | `…/citygml/bridge/3.0` | `containment` | aggregation |
+| `tunnelPart` | `…/citygml/tunnel/3.0` | `containment` | aggregation |
+| `hollowSpace` | `…/citygml/tunnel/3.0` | `containment` | aggregation |
+| `tunnelInstallation` | `…/citygml/tunnel/3.0` | `containment` | aggregation |
+| `tunnelConstructiveElement` | `…/citygml/tunnel/3.0` | `containment` | aggregation |
+| `tunnelFurniture` | `…/citygml/tunnel/3.0` | `containment` | aggregation |
+| `section` | `…/citygml/transportation/3.0` | `containment` | aggregation |
+| `intersection` | `…/citygml/transportation/3.0` | `containment` | aggregation |
+| `trafficSpace` | `…/citygml/transportation/3.0` | `containment` | aggregation |
+| `auxiliaryTrafficSpace` | `…/citygml/transportation/3.0` | `containment` | aggregation |
+| `clearanceSpace` | `…/citygml/transportation/3.0` | `containment` | aggregation |
+| `hole` | `…/citygml/transportation/3.0` | `containment` | aggregation |
+| `marking` | `…/citygml/transportation/3.0` | `containment` | aggregation |
+| `predecessor` | `…/citygml/transportation/3.0` | `peer` | reference |
+| `successor` | `…/citygml/transportation/3.0` | `peer` | reference |
+| `reliefComponent` | `…/citygml/relief/3.0` | `containment` | aggregation |
+| `groupMember` | `…/citygml/cityobjectgroup/3.0` | `grouping` | aggregation, via `Role` |
+| `parent` | `…/citygml/cityobjectgroup/3.0` | `grouping` | reference |
 
 Namespaces are written in full in a config; the elided prefix is
-`http://www.opengis.net/`. Only the properties your documents actually use
-matter — a LOD1 building model typically produces `boundary` alone, and
-declaring types no edge ever references is harmless but pointless.
+`http://www.opengis.net/`. *Reference* means `gml:ReferenceType`: an xlink, no
+inline form.
 
-Assert them once, at build time. `category` is a column on
-`usap_relationship_type`, so a package keeps its classification and a later
-`open()` repeats nothing. Re-asserting a *different* non-NULL category raises
-rather than overwriting, so a package cannot be quietly reclassified.
+The rule is that an aggregation is `containment` and a link pointing both ways
+or along a network is `peer`. The rest is USAP's reading, and the first thing to
+check against your data. `boundary`, `filling` and `fillingSurface` are read as
+containment: the surfaces bounding a space, and a wall's openings, are its
+parts. `relatedTo` is a peer and `generalizesTo` a generalization. The two
+group links are `grouping`, `groupMember` included although it is an
+aggregation, because a group's members are not its parts.
+
+¹ Also declared, without aggregation, by `Storey` and `BuildingUnit`. A type's
+identity is its name and namespace, not the class declaring it, so one category
+covers both: a room is part of its building and of its storey (reached twice,
+returned once). `buildingFurniture` and `buildingInstallation` are declared by
+`Storey` and `BuildingUnit` too, as aggregations.
+² `Storey` and `BuildingUnit` point at each other. As containment the pair
+would be a cycle.
+
+The 35 are every property through which one CityGML 3.0 city object refers to
+another. `cityObjectMember` (from `CityModel`) and `sensorLocation` (from a
+`Dynamizer`'s `SensorConnection`) start outside the city-object branch and are
+not link types. An edge from a CityGML 2.0 document keeps its 2.0 namespace and
+is not covered.
+
+**Declaring a category.** `register_relationship_type`, a project-config
+`relationship_types` block, an ontology's `usap:category` and
+`link_city_objects(category=...)` all declare one, under the same rule:
+
+- a category that is still NULL is filled in;
+- a default gives way to the first declaration: a different category replaces
+  it, the same one confirms it, and either way the type is declared from then
+  on;
+- a declared category is never overwritten: contradicting it raises, so two
+  sources that disagree fail in whichever order they arrive.
+
+A declaration with no category changes nothing. Which categories are still
+defaults is on the row: `metadata_json` carries `"usap:category_source":
+"default"` until a declaration removes it, and `list_relationship_types()`
+returns that column. Replacing or confirming a default is recorded in
+`usap_edit_log`.
+
+`category` is a column on `usap_relationship_type`, so a package keeps its
+classification and a later `open()` repeats nothing — and adds nothing. A
+package created before 0.6.1 has no defaults at all;
+`pkg.register_default_relationship_types()` adds them. It fills only what is
+missing, a type the package lacks or one it has with no category, and returns
+what it did (`registered`, `classified`). Every type the package classifies
+differently comes back in `kept` instead of raising, so one disagreement does
+not block the rest. To create a package without the defaults, as 0.6.0 did,
+pass `USAPPackage.create(..., default_relationship_types=False)`.
 
 Containment must be acyclic — a cycle would make an object its own part, and
 `validate_report()` flags it as `CITY_OBJECT_GRAPH_CYCLE`. A cycle of peer
@@ -757,7 +826,7 @@ declares:
 | Read | Becomes |
 |---|---|
 | `owl:ObjectProperty` | a link type, identified by the IRI's namespace + local name |
-| `usap:category` | that type's category — the one fact no CityGML artifact carries |
+| `usap:category` | that type's category; for a CityGML 3.0 property, it replaces the default |
 | `owl:Class` (+ `rdfs:subClassOf`) | a concept and its parent, for ADE classes |
 
 ```xml
@@ -776,8 +845,9 @@ without USAP owning a domain — the same reasoning as `package_iri`.
 This is what makes a package *depend* on its ontology: supply a different one
 and the link vocabulary changes with it, over the very same document. Loading
 is idempotent and order-independent — classify before or after the import, the
-result is the same, and a category that contradicts one already recorded raises
-rather than overwriting it.
+result is the same. A category is a declaration (see *Declaring a category*):
+it replaces a CityGML 3.0 default, and one that contradicts a declared category
+raises rather than overwriting it.
 
 **RDF/XML is the only syntax read**, picked by suffix: `.owl` / `.rdf` /
 `.rdfs` / `.xml` go through a narrow built-in reader that uses the `lxml` USAP
@@ -799,7 +869,8 @@ vocabularies — use `load_vocabulary_folder(pkg, path)`.
 A category only bites if the property's IRI namespace matches the namespace the
 source document writes; that pair *is* the type's identity. Mismatch it and the
 category lands on a type nothing uses, while the one the import registered
-stays unclassified — which `validate_report()` reports.
+keeps its CityGML 3.0 default — or, having none, stays unclassified, which
+`validate_report()` reports.
 
 #### Concept provenance
 
@@ -985,6 +1056,10 @@ meshes:
 
 Key notes:
 
+- `"relationship_types"` — optional. A category per link type: it replaces the
+  CityGML 3.0 default where there is one, and classifies anything else (a
+  CityGML 2.0 or ADE property). The two entries above restate defaults. See
+  *City object* → *Declaring a category*.
 - `"annotation_batches"` — batch files applied right after the assets are
   registered, so one build call ingests the annotations too.
 - an asset's optional `"uri"` (a stable logical name, `area_lod2` above) lets
@@ -1330,12 +1405,13 @@ with USAPPackage.create("demo.usap.gpkg", overwrite=True) as pkg:
 
     seed_default_ade_vocabulary(pkg)
 
-    # Which link types mean "part of". No CityGML artifact states this, so it
-    # is asserted here (or by an ontology). Without it every edge is still
-    # recorded and queryable by name, but nothing is reported as a part.
+    # Which link types mean "part of". The 35 CityGML 3.0 relation properties
+    # arrive classified (see "The CityGML 3.0 defaults"); declare only what your
+    # data reads differently, or a link type outside them, such as an ADE's.
+    # Here a building unit's storeys become its parts.
     pkg.register_relationship_type(
-        "boundary",
-        code_space="http://www.opengis.net/citygml/3.0",
+        "storey",
+        code_space="http://www.opengis.net/citygml/building/3.0",
         category="containment",
     )
 ```

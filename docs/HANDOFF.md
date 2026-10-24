@@ -289,34 +289,45 @@ Blocks come back de-duplicated by `membership_block_id`, so an annotation
 reached through two objects appears once. Each block names its `asset_part_id`,
 which is how the result is routed to the right viewport layer.
 
-### 3.1 If you ever do build a link graph, classify it
+### 3.1 If you ever do build a link graph, the CityGML 3.0 categories are already there
 
 Carrier-only mode has no edges, so this does not arise there. It arises the
 moment a package is built by importing a CityGML — which is what
 `build_project_package` does, and what any package handed to you was probably
 made with.
 
-An imported edge records the property name it came from (`boundary`), but
-**nothing in CityGML says which properties mean *part of***. Until a link type
-is classified, its edges are stored and queryable by name and skipped by every
-subtree query, and `validate_report()` reports
-`UNCLASSIFIED_RELATIONSHIP_TYPE`.
-
-Project configs declare this in a `relationship_types` block. **The application
-has no config**, so it must assert the same thing directly:
+An imported edge records the property name it came from (`boundary`), and its
+link type's *category* decides whether a subtree query follows it. Since 0.6.1,
+`USAPPackage.create` registers a default category for all 35 CityGML 3.0
+relation properties, so a package the application creates already knows that a
+`boundary` or a `buildingPart` is a part. **The application asserts only the
+categories it reads differently**:
 
 ```python
 pkg.register_relationship_type(
-    "boundary",
-    code_space="http://www.opengis.net/citygml/3.0",
+    "storey",
+    code_space="http://www.opengis.net/citygml/building/3.0",
     category="containment",
 )
 ```
 
-REFERENCE.md → *City object relationships* → **What to assert, for CityGML
-3.0** carries the full thirteen-property mapping. Assert once, at build; the
-category is stored on `usap_relationship_type` and survives close/reopen.
-Re-asserting a *different* non-NULL category raises rather than overwriting.
+An assertion replaces the default once, and is stored on
+`usap_relationship_type`, so it survives close/reopen. Asserting a *different*
+category afterwards raises rather than overwriting. REFERENCE.md → *City object*
+→ **The CityGML 3.0 defaults** lists the 35 and says which of them are USAP's
+reading rather than the standard's.
+
+Two cases still need the application:
+
+- **A package created before 0.6.1** has none of the defaults, and opening it
+  adds none. Call `pkg.register_default_relationship_types()` once. It fills
+  only empty categories, and returns in `kept` any it disagrees with instead of
+  raising.
+- **A link type outside the 35** — from a CityGML 2.0 document, an ADE, or a
+  `CityObjectRelation` typed by its `relationType` — starts unclassified. Its
+  edges are stored and queryable by name but skipped by every subtree query, and
+  `validate_report()` reports `UNCLASSIFIED_RELATIONSHIP_TYPE`. Classify it the
+  same way.
 
 ---
 

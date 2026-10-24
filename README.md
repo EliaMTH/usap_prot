@@ -97,7 +97,7 @@ For CityGML that source is the **OGC schemas themselves**: `load_citygml_schema(
 
 USAP deliberately ships **no CityGML vocabulary**. It used to, and the file accumulated exactly the errors a hand-written one accumulates: surfaces filed under the wrong module, a class parented to the wrong supertype, a class that exists only in CityGML 2.0. Two example registries do ship — an ADE prototype and a minimal local scheme — as starting points to seed or replace, not as a taxonomy.
 
-The same holds for **link types**. Which CityGML property means "part of" is stated in no CityGML artifact — not the XSD, not the conceptual model, not an OWL rendering — so USAP does not assert it either. The package builder does, and until they do, an imported edge is stored and queryable by name but is not reported as a part.
+**Link types** are the one place USAP starts with an opinion. Every package is created with a default category for the 35 CityGML 3.0 relation properties — whether `boundary`, `buildingPart` or `section` makes the target a *part*, a peer, a generalization or a group member — taken from the conceptual model's aggregations where it states one, and USAP's reading where it does not (`boundary`, `filling`, `fillingSurface`). They are defaults: the package builder's own declaration replaces any of them. A link type outside the 35, such as a CityGML 2.0 or ADE property, is stored and queryable by name but is not reported as a part until someone classifies it.
 
 ## Per-element value fields
 

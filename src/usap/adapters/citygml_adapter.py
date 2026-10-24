@@ -351,7 +351,8 @@ def _resolve_edges(
         return edges, skipped
 
     # (b) xlink — nothing proves the target is a city object, so the property
-    # itself has to be one USAP has already met. The appearance module is
+    # itself has to be one USAP has already met: the 35 CityGML 3.0 defaults,
+    # or whatever an ontology or config registered. The appearance module is
     # under opengis.net/citygml too, so without this gate an <app:target
     # xlink:href="#roof"> mints a bogus city-object edge and a bogus type —
     # the exact failure class the deleted rename table caused.
@@ -406,8 +407,9 @@ def import_citygml_semantics(
                 that index and emit one edge
 
     Concepts are a precondition: USAP ships no CityGML vocabulary, so load one
-    first (load_citygml_schema, or an ontology). Link types are not — an
-    unseen property registers itself, and is reported as unclassified until
+    first (load_citygml_schema, or an ontology). Link types are not. The 35
+    CityGML 3.0 relation properties are classified from create() on, and any
+    other property registers itself and is reported as unclassified until
     something says what category it belongs to.
 
     Only elements in a CityGML namespace are imported, at any version. The

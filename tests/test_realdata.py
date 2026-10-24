@@ -33,7 +33,11 @@ from usap import (
     load_vocabulary_folder,
     register_mesh_asset,
 )
-from usap.constants import DEFAULT_BLOCK_SIZE
+from usap.constants import (
+    CITYGML_3_0_CORE_NS,
+    CITYGML_3_0_RELATIONSHIP_CATEGORIES,
+    DEFAULT_BLOCK_SIZE,
+)
 from usap.validation import verify_assets
 
 from conftest import REAL_PACKAGE_NAME
@@ -257,6 +261,134 @@ def test_n2_the_substitution_group_hierarchy_resolves(
     assert "AbstractThematicSurface" in chain
     assert "AbstractCityObject" in chain
     assert len(chain) >= 5
+
+
+_XS = "{http://www.w3.org/2001/XMLSchema}"
+_GML_NS = "http://www.opengis.net/gml/3.2"
+
+# The two objectified relations. Neither is a city object, but the property
+# holding one is a link between city objects, and the property inside it
+# carries the same name (core:relatedTo, grp:groupMember).
+_RELATION_OBJECTS = {
+    (CITYGML_3_0_CORE_NS, "CityObjectRelation"),
+    ("http://www.opengis.net/citygml/cityobjectgroup/3.0", "Role"),
+}
+
+
+def _citygml_relation_properties(
+    folder: Path,
+) -> tuple[set[tuple[str, str]], set[str]]:
+    """
+    Every (property, namespace) by which a CityGML 3.0 city object refers to
+    another, read from the XSDs alone -- plus the 3.0 namespaces the folder
+    declares, so a partial vocabulary can be told apart from a missing row.
+
+    A property counts when a city-object class declares it and its type wraps
+    a city object or an objectified relation: a named property type, an
+    anonymous one, or gml:ReferenceType with its gml:targetElement.
+    """
+    from lxml import etree
+
+    def qname(value: str, nsmap: dict) -> tuple[str | None, str]:
+        prefix, _, local = value.rpartition(":")
+        return (nsmap.get(prefix or None), local)
+
+    elements: dict[tuple, tuple] = {}
+    types: dict[tuple, object] = {}
+    namespaces: set[str] = set()
+
+    for xsd in folder.rglob("*.xsd"):
+        root = etree.parse(str(xsd)).getroot()
+        tns = root.get("targetNamespace") or ""
+
+        if "opengis.net/citygml" not in tns or not tns.endswith("/3.0"):
+            continue
+
+        namespaces.add(tns)
+
+        for node in root.findall(f"{_XS}element"):
+            declared, subst = node.get("type"), node.get("substitutionGroup")
+            elements[(tns, node.get("name"))] = (
+                qname(declared, node.nsmap) if declared else None,
+                qname(subst, node.nsmap) if subst else None,
+            )
+
+        for node in root.findall(f"{_XS}complexType"):
+            types[(tns, node.get("name"))] = node
+
+    def is_city_object(key) -> bool:
+        seen = set()
+
+        while key in elements and key not in seen:
+            if key == (CITYGML_3_0_CORE_NS, "AbstractCityObject"):
+                return True
+
+            seen.add(key)
+            key = elements[key][1]
+
+        return False
+
+    def target(prop):
+        declared = prop.get("type")
+        kind = qname(declared, prop.nsmap) if declared else None
+
+        if kind == (_GML_NS, "ReferenceType"):
+            node = prop.find(f"{_XS}annotation/{_XS}appinfo/{{{_GML_NS}}}targetElement")
+            return None if node is None else qname(node.text.strip(), node.nsmap)
+
+        node = prop.find(f"{_XS}complexType") if kind is None else types.get(kind)
+
+        if node is None:
+            return None
+
+        ref = next((e for e in node.iter(f"{_XS}element") if e.get("ref")), None)
+
+        return None if ref is None else qname(ref.get("ref"), ref.nsmap)
+
+    found: set[tuple[str, str]] = set()
+
+    for key, (type_key, _parent) in elements.items():
+        if not is_city_object(key) or type_key not in types:
+            continue
+
+        node = types[type_key]
+        sequence = node.find(f"{_XS}complexContent/{_XS}extension/{_XS}sequence")
+
+        if sequence is None:
+            sequence = node.find(f"{_XS}sequence")
+
+        for prop in () if sequence is None else sequence.findall(f"{_XS}element"):
+            pointed = target(prop) if prop.get("name") else None
+
+            if pointed is not None and (
+                is_city_object(pointed) or pointed in _RELATION_OBJECTS
+            ):
+                # Local elements are qualified, so they sit in the namespace
+                # of the schema declaring the type -- the code space an import
+                # records.
+                found.add((prop.get("name"), type_key[0]))
+
+    return found, namespaces
+
+
+def test_n2_the_link_defaults_are_every_relation_property_of_the_schemas(
+    real_vocabulary_dir: Path,
+) -> None:
+    """
+    The 35 CityGML 3.0 link categories create() registers, against the real
+    schemas: nothing missing from the table, nothing extra. The list this one
+    replaced held CityGML 2.0 tokens, and nothing compared it with a schema.
+    """
+    derived, namespaces = _citygml_relation_properties(real_vocabulary_dir)
+    shipped = {(name, ns) for name, ns, _ in CITYGML_3_0_RELATIONSHIP_CATEGORIES}
+    absent = {ns for _, ns in shipped} - namespaces
+
+    if absent:
+        pytest.skip(f"the vocabulary has no schema for {sorted(absent)}")
+
+    print(f"\n  {len(derived)} relation properties in {len(namespaces)} namespaces")
+
+    assert derived == shipped
 
 
 @pytest.mark.parametrize("name", ["uish_ontology_building.owl", "uo-full.owl"])

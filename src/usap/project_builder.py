@@ -338,18 +338,20 @@ def _register_config_relationship_types(
     config: dict[str, Any],
 ) -> None:
     """
-    Classify the link types this package's builder treats as containment.
+    Classify the link types this package's builder reads its own way.
 
-    Which CityGML properties mean "part of" is stated in no CityGML artifact —
-    not the XSD, not the conceptual model, not an OWL rendering of it — so it
-    has to be asserted by whoever builds the package. Without it every edge is
-    still recorded and queryable by name, but nothing is a *part*: an
-    'and its parts' query returns the object alone, and validate_report()
-    warns UNCLASSIFIED_RELATIONSHIP_TYPE.
+    The package already carries the 35 CityGML 3.0 relation properties, with
+    the categories USAPPackage.create registers by default. An entry here
+    replaces a default -- the config is the builder's declaration, and the
+    defaults are only a starting point -- and classifies any other link type:
+    a CityGML 2.0 or ADE property, a relationType value. Without a category
+    such a type's edges are still recorded and queryable by name, but none of
+    them is a *part*, and validate_report() warns
+    UNCLASSIFIED_RELATIONSHIP_TYPE.
 
         "relationship_types": [
-            {"local_name": "boundary",
-             "code_space": "http://www.opengis.net/citygml/3.0",
+            {"local_name": "storey",
+             "code_space": "http://www.opengis.net/citygml/building/3.0",
              "category": "containment"}
         ]
     """

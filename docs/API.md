@@ -27,7 +27,7 @@ Conventions throughout:
 
 | Call | Does |
 |---|---|
-| `USAPPackage.create(db_path, overwrite=False, package_iri=None)` | create a new package; mints a `urn:uuid:` identity unless you supply one |
+| `USAPPackage.create(db_path, overwrite=False, package_iri=None, *, default_relationship_types=True)` | create a new package; mints a `urn:uuid:` identity unless you supply one, and registers the CityGML 3.0 link categories unless told not to |
 | `USAPPackage.open(db_path)` | open an existing one; refuses a profile this build does not understand |
 | `pkg.close()` / `with USAPPackage.open(...) as pkg:` | close the connection |
 | `pkg.transaction()` | context manager; re-entrant, so grouped edits commit or roll back together |
@@ -92,7 +92,8 @@ supply; USAP asserts no taxonomy of its own.
 | `resolve_city_object(city_object)` | id, `object_uid`, or `gml_id` → `city_object_id` |
 | `link_city_objects(from_city_object_id, to_city_object_id, relationship_type, to_external_uri=None, role=None, ...)` | one typed directed edge; the target may be outside the package |
 | `related_city_objects(city_object, direction="out", ...)` | the **edges** touching an object — the only view showing external targets |
-| `register_relationship_type(local_name, code_space=None, category=None)` | declare a link type and whether it means *part of* |
+| `register_relationship_type(local_name, code_space=None, category=None)` | declare a link type and whether it means *part of*; replaces a CityGML 3.0 default once, raises against a declared category |
+| `register_default_relationship_types()` | give a package created before 0.6.1 the 35 CityGML 3.0 categories; fills only what is empty and reports the rest |
 | `list_relationship_types(category=None)` | the link vocabulary with edge counts; `None` also lists unclassified |
 | `resolve_relationship_type(relationship_type, code_space=None)` | name (+ namespace) or id → `relationship_type_id` |
 | `import_citygml_semantics(pkg, citygml_path, compute_hash=True)` | import object identities, classes and typed relationships from a `.gml` |
@@ -249,6 +250,8 @@ will actually hold:
 | `UnresolvedTarget` | `from_uid`, `relationship_type`, `href` — an xlink leaving the document |
 | `VocabularyResult` | `by_name`, `by_uri` — concept name/URI → id |
 | `OntologyResult` | `relationship_types`, `concepts`, `categorised`, `imports` |
+| `DefaultRelationshipTypesResult` | `registered`, `classified` — `(local_name, code_space)` pairs — and `kept` |
+| `KeptRelationshipCategory` | `local_name`, `code_space`, `category`, `default_category` — a default not applied because the package classifies the type otherwise |
 | `BatchImportResult` | `annotation_count`, `membership_count`, `value_field_count`, `path_segment_count`, `created_city_object_count`, `created_city_object_uids`, `annotations` |
 | `BatchAnnotationResult` | `annotation_id`, `annotation_uid`, `concept`, `membership_count`, `value_field_count`, `path_segment_count` |
 | `ProjectBuildResult` | `db_path`, `manifest_path`, `citygml`, `las_assets`, `mesh_assets`, `accepted_concept_count`, `batches` |
@@ -262,3 +265,6 @@ will actually hold:
 `DEFAULT_BLOCK_SIZE`, `DEFAULT_ENCODING`, `DEFAULT_GRAPH_NAME`,
 `DEFAULT_SCHEMA_PATH`, `VALIDATION_LEVELS`,
 `GPKG_APPLICATION_ID`, `GPKG_USER_VERSION`, `USAP_EXTENSION_NAME`.
+In `usap.constants`: `CITYGML_3_0_RELATIONSHIP_CATEGORIES` — the 35
+`(local_name, code_space, category)` defaults — and the CityGML 3.0 module
+namespaces (`CITYGML_3_0_CORE_NS`, `CITYGML_3_0_BUILDING_NS`, …).

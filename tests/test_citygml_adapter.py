@@ -4,11 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import (
-    make_pkg,
-    seed_citygml_concepts,
-    seed_citygml_relationship_categories,
-)
+from conftest import make_pkg, seed_citygml_concepts
 from usap import USAPError, USAPPackage, import_citygml_semantics
 
 
@@ -135,13 +131,13 @@ def test_parts_are_reachable_at_every_depth(tmp_path: Path) -> None:
     # from the building to its surfaces, and con:fillingSurface from a wall to
     # its openings. The predecessor of this code hardcoded four CityGML 2.0
     # tokens, so 'fillingSurface' was recorded and then never traversed and
-    # the window silently was not part of the building.
+    # the window silently was not part of the building. Nothing classifies
+    # them here but the defaults create() registers.
     citygml_path = tmp_path / "tiny_city.gml"
     citygml_path.write_text(TINY_CITYGML, encoding="utf-8")
 
     with make_pkg(tmp_path) as pkg:
         seed_citygml_concepts(pkg)
-        seed_citygml_relationship_categories(pkg)
         import_citygml_semantics(pkg, citygml_path)
 
         descendants = {
@@ -162,14 +158,15 @@ def test_parts_are_reachable_at_every_depth(tmp_path: Path) -> None:
 def test_uncategorised_links_are_recorded_but_not_traversed(
     tmp_path: Path,
 ) -> None:
-    # USAP ships no link vocabulary, so an import with no categories supplied
-    # still records every edge — but nothing is a "part" until something says
+    # A link type nothing classifies -- here because the package was created
+    # without the CityGML 3.0 defaults; in a real one, a 2.0 or ADE property --
+    # still records every edge, but nothing is a "part" until something says
     # which properties mean that. The point is that this is visible, not that
     # it is silent: the edges are queryable by name and validation says so.
     citygml_path = tmp_path / "tiny_city.gml"
     citygml_path.write_text(TINY_CITYGML, encoding="utf-8")
 
-    with make_pkg(tmp_path) as pkg:
+    with make_pkg(tmp_path, default_relationship_types=False) as pkg:
         seed_citygml_concepts(pkg)
         import_citygml_semantics(pkg, citygml_path)
 

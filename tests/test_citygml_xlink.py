@@ -3,7 +3,7 @@ Relationship serialization: nesting is not the relationship.
 
 A CityGML relationship is the named property element. Whether the target sits
 inside that element or behind an xlink:href only says where the target is
-*defined* — 29 of the 33 city-object properties accept either form, and six
+*defined* — 29 of the 35 city-object properties accept either form, and six
 accept nothing but a reference. The adapter this replaces read nesting alone,
 so a document written by reference imported as a pile of unrelated roots with
 no warning, and the xlink-only properties could never appear at all.
@@ -15,11 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import (
-    make_pkg,
-    seed_citygml_concepts,
-    seed_citygml_relationship_categories,
-)
+from conftest import make_pkg, seed_citygml_concepts
 from usap import USAPPackage, import_citygml_semantics
 
 NS = """xmlns:core="http://www.opengis.net/citygml/3.0"
@@ -82,7 +78,6 @@ def _import(tmp_path: Path, name: str, xml: str) -> USAPPackage:
 
     pkg = make_pkg(tmp_path, f"{name}.usap.gpkg")
     seed_citygml_concepts(pkg)
-    seed_citygml_relationship_categories(pkg)
     import_citygml_semantics(pkg, gml)
 
     return pkg
@@ -219,7 +214,6 @@ def test_target_outside_the_document_is_kept_and_warned(tmp_path: Path) -> None:
 
     with make_pkg(tmp_path) as pkg:
         seed_citygml_concepts(pkg)
-        seed_citygml_relationship_categories(pkg)
 
         with pytest.warns(UserWarning, match="outside"):
             result = import_citygml_semantics(pkg, gml)
@@ -264,7 +258,6 @@ def test_appearance_hrefs_do_not_become_city_object_edges(tmp_path: Path) -> Non
 
     with make_pkg(tmp_path) as pkg:
         seed_citygml_concepts(pkg)
-        seed_citygml_relationship_categories(pkg)
 
         result = import_citygml_semantics(pkg, gml)
 

@@ -2,8 +2,10 @@
 Initialising a package on an ontology.
 
 The governing requirement: supply a different ontology, or extend the one you
-have, and the package's link vocabulary changes with it. USAP ships no link
-vocabulary and asserts no category of its own.
+have, and the package's link vocabulary changes with it. The only categories
+USAP asserts itself are the CityGML 3.0 defaults create() registers, and an
+ontology overrides those; the tests that need a vocabulary the ontology alone
+supplies use a package created without them.
 """
 
 from __future__ import annotations
@@ -57,7 +59,8 @@ def _types(pkg: USAPPackage) -> dict[tuple[str, str | None], str | None]:
     }
 
 
-def test_ontology_supplies_the_categories(pkg: USAPPackage) -> None:
+def test_ontology_supplies_the_categories(bare_pkg: USAPPackage) -> None:
+    pkg = bare_pkg
     result = load_ontology(pkg, CATEGORY_ONTOLOGY)
 
     assert result.categorised == 6
@@ -74,10 +77,11 @@ def test_ontology_supplies_the_categories(pkg: USAPPackage) -> None:
     assert types[("relatedTo", CORE_NS)] is None
 
 
-def test_iso_19150_class_property_names_are_split(pkg: USAPPackage) -> None:
+def test_iso_19150_class_property_names_are_split(bare_pkg: USAPPackage) -> None:
     # CityGML's published OWL renderings name a property `Class.property`.
     # Keeping the class prefix would give a type name no document ever writes,
     # so the category would land on a type nothing uses.
+    pkg = bare_pkg
     load_ontology(pkg, CATEGORY_ONTOLOGY)
 
     types = _types(pkg)
@@ -111,12 +115,13 @@ def test_ade_classes_and_their_parents_are_registered(pkg: USAPPackage) -> None:
 
 
 def test_the_ontology_classifies_a_real_import(tmp_path: Path) -> None:
-    # End to end: concepts from the schema, edges from the document, and the
-    # one thing neither carries — what counts as a part — from the ontology.
+    # End to end: concepts from the schema, edges from the document, and what
+    # counts as a part from the ontology -- on a package created without the
+    # CityGML 3.0 defaults, so the ontology is the only thing classifying.
     gml = tmp_path / "city.gml"
     gml.write_text(TINY_CITYGML, encoding="utf-8")
 
-    with make_pkg(tmp_path) as pkg:
+    with make_pkg(tmp_path, default_relationship_types=False) as pkg:
         seed_citygml_concepts(pkg)
         import_citygml_semantics(pkg, gml)
 
@@ -151,6 +156,9 @@ def test_loading_is_idempotent_and_order_independent(pkg: USAPPackage) -> None:
 
 
 def test_a_contradicting_category_raises(pkg: USAPPackage) -> None:
+    # boundary arrives as a CityGML 3.0 default (containment). Declaring it
+    # peer replaces the default, and a declaration is not something a later
+    # source may contradict -- an ontology included.
     pkg.register_relationship_type(
         "boundary", code_space=CORE_NS, category="peer"
     )
@@ -178,6 +186,8 @@ def test_swapping_the_ontology_swaps_the_vocabulary(tmp_path: Path) -> None:
         '         xmlns:owl="http://www.w3.org/2002/07/owl#"\n'
         '         xmlns:usap="urn:usap:">\n'
         # This deployment does NOT consider an opening part of the building.
+        # fillingSurface is a CityGML 3.0 default (containment); the ontology
+        # replaces it, because the defaults are a starting point.
         f'  <owl:ObjectProperty rdf:about="{CORE_NS}#boundary">\n'
         "    <usap:category>containment</usap:category>\n"
         "  </owl:ObjectProperty>\n"
@@ -423,10 +433,12 @@ def test_a_vocabulary_folder_loads_all_or_nothing(tmp_path):
     )
 
     with make_pkg(tmp_path, "folder.usap.gpkg") as pkg:
+        before = _written(pkg)
+
         with pytest.raises(ValueError, match="Missing"):
             load_vocabulary_folder(pkg, folder)
 
-        assert _written(pkg) == (0, 0)
+        assert _written(pkg) == before
 
         (folder / "b.json").write_text(
             _vocabulary("b", [{"local_name": "Second"}]), encoding="utf-8"
@@ -513,10 +525,12 @@ def test_a_folder_error_names_its_file_and_keeps_its_type(
     folder = _folder(tmp_path, files)
 
     with make_pkg(tmp_path, "errors.usap.gpkg") as pkg:
+        before = _written(pkg)
+
         with pytest.raises(error) as excinfo:
             load_vocabulary_folder(pkg, folder)
 
-        assert _written(pkg) == (0, 0)
+        assert _written(pkg) == before
 
     raised = excinfo.value
 

@@ -10,7 +10,12 @@ from .constants import (
     ELEMENT_KIND_VERTEX,
     VALUE_DTYPES,
 )
-from .core import DEFAULT_SCHEMA_PATH, USAPPackage
+from .core import (
+    DEFAULT_SCHEMA_PATH,
+    DefaultRelationshipTypesResult,
+    KeptRelationshipCategory,
+    USAPPackage,
+)
 
 # The content-hash helpers are re-exported because every consumer needs the
 # exact tolerance rules -- canonical 'algorithm:digest', a bare 64-hex digest
@@ -73,6 +78,8 @@ from .project_builder import (
 __all__ = [
     "USAPPackage",
     "DEFAULT_SCHEMA_PATH",
+    "DefaultRelationshipTypesResult",
+    "KeptRelationshipCategory",
     "USAPError",
     "USAPAmbiguityError",
     "canonical_hash",

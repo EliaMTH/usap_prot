@@ -493,9 +493,11 @@ def _resolve_optional_parent(
 # Ontology loading (RDF/XML)
 # ---------------------------------------------------------------------------
 
-# USAP's own predicate, for the one fact no CityGML artifact carries: whether a
-# link type means "part of". A URN because it needs to be globally unique
-# without USAP owning a domain — the same reasoning as usap_profile.package_iri.
+# USAP's own predicate for whether a link type means "part of". The CityGML 3.0
+# relation properties already carry a default category from create(); this is
+# how an ontology classifies anything else, or reads one of those differently.
+# A URN because it needs to be globally unique without USAP owning a domain —
+# the same reasoning as usap_profile.package_iri.
 #
 # In RDF/XML:
 #     xmlns:usap="urn:usap:"
@@ -745,8 +747,8 @@ def load_ontology(
         owl:ObjectProperty   a link type. Identity is the IRI's namespace plus
                              its local name, so it matches what an import
                              registers from the document.
-        usap:category        the one fact no CityGML artifact carries: whether
-                             that link means part-of. See
+        usap:category        whether that link means part-of, overriding the
+                             CityGML 3.0 default where there is one. See
                              USAP_ONTOLOGY_NAMESPACE for the predicate.
         owl:Class            a concept, with rdfs:subClassOf as its parent when
                              that parent is also declared here. Meant for ADE
@@ -760,8 +762,11 @@ def load_ontology(
     the caller to convert the file — never silently skipped, so a package can
     never come up with fewer concepts than its configuration named.
 
-    Anything a reader does not recognise is left alone: this adds facts, it
-    never removes or overrides them.
+    Anything a reader does not recognise is left alone: this adds facts and
+    never removes one. The only category it overrides is one of the CityGML
+    3.0 defaults create() registers, which give way to a declaration; a
+    category contradicting a declared one raises (see
+    register_relationship_type).
 
     ``owl:imports`` is **not** followed; the imported IRIs are returned so a
     caller can load them too if it wants. Following them would mean fetching
